@@ -7,7 +7,7 @@ import torch.optim as optim
 import torch.autograd as autograd
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
-from synthetic_data import masked_loss, get_random_mask
+from synthetic_data import masked_loss, get_random_mask, _random_fill
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
@@ -268,10 +268,11 @@ class DEQEncoderVAE(VAEBase):
   encoder/decoder capacity.
 
   Note: like every other model in this file, the encoder receives
-  mean-imputed values for missing entries (see get_random_mask / epoch_vae)
-  plus a mask channel -- this class does not by itself remove that
-  preprocessing step. What it adds is a weight-tied, variable-depth
-  refinement of the latent given that input, with convergence diagnostics
+  randomly-filled values for missing entries (per-gene N(mean, std) noise,
+  see get_random_mask / epoch_vae) plus a mask channel -- this class does
+  not by itself remove that preprocessing step. What it adds is a
+  weight-tied, variable-depth refinement of the latent given that input,
+  with convergence diagnostics
   available via self.deq_cell.last_forward_iters / last_forward_residual.
   """
 
@@ -2067,10 +2068,9 @@ def impute(model, x_raw, frac, *, device=device):
         elif isinstance(model, VAEBase):
             # Apply get_random_mask logic manually so we control the type-2 mask
             combined_mask = type2_mask | nan_mask           # what the model sees as missing
-            x_masked = x_raw.clone()
-            x_masked = x_masked.where(~combined_mask,
-                                      x_raw.nanmean(dim=0).expand_as(x_raw))
-            x_masked += torch.randn_like(x_masked) * 0.05  # same augmentation as training
+            x_masked = _random_fill(x_raw, combined_mask)
+            # same augmentation as training: noise on genuinely observed positions only
+            x_masked = x_masked + torch.randn_like(x_masked) * 0.05 * (~combined_mask).float()
             x_in = torch.cat((x_masked, combined_mask.float()), dim=1)  # (B, n_genes*2)
             recon, *_ = model(x_in)
             recon = recon.detach().cpu()

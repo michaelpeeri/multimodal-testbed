@@ -5,7 +5,7 @@
 # 
 # TODOs:
 # 1. Fix masking  
-# 2. Fix missing value initialization (mean)  
+# 2. [Done] Fix missing value initialization -- was mean-fill, now per-gene N(mean, std) random fill (see get_random_mask/_random_fill in synthetic_data.py)
 # 3. Use negative binomial distribution, Zero-Inflated Negative Binomial (ZINB) Loss, log(1+x)+MSE  
 # 3b. Fix distribution shift on reconstructed output  
 # 4. Replace mask concatenatenation with canonical style  

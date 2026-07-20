@@ -175,6 +175,19 @@ def make_synthetic_data2(
           block_bounds)
 
 
+def _random_fill(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+  """Fill `x` at positions where `mask` is True with per-gene random noise
+  drawn from N(nanmean, nanstd) for that gene.
+
+  This is statistically similar to a real observation of that gene (unlike a
+  fixed mean or zero-fill sentinel), so the filled value itself gives no cue
+  about missingness -- the model must rely on the explicit mask channel.
+  """
+  gene_mean = x.nanmean(dim=0)
+  gene_var  = (x - gene_mean).pow(2).nanmean(dim=0)
+  gene_std  = gene_var.clamp(min=1e-6).sqrt()
+  return x.where(~mask, gene_mean + gene_std * torch.randn_like(x))
+
 def get_random_mask(x:torch.Tensor, masked_fraction:float) -> torch.Tensor:
   """
   """
@@ -184,12 +197,10 @@ def get_random_mask(x:torch.Tensor, masked_fraction:float) -> torch.Tensor:
   type2_mask = torch.logical_and( type2_mask, ~type1_mask )
   mask  = type2_mask | type1_mask
 
-  #print(f'x:{x.shape} mean_vals:{mean_vals.shape}')
-  x_masked = x.clone()
-  #x_masked[mask] = x.mean(dim=0).expand((x.shape[0],-1)) # 0 # torch.nan # TODO use random values
-  x_masked = x_masked.where( ~mask, x.nanmean(dim=0).expand((x.shape[0],-1)) )
-  x_masked += torch.randn_like(x_masked) * 0.05  # Augmentation: add noise to the input
-  # TODO use better noise
+  x_masked = _random_fill(x, mask)
+  # Augmentation: add noise to genuinely observed positions only -- masked
+  # positions already received fresh per-gene random fill above.
+  x_masked = x_masked + torch.randn_like(x_masked) * 0.05 * (~mask).float()
   return x_masked, mask, type2_mask
 
 class GeneExpressionDataset(Dataset):

@@ -152,20 +152,35 @@ def _fixed_point_iterate(f, z0:torch.Tensor, max_iter:int=30, tol:float=1e-4):
   construction (spectral-normalized weight * coeff < 1, composed with a
   1-Lipschitz tanh).
 
-  Returns (z, n_iter, final_rel_change) so callers can check whether the
-  solve actually converged within budget.
+  Returns (z, n_iter, final_rel_change, final_rel_change_per_sample).
+
+  Instrumentation note: the stopping decision is made from a single
+  *whole-batch* scalar (`rel_change`, computed from the aggregate norm over
+  all rows) -- this matches the original behaviour exactly, so training
+  dynamics/results are unaffected. The extra `rel_change_per_sample` return
+  value (shape (B,), one scalar per row of z0) is a diagnostic computed
+  alongside it at no extra cost (same z/z_next already in hand), added so
+  callers can tell whether "converged" (by the aggregate check) actually
+  means every row converged, or just that most rows did while a few
+  particular rows (e.g. ones from an under-represented class) were still
+  changing a lot when the loop stopped. A single aggregate scalar cannot
+  distinguish those two cases; rel_change_per_sample can.
   """
   z = z0
   n_iter = max_iter
   rel_change = float("nan")
+  rel_change_per_sample = torch.full(
+      (z0.shape[0],), float("nan"), device=z0.device, dtype=z0.dtype)
   for i in range(max_iter):
     z_next = f(z)
-    rel_change = ((z_next - z).norm() / (z.norm() + 1e-6)).item()
+    diff = z_next - z
+    rel_change = (diff.norm() / (z.norm() + 1e-6)).item()
+    rel_change_per_sample = diff.flatten(1).norm(dim=1) / (z.flatten(1).norm(dim=1) + 1e-6)
     z = z_next
     if rel_change < tol:
       n_iter = i + 1
       break
-  return z, n_iter, rel_change
+  return z, n_iter, rel_change, rel_change_per_sample
 
 
 class DEQCell(nn.Module):
@@ -193,6 +208,24 @@ class DEQCell(nn.Module):
   backward-pass gradient with the solution of the adjoint fixed-point
   equation via a backward hook -- avoiding backprop through the unrolled
   solver entirely.
+
+  Diagnostics (populated on every forward() call, read-only, for inspection):
+    last_forward_iters / last_forward_residual   -- whole-batch (aggregate)
+        iteration count and residual for the forward solve, as before.
+    last_forward_residual_per_sample : (B,) tensor -- per-row residual at
+        the same final iteration used for the aggregate check above (see
+        _fixed_point_iterate's docstring). Lets a caller check whether
+        particular rows (e.g. cells from a specific class) were still far
+        from converged even when the aggregate check passed.
+    last_z_star : (B, dim) tensor, detached -- the converged fixed point
+        itself, *before* any downstream Linear projection (e.g. fc_mu).
+        Since z* = coeff*tanh(...), every component is confined to
+        (-coeff, coeff); inspecting last_z_star's histogram/std is how to
+        check whether the recurrence is saturating (most mass near
+        +/-coeff) for some inputs, which would compress the gradient signal
+        available to whatever consumes z* downstream.
+    last_backward_iters / last_backward_residual -- same as above, but for
+        the adjoint (backward-pass) fixed-point solve.
   """
 
   def __init__(self, dim:int, coeff:float=0.9, max_iter:int=30, tol:float=1e-4,
@@ -205,10 +238,12 @@ class DEQCell(nn.Module):
     self.tol = tol
 
     # Diagnostics populated on every forward() call, for inspection only.
-    self.last_forward_iters:       int|None = None
-    self.last_forward_residual:  float|None = None
-    self.last_backward_iters:      int|None = None
-    self.last_backward_residual: float|None = None
+    self.last_forward_iters:                int|None = None
+    self.last_forward_residual:            float|None = None
+    self.last_forward_residual_per_sample: torch.Tensor|None = None
+    self.last_z_star:                      torch.Tensor|None = None
+    self.last_backward_iters:               int|None = None
+    self.last_backward_residual:          float|None = None
 
   def _f(self, z:torch.Tensor, c:torch.Tensor) -> torch.Tensor:
     """
@@ -221,10 +256,12 @@ class DEQCell(nn.Module):
     """c: (B, dim) conditioning vector -> z*: (B, dim) fixed point."""
     z0 = torch.zeros_like(c)
     with torch.no_grad():
-      z_star, n_iter, residual = _fixed_point_iterate(
+      z_star, n_iter, residual, residual_per_sample = _fixed_point_iterate(
           lambda z: self._f(z, c), z0, self.max_iter, self.tol)
     self.last_forward_iters = n_iter
     self.last_forward_residual = residual
+    self.last_forward_residual_per_sample = residual_per_sample.detach()
+    self.last_z_star = z_star.detach()
 
     z = self._f(z_star, c)  # value ~= z_star, but now differentiable
 
@@ -233,7 +270,7 @@ class DEQCell(nn.Module):
       f0 = self._f(z0d, c)
 
       def backward_hook(grad):
-        v, n_iter_bwd, residual_bwd = _fixed_point_iterate(
+        v, n_iter_bwd, residual_bwd, _residual_bwd_per_sample = _fixed_point_iterate(
             lambda v: torch.autograd.grad(f0, z0d, grad_outputs=v, retain_graph=True)[0] + grad,
             grad, self.max_iter, self.tol,
         )
@@ -272,8 +309,13 @@ class DEQEncoderVAE(VAEBase):
   see get_random_mask / epoch_vae) plus a mask channel -- this class does
   not by itself remove that preprocessing step. What it adds is a
   weight-tied, variable-depth refinement of the latent given that input,
-  with convergence diagnostics
-  available via self.deq_cell.last_forward_iters / last_forward_residual.
+  with convergence diagnostics available via self.deq_cell.last_forward_iters
+  / last_forward_residual (whole-batch), or
+  self.deq_cell.last_forward_residual_per_sample / last_z_star (per-cell --
+  see DEQCell's docstring) for e.g. correlating convergence quality with
+  per-class imputation error. Unlike DEQEncoderVampVAE, deq_cell here is
+  only ever called once per forward pass, so these attributes always
+  reflect the most recent real batch with no clobbering concern.
   """
 
   def __init__(self,
@@ -540,6 +582,19 @@ class VampPriorVAE(VAEBase):
       # effective K = exp(mean_batch[ entropy(resp)])
       ent = -(resp * (resp + 1e-20).log()).sum(dim=1)  # (B,)
       self._effective_K = torch.exp(ent.mean())
+      # Per-sample version of the same diagnostic: exp(entropy) for each
+      # individual cell's responsibility distribution over the K
+      # pseudo-inputs, rather than averaged over the batch first. A
+      # batch-level self._effective_K can look healthy (e.g. ~10 out of 50)
+      # while actually being an average of "well-covered" cells (many
+      # components effectively responsible, per-sample value close to K)
+      # and "poorly-covered" cells (collapsed onto ~1 component each) --
+      # the aggregate scalar can't distinguish uniform partial coverage from
+      # a bimodal mix. Grouping this per-sample value by class/label
+      # reveals whether specific classes are consistently under-covered by
+      # the mixture prior (a partial mode-collapse signature) rather than
+      # collapse being spread evenly across all cells.
+      self._effective_K_per_sample = torch.exp(ent).detach()  # (B,)
 
     log_p = torch.logsumexp(log_p_k, dim=1) - math.log(self.n_pseudo)  # (B,)
 
@@ -556,6 +611,153 @@ class VampPriorVAE(VAEBase):
     self._vamp_kl = self.vampprior_kl(mu, logvar, z)
     return recon, mu, logvar, None, None, None
 
+
+class DEQEncoderVampVAE(VampPriorVAE):
+  """
+  Stage 2: VampPriorVAE with a DEQ (implicit-depth) encoder instead of a
+  plain MLP head.
+
+  Combines two previously-isolated changes:
+    - DEQEncoderVAE's weight-tied fixed-point recognition network (encoder
+      question / requirements b,c: missing-data handling, sample efficiency)
+    - VampPriorVAE's mixture-of-posteriors prior (prior question /
+      requirement a: multimodal, mode-collapse-resistant prior)
+
+  Subtlety #1 -- prior and posterior share one DEQCell:
+    Both the real batch and the K learnable pseudo-inputs are encoded
+    through the *same* DEQCell instance. This means the prior's mixture
+    components q(z|u_k) are fixed points of the identical implicit function
+    that defines the posterior q(z|x), just evaluated at different
+    conditioning vectors -- there is no separate "prior network" the way
+    there would be for, e.g., a learned normalizing-flow prior. This is a
+    deliberate design choice (keeps the "one weight-tied transition" DEQ
+    argument intact) but it does mean the two roles are coupled: any change
+    to W_zz that helps fit real data also reshapes every pseudo-input's
+    fixed point, and vice versa.
+
+  Subtlety #2 -- subclassing VampPriorVAE, not DEQEncoderVAE:
+    epoch_vae (models.py) dispatches the VampPrior KL override via
+    `isinstance(model, VampPriorVAE)`. Subclassing VampPriorVAE means that
+    check fires with zero changes to the shared training loop. The
+    DEQ-specific pieces (fc_cond, deq_cell) are grafted on top instead of
+    inherited from DEQEncoderVAE, since VampPriorVAE.__init__ already builds
+    everything else this class needs (encoder, decoder, pseudo_inputs,
+    vampprior_kl).
+
+  Subtlety #3 -- fc_mu/fc_logvar are re-declared, not reused:
+    VampPriorVAE.__init__ (via super().__init__ below) allocates
+    self.fc_mu / self.fc_logvar as Linear(enc_out_dim, latent_dim), sized to
+    consume the *raw encoder output* h directly (its own encode() applies
+    them to h). Here, mu/logvar must instead be read off the DEQ fixed point
+    z* (dim == latent_dim), so those two Linear layers are immediately
+    overwritten with Linear(latent_dim, latent_dim) versions after
+    super().__init__() returns. The two original Linear(enc_out_dim,
+    latent_dim) modules are allocated and then discarded (replaced before
+    any forward/optimizer step touches them) -- wasted construction cost
+    only, no effect on parameters actually trained or saved.
+
+  Subtlety #4 -- DEQCell diagnostics get overwritten by the pseudo-input pass:
+    DEQCell.forward() records convergence diagnostics (last_forward_iters /
+    last_forward_residual / last_forward_residual_per_sample / last_z_star)
+    as attributes on the DEQCell instance itself, updated on every call.
+    Within one forward() call here, deq_cell runs twice: once for the real
+    batch (inside encode()), and once more for the K pseudo-inputs (inside
+    vampprior_kl() -> _pseudo_encoded(), triggered right after). The second
+    call silently overwrites the first call's diagnostics, so reading
+    self.deq_cell.last_forward_iters (or any of the other last_forward_*
+    attributes) after forward() returns would reflect the pseudo-input
+    solve, not the real-batch solve we actually want to track (e.g.
+    iteration count / per-cell residual vs. mask fraction or class label --
+    the diagnostics DEQEncoderVAE/DEQCell were built to expose). Fixed by
+    snapshotting self.last_batch_* immediately after the real-batch
+    encode() call, before vampprior_kl() runs and clobbers deq_cell's
+    shared state. This is *not* an issue for self._effective_K /
+    self._effective_K_per_sample (VampPriorVAE.vampprior_kl) -- those are
+    computed exactly once per forward() call, from the already-encoded real
+    batch and pseudo-inputs together, so there's no second overwriting call.
+  """
+
+  def __init__(self,
+               n_genes:      int,
+               latent_dim:   int = 32,
+               n_pseudo:     int = 50,
+               hidden_dims:  list[int]|None = None,
+               encoder_dims: list[int]|None = None,
+               decoder_dims: list[int]|None = None,
+               dropout:      float = 0.02,
+               coeff:        float = 0.9,
+               max_iter:     int = 30,
+               tol:          float = 1e-4,
+               pseudo_init_samples: torch.Tensor|None = None):
+
+    super().__init__(n_genes, latent_dim, n_pseudo,
+                      hidden_dims, encoder_dims, decoder_dims, dropout,
+                      pseudo_init_samples)
+    # VampPriorVAE.__init__ already built self.encoder, self.decoder,
+    # self.pseudo_inputs, and (see Subtlety #3) fc_mu/fc_logvar sized for
+    # the *wrong* input dim -- replace them here.
+    self.fc_mu     = nn.Linear(latent_dim, latent_dim)
+    self.fc_logvar = nn.Linear(latent_dim, latent_dim)
+
+    self.fc_cond  = nn.Linear(self.enc_out_dim, latent_dim)
+    self.deq_cell = DEQCell(latent_dim, coeff=coeff, max_iter=max_iter, tol=tol)
+
+    # Real-batch DEQ convergence diagnostics, snapshotted in forward() before
+    # the pseudo-input pass overwrites deq_cell's shared attributes (see
+    # Subtlety #4). None until the first forward() call.
+    self.last_batch_iters:             int|None = None
+    self.last_batch_residual:        float|None = None
+    self.last_batch_residual_per_sample: torch.Tensor|None = None
+    self.last_batch_z_star:              torch.Tensor|None = None
+
+  def _encode_via_deq(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Shared path for both real data and pseudo-inputs (see Subtlety #1)."""
+    h = self.encoder(x)
+    c = self.fc_cond(h)
+    z_star = self.deq_cell(c)
+    return h, self.fc_mu(z_star), self.fc_logvar(z_star)
+
+  def encode(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return self._encode_via_deq(x)
+
+  def _pseudo_encoded(self) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Encode all K pseudo-inputs through the same encoder+DEQ path as real
+    data (overrides VampPriorVAE._pseudo_encoded, which used a plain MLP
+    head). Called by the inherited vampprior_kl() -- this is also the call
+    that overwrites deq_cell's shared diagnostics (Subtlety #4).
+    """
+    zero_mask  = torch.zeros(self.n_pseudo, self.n_genes, device=self.pseudo_inputs.device)
+    pseudo_aug = torch.cat([self.pseudo_inputs, zero_mask], dim=1)
+    _, pu_mu, pu_logvar = self._encode_via_deq(pseudo_aug)
+    return pu_mu, pu_logvar
+
+  def forward(self, x: torch.Tensor):
+    """
+    Returns: (recon, mu, logvar, None, None, None) -- same 6-tuple contract
+    as every other model in this file.
+    Side-effects:
+      - self._vamp_kl set (read by epoch_vae's kl_override for this
+        isinstance(model, VampPriorVAE) branch).
+      - self._effective_K / self._effective_K_per_sample set by
+        vampprior_kl() (no clobbering concern, see Subtlety #4).
+      - self.last_batch_iters / last_batch_residual /
+        last_batch_residual_per_sample / last_batch_z_star snapshotted for
+        the *real batch* solve specifically (see Subtlety #4) -- read these
+        instead of self.deq_cell.last_forward_* after this returns.
+    """
+    _, mu, logvar = self.encode(x)
+    # Snapshot now: vampprior_kl() below re-runs deq_cell on pseudo-inputs
+    # and would otherwise overwrite these.
+    self.last_batch_iters               = self.deq_cell.last_forward_iters
+    self.last_batch_residual            = self.deq_cell.last_forward_residual
+    self.last_batch_residual_per_sample = self.deq_cell.last_forward_residual_per_sample
+    self.last_batch_z_star              = self.deq_cell.last_z_star
+
+    z = self.reparameterize(mu, logvar)
+    recon = self.decode(z)
+    self._vamp_kl = self.vampprior_kl(mu, logvar, z)
+    return recon, mu, logvar, None, None, None
 
 
 def epoch_vae(model, loader, opt=None, mask_fraction=0.1, beta=1.0, gamma=0.2, min_free_bits=0.05, lambda_entropy=0.1):
@@ -2082,6 +2284,140 @@ def impute(model, x_raw, frac, *, device=device):
 
 
 # ---------------------------------------------------------------------------
+# Per-cell / per-class diagnostics
+#
+# Built on top of impute() to support grouping per-cell imputation error (and
+# DEQ/VampPrior internal diagnostics) by an external class/cluster label, to
+# investigate questions like: "is DEQEncoderVampVAE's higher variance in
+# imputation error across classes coming from uneven VampPrior mixture
+# coverage, uneven DEQ fixed-point convergence, or something else?"
+# ---------------------------------------------------------------------------
+
+def per_cell_masked_error(x_raw: torch.Tensor,
+                           recon: torch.Tensor,
+                           type2_mask: torch.Tensor) -> torch.Tensor:
+    """
+    Mean squared imputation error per cell, over that cell's type-2-masked
+    (deliberately held-out, ground-truth-known) genes only.
+
+    Args:
+        x_raw, recon, type2_mask : as returned by / passed to impute() --
+            (B, n_genes), aligned row-for-row. x_raw may contain NaN
+            (type-1/genuinely-missing positions); these are never counted
+            here because type2_mask is constructed to exclude them already
+            (see impute()).
+    Returns:
+        (B,) float tensor, CPU. NaN for any cell with zero masked genes in
+        this draw (can happen at very low mask fractions/small n_genes).
+    """
+    x_raw  = x_raw.detach().cpu()
+    recon  = recon.detach().cpu()
+    type2_mask = type2_mask.detach().cpu()
+
+    # NaN-safety: positions outside type2_mask can be NaN in x_raw (genuine
+    # type-1 missing values), and 0 * NaN == NaN in IEEE754 -- so a plain
+    # (sq_err * type2_mask.float()) would silently turn every row that has
+    # *any* type-1-missing gene into an all-NaN row, even though those
+    # positions are supposed to be excluded. nan_to_num + torch.where keeps
+    # the excluded positions from ever contributing/propagating NaN.
+    sq_err = (recon - x_raw.nan_to_num(0)).pow(2)
+    sq_err = torch.where(type2_mask, sq_err, torch.zeros_like(sq_err))
+    n_masked = type2_mask.sum(dim=1).float()
+    per_cell = sq_err.sum(dim=1) / n_masked.clamp(min=1)
+    per_cell[n_masked == 0] = float('nan')
+    return per_cell
+
+
+def collect_deq_diagnostics(model: nn.Module) -> dict:
+    """
+    Snapshot the DEQ / VampPrior per-sample diagnostics currently held on
+    *model*, populated as a side effect of its most recent forward() call
+    (e.g. the call made inside impute()). Call this immediately after
+    impute()/model(...) and before any other forward pass on the same model,
+    since some of these attributes are overwritten on every call (see
+    DEQEncoderVampVAE's Subtlety #4).
+
+    Safe to call on any model type in this file -- entries are None if the
+    model doesn't have that diagnostic (e.g. GeneExpressionVAE has no
+    deq_cell; VampPriorVAE without a DEQ encoder has no deq_cell either).
+
+    Returns a dict with keys:
+        'deq_iters'               : int  or None -- whole-batch iteration count
+        'deq_residual'            : float or None -- whole-batch final residual
+        'deq_residual_per_sample' : (B,) tensor or None
+        'deq_z_star'              : (B, latent_dim) tensor or None -- pre-fc_mu
+                                     fixed point, for saturation/range checks
+        'effective_K'             : float or None -- VampPrior mixture usage,
+                                     whole-batch average
+        'effective_K_per_sample'  : (B,) tensor or None
+    """
+    out = {
+        'deq_iters':               None,
+        'deq_residual':             None,
+        'deq_residual_per_sample': None,
+        'deq_z_star':               None,
+        'effective_K':              None,
+        'effective_K_per_sample':  None,
+    }
+
+    if isinstance(model, DEQEncoderVampVAE):
+        # Real-batch-specific snapshots taken in forward(), NOT deq_cell's
+        # raw attributes -- those get overwritten by the pseudo-input pass
+        # triggered inside vampprior_kl() (Subtlety #4).
+        out['deq_iters']               = model.last_batch_iters
+        out['deq_residual']            = model.last_batch_residual
+        out['deq_residual_per_sample'] = model.last_batch_residual_per_sample
+        out['deq_z_star']              = model.last_batch_z_star
+    else:
+        deq_cell = getattr(model, 'deq_cell', None)
+        if deq_cell is not None:
+            out['deq_iters']               = deq_cell.last_forward_iters
+            out['deq_residual']            = deq_cell.last_forward_residual
+            out['deq_residual_per_sample'] = deq_cell.last_forward_residual_per_sample
+            out['deq_z_star']              = deq_cell.last_z_star
+
+    if isinstance(model, VampPriorVAE):
+        effk = getattr(model, '_effective_K', None)
+        out['effective_K'] = float(effk) if effk is not None else None
+        out['effective_K_per_sample'] = getattr(model, '_effective_K_per_sample', None)
+
+    return out
+
+
+def class_grouped_stats(values: torch.Tensor, labels) -> tuple[dict, float]:
+    """
+    Group a per-cell diagnostic (e.g. per_cell_masked_error(...) output, or
+    collect_deq_diagnostics(...)['effective_K_per_sample']) by an external
+    class/cluster label and compute the between-class variance of the
+    per-class means -- i.e. the metric this whole investigation is about.
+
+    Args:
+        values : (N,) tensor or array-like, may contain NaN (excluded via
+                  nanmean within each class).
+        labels : (N,) array-like of class ids (int, str, whatever is
+                  hashable/sortable via np.unique), aligned row-for-row
+                  with values.
+    Returns:
+        (per_class_means, between_class_variance)
+        per_class_means         : {label: float} mean value within each class
+        between_class_variance  : float, variance across those per-class
+                                   means (population variance, ddof=0)
+    """
+    values_np = values.detach().cpu().numpy() if torch.is_tensor(values) else np.asarray(values)
+    labels_np = np.asarray(labels)
+    assert values_np.shape[0] == labels_np.shape[0], \
+        f"values ({values_np.shape[0]}) and labels ({labels_np.shape[0]}) must align"
+
+    per_class_means = {}
+    for lbl in np.unique(labels_np):
+        vals = values_np[labels_np == lbl]
+        per_class_means[lbl] = float(np.nanmean(vals)) if len(vals) else float('nan')
+
+    between_class_variance = float(np.var(list(per_class_means.values())))
+    return per_class_means, between_class_variance
+
+
+# ---------------------------------------------------------------------------
 # Model factories
 # One callable per named architecture; each accepts a single argument: n_genes
 # an *un-trained* model instance (not yet moved to device).
@@ -2138,6 +2474,23 @@ def _make_vamp_vae(n_genes:int):
         latent_dim=24,
         pseudo_init_samples=None)
 
+def _make_deq_vamp_vae(n_genes:int):
+    # encoder_dims/decoder_dims/latent_dim match _make_deq_encoder_vae so
+    # DEQEncoderVAE vs DEQEncoderVampVAE isolates only the prior (Gaussian vs
+    # Vamp); n_pseudo matches _make_vamp_vae so VampPriorVAE vs
+    # DEQEncoderVampVAE isolates only the encoder (MLP vs DEQ).
+    return DEQEncoderVampVAE(
+        n_genes=n_genes,
+        dropout=0.02,
+        encoder_dims=[512, 256, 128],
+        decoder_dims=[128, 256, 256],
+        latent_dim=32,
+        n_pseudo=50,
+        coeff=0.9,
+        max_iter=30,
+        tol=1e-4,
+        pseudo_init_samples=None)
+
 def _make_means_model(n_genes:int):
     return MeansModel(n_genes=n_genes)
 
@@ -2181,6 +2534,7 @@ model_factories = {
     'MoVEVAE_K3':           _make_move_vae_k3,
     'MoVEVAE_K1':           _make_move_vae_k1,
     'VampPriorVAE':         _make_vamp_vae,
+    'DEQEncoderVampVAE':    _make_deq_vamp_vae,
     'ImputationTransformer':_make_imputation_transformer,
 }
 

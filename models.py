@@ -497,6 +497,143 @@ class VampPriorVAE(VAEBase):
   forward() returns the same 6-tuple as MoVEVAE so it is a drop-in replacement
   in epoch_vae.  The VampPrior KL scalar is stored in self._vamp_kl after each
   forward pass for use by the training loop.
+
+  Anti-collapse regularizers (both optional, both consumed by epoch_vae if
+  present -- see there for the loss-composition side):
+    self._vamp_diversity_loss : population-level responsibility-entropy
+        term (same sign/scale convention as MoVEVAE's gating_entropy_loss;
+        weighted by the existing lambda_entropy hyperparameter). Encourages
+        the K pseudo-inputs to *collectively* share responsibility for the
+        batch, rather than one pseudo-input absorbing almost all of it.
+        Blind spot: satisfiable by K identical/redundant components (a
+        mixture of clones has perfectly uniform, but meaningless,
+        responsibility) -- see _vamp_repulsion_loss below for why both
+        regularizers are needed together.
+    self._vamp_repulsion_loss : pairwise hinge repulsion on the pseudo-inputs'
+        *encoded* posterior means (pu_mu), with an adaptive margin (see
+        vampprior_kl) rather than a fixed guessed constant. Encourages the K
+        components to be geometrically distinct in latent space, which
+        _vamp_diversity_loss alone cannot guarantee.
+
+        Caveat learned from a real training run: this alone was NOT
+        sufficient to prevent effective_K collapse. Mutual repulsion only
+        pushes pseudo-inputs apart from EACH OTHER -- it converged nicely
+        (pu_mu pairwise distance comfortably exceeded the margin) while
+        effective_K still collapsed to ~1, because nothing pulled the
+        pseudo-inputs toward the region where real data actually lives. In
+        a high-dimensional ambient latent space, mutually-repelled points
+        can scatter away from a comparatively low-dimensional data manifold
+        entirely, leaving only ~1 of K ever close enough to compete for
+        responsibility. See _vamp_coverage_loss below, which is what
+        actually addresses this.
+    self._vamp_coverage_loss : Chamfer-style attraction term -- pulls each
+        pseudo-input toward its *nearest* real-batch encoded mu, so
+        pseudo-inputs individually land near the data manifold instead of
+        merely being spread apart from each other in the ambient space.
+        Combined with _vamp_repulsion_loss this gives the standard
+        "attract to data, repel from siblings" pattern (as used in
+        prototype/coverage learning): pulled onto the manifold
+        individually, but can't pile onto the same point because repulsion
+        still pushes them apart.
+  None of these regularizers require this model's KL to have been computed
+  via kl_override in any special way -- they are independent extra loss
+  terms.
+
+  ***effective_K vs effective_K_population -- READ THIS FIRST***
+  self._effective_K (and self._effective_K_per_sample) is exp(mean_i[entropy
+  of cell i's own responsibility distribution over the K components]).
+  self._effective_K_population is exp(entropy(avg_resp)), i.e. entropy
+  computed AFTER averaging responsibility over the batch. These are NOT
+  interchangeable, and the difference is not a rounding nuance:
+
+    Because entropy is concave, Jensen's inequality gives
+    exp(mean_i[entropy_i]) <= exp(entropy(mean_i)) ALWAYS -- and in the
+    THEORETICAL BEST CASE (every cell confidently/one-hot assigned to its
+    own distinct pseudo-input, perfectly spread across all K -- i.e.
+    maximally diverse population usage with zero redundancy) --
+    self._effective_K reads EXACTLY 1.0 while self._effective_K_population
+    reads K. This isn't a hypothetical edge case either: it's the expected
+    *routine* regime for a well-separated Gaussian mixture in a
+    high-dimensional latent space (latent_dim=32 here) -- individual
+    per-cell assignment naturally sharpens toward one-hot long before the
+    population's aggregate usage becomes non-diverse.
+
+    Across this debugging session, self._effective_K stayed pinned near
+    1.0-1.14 through three different regularizer designs that each targeted
+    a different, confirmed-working geometric mechanism (population entropy,
+    pairwise repulsion, data-manifold coverage) -- a strong signal in
+    hindsight that the metric itself has a structural floor near 1, largely
+    independent of whether the population-level mixture usage is actually
+    healthy. self._effective_K_population is the metric that actually
+    answers "does the population, in aggregate, spread its responsibility
+    across many of the K components" -- i.e. the thing all three
+    regularizers are actually trying to fix. Check *that* number before
+    concluding collapse is still occurring.
+
+  Diagnostics for tracking whether the regularizers are actually working
+  (see collect_vamp_diagnostics, and vampprior_kl's inline comments for what
+  each one distinguishes -- in particular, whether the adaptive margin is
+  itself shrinking over training, a self-referential failure mode where the
+  repulsion threshold retreats in step with collapse instead of resisting
+  it; and separately, whether pseudo-inputs are actually landing near real
+  data, which repulsion alone cannot guarantee):
+    self._effective_K / self._effective_K_per_sample : responsibility-based
+        mixture usage, per-sample-averaged -- see note above, near 1.0 is
+        NORMAL, not necessarily collapse.
+    self._effective_K_population : responsibility-based mixture usage,
+        computed on the batch-averaged responsibility distribution -- see
+        note above; THIS is the metric that indicates actual collapse.
+    self._vamp_repulsion_typical_scale : real batch's own mu pairwise
+        spread (the shared reference scale for both the repulsion margin
+        and the coverage loss's normalization).
+    self._vamp_repulsion_margin : the derived repulsion threshold.
+    self._vamp_pu_mu_pairwise_median : what the pseudo-inputs actually
+        achieve post-encoding -- compare against the margin above.
+    self._vamp_pseudo_inputs_raw_pairwise_median : pre-encoding, raw
+        gene-expression-space spread of the pseudo_inputs parameters
+        themselves -- separates "did gradient descent spread the raw
+        parameters apart" from "does the shared encoder collapse them
+        anyway regardless of raw spread".
+    self._vamp_coverage_mean_nearest_dist : mean (over K pseudo-inputs) of
+        each one's distance to its nearest real-batch cell, in raw latent
+        units -- should shrink toward 0 as coverage improves.
+    self._vamp_resp : full (B, K) per-sample responsibility matrix,
+        detached. On its own this is just the raw ingredient behind
+        effective_K/effective_K_population above; its real purpose is to be
+        joined against external per-cell class/cell-type labels (see
+        vamp_usage_by_class) to test a distinct question from all of the
+        above: not "is the mixture used diversely overall" but "is that
+        diversity aligned with class identity at all", i.e. do different
+        classes actually get routed to different pseudo-inputs, or does
+        every class independently spread across ~the same broad set of
+        components.
+
+        Confirmed via a real run (8 classes): strongly class-aligned --
+        per-class effective_K_population ~4.5-9.2 vs. a global value of
+        ~40, and pairwise JS divergence between classes' avg_resp mostly at
+        the theoretical max (ln 2). So different classes DO get routed to
+        largely disjoint pseudo-inputs -- yet per-class reconstruction
+        error variance was observed to be unchanged vs. a standard N(0,I)
+        prior at matched latent_dim and non-negligible beta (beta*kl_loss
+        ~7.9% of recon_loss at convergence). self._vamp_kl_per_sample below
+        is the follow-up diagnostic this motivated.
+    self._vamp_kl_per_sample : (B,) per-cell KL cost (log_q - log_p),
+        detached -- see standard_gaussian_kl_per_sample for the equivalent
+        quantity under a standard N(0,I) prior. Class-routing being
+        class-aligned (above) is a RATE-ALLOCATION result: it says a class
+        can occupy its own region of latent space cheaply. It does NOT by
+        itself imply reconstruction FIDELITY becomes more class-fair too --
+        fidelity is governed by posterior precision (logvar) and decoder
+        capacity, which a flexible prior doesn't directly touch. Group this
+        per-cell value with class_grouped_stats and compare its
+        between_class_variance against the same computation on a
+        standard-prior model's KL to test that distinction directly: if
+        VampPrior's KL-cost variance across classes is lower than the
+        standard prior's, but reconstruction-error variance
+        (per_cell_masked_error) is the same for both, that confirms rate
+        allocation and fidelity are simply different things the prior
+        affects differently -- explaining the original null result without
+        needing to invoke beta or capacity issues at all.
   """
 
   def __init__(self,
@@ -507,11 +644,17 @@ class VampPriorVAE(VAEBase):
                encoder_dims: list[int]|None = None,
                decoder_dims: list[int]|None = None,
                dropout:      float = 0.05,
-               pseudo_init_samples: torch.Tensor|None = None):
+               pseudo_init_samples: torch.Tensor|None = None,
+               repulsion_margin_frac: float = 0.5):
 
     super().__init__(n_genes, latent_dim, hidden_dims, encoder_dims, decoder_dims, dropout)
 
     self.n_pseudo = n_pseudo
+    # Fraction of the *real batch's* typical pairwise mu-mu distance used as
+    # the repulsion margin (see vampprior_kl) -- scale-free, so it doesn't
+    # need re-tuning per latent_dim/encoder architecture/dataset the way a
+    # fixed absolute margin would.
+    self.repulsion_margin_frac = repulsion_margin_frac
 
     # Encoder (single head — same as GeneExpressionVAE)
     self.encoder   = build_encoder(n_genes, self.encoder_dims, dropout)
@@ -531,8 +674,26 @@ class VampPriorVAE(VAEBase):
       self.pseudo_inputs = nn.Parameter( pseudo_init_samples[sample] )
     assert(self.pseudo_inputs.data.shape==(n_pseudo, n_genes))
 
-    # Populated by forward(); read by epoch_vae.
-    self._vamp_kl: torch.Tensor|None = None
+    # Populated by forward()/vampprior_kl(); read by epoch_vae.
+    self._vamp_kl:             torch.Tensor|None = None
+    self._vamp_diversity_loss: torch.Tensor|None = None
+    self._vamp_repulsion_loss: torch.Tensor|None = None
+    self._vamp_coverage_loss:  torch.Tensor|None = None
+    self._effective_K:              float|None = None
+    self._effective_K_per_sample: torch.Tensor|None = None
+    self._effective_K_population:   float|None = None
+    self._vamp_resp:              torch.Tensor|None = None  # (B, K), see vamp_usage_by_class
+    self._vamp_kl_per_sample:     torch.Tensor|None = None  # (B,), see standard_gaussian_kl_per_sample
+    # Diagnostics only (see vampprior_kl / collect_vamp_diagnostics) -- track
+    # whether the repulsion regularizer's adaptive margin is itself
+    # collapsing, whether collapse (if any) originates in the raw
+    # pseudo_inputs parameters or is introduced by the shared encoder, and
+    # whether pseudo-inputs are actually landing near real data.
+    self._vamp_repulsion_typical_scale:           torch.Tensor|None = None
+    self._vamp_repulsion_margin:                  torch.Tensor|None = None
+    self._vamp_pu_mu_pairwise_median:             torch.Tensor|None = None
+    self._vamp_pseudo_inputs_raw_pairwise_median: torch.Tensor|None = None
+    self._vamp_coverage_mean_nearest_dist:        torch.Tensor|None = None
 
   def _pseudo_encoded(self) -> tuple[torch.Tensor, torch.Tensor]:
     """Encode all K pseudo-inputs; return (pu_mu, pu_logvar) each (K, D)."""
@@ -560,6 +721,13 @@ class VampPriorVAE(VAEBase):
 
     mu, logvar, z : (B, D)
     returns scalar
+
+    Side effects (read by epoch_vae / collect_deq_diagnostics):
+      self._effective_K, self._effective_K_per_sample : diagnostics only,
+          no_grad, unchanged from before.
+      self._vamp_diversity_loss, self._vamp_repulsion_loss : anti-collapse
+          regularizer terms, WITH gradient -- see class docstring and the
+          inline comments below for what each targets.
     """
     # log q(z | x) : (B,)
     log_q = gaussian_log_prob(z, mu, logvar).sum(dim=-1)
@@ -574,11 +742,29 @@ class VampPriorVAE(VAEBase):
         pu_logvar.unsqueeze(0),   # (1, K, D)
     ).sum(dim=-1)                 # (B, K)
 
-    # effective K (diagnostic)
+    # Responsibility distribution -- kept differentiable (NOT wrapped in
+    # no_grad) because _vamp_diversity_loss below needs its gradient to
+    # actually discourage collapse during training. The no_grad block
+    # further down reuses this same `resp`/`ent` purely for read-only
+    # diagnostics (_effective_K*), which is unaffected by resp being
+    # differentiable here (no_grad there just stops those particular
+    # diagnostic computations from being tracked further, it doesn't
+    # detach resp itself for use elsewhere).
+    log_resp = log_p_k - torch.logsumexp(log_p_k, dim=1, keepdim=True)  # (B, K)
+    resp = log_resp.exp()
+
+    # Full per-sample responsibility matrix, detached -- diagnostic only.
+    # Lets external code (e.g. vamp_usage_by_class) join this against
+    # per-cell class/cell-type labels to test whether the mixture's
+    # diversity is actually class-aligned (different classes routed to
+    # different pseudo-inputs), as opposed to diverse only in the
+    # aggregate/population sense that effective_K_population confirms.
+    with torch.no_grad():
+      self._vamp_resp = resp.detach()  # (B, K)
+
+    # effective K (diagnostic only)
     # range: 1.0 - n_pseudo
     with torch.no_grad():
-      log_resp = log_p_k - torch.logsumexp( log_p_k, dim=1, keepdim=True ) # (B, K)
-      resp = log_resp.exp()
       # effective K = exp(mean_batch[ entropy(resp)])
       ent = -(resp * (resp + 1e-20).log()).sum(dim=1)  # (B,)
       self._effective_K = torch.exp(ent.mean())
@@ -596,14 +782,168 @@ class VampPriorVAE(VAEBase):
       # collapse being spread evenly across all cells.
       self._effective_K_per_sample = torch.exp(ent).detach()  # (B,)
 
+    # --- Anti-collapse regularizer 1: population-level responsibility entropy ---
+    # IMPORTANT (see class docstring "effective_K vs effective_K_population"):
+    # self._effective_K above (exp of the MEAN of per-sample entropies) is
+    # NOT the same quantity as "how many of the K pseudo-inputs does the
+    # population, in aggregate, actually use" -- by Jensen's inequality
+    # (entropy is concave), exp(mean_i[entropy_i]) <= exp(entropy(mean_i)).
+    # In fact self._effective_K reads EXACTLY 1.0 even in the theoretical
+    # best case (every cell confidently, one-hot, assigned to its OWN
+    # distinct pseudo-input, perfectly spread across all K) -- confirmed by
+    # direct calculation. This is expected/routine sharpening in a
+    # high-dimensional (latent_dim=32) Gaussian mixture, not evidence of
+    # collapse by itself. self._effective_K_population below (exp of the
+    # entropy of avg_resp, i.e. entropy computed AFTER averaging over the
+    # batch) is the metric that actually answers "is the population's usage
+    # of the K components diverse", and is what the three regularizers
+    # above/below are actually pulling toward. Track BOTH going forward:
+    # self._effective_K near 1 is normal; self._effective_K_population near
+    # 1 is the real collapse signal.
+    # avg_resp: how much of the *whole batch's* total responsibility mass
+    # falls on each pseudo-input, aggregated over cells. Same sign/scale
+    # convention as MoVEVAE's gating_entropy_loss (synthetic_data.py):
+    # (avg_resp * log(avg_resp)).sum() ranges from -log(K) (avg_resp
+    # uniform -- every pseudo-input shares the load) to 0 (avg_resp
+    # one-hot -- one pseudo-input absorbs virtually the whole batch).
+    # epoch_vae adds lambda_entropy * this term to the loss, so minimizing
+    # loss pushes toward uniform aggregate usage.
+    # Blind spot (see class docstring): satisfiable by K identical/redundant
+    # components, which is why regularizer 2 below also exists.
+    avg_resp = resp.mean(dim=0)  # (K,), differentiable
+    self._vamp_diversity_loss = (avg_resp * (avg_resp + 1e-20).log()).sum()
+    with torch.no_grad():
+      # exp(entropy(avg_resp)) -- see the note above self._effective_K_per_sample
+      # for why this (population-level) quantity, not self._effective_K, is
+      # the real collapse diagnostic. self._vamp_diversity_loss == sum(p*log p)
+      # == -entropy(avg_resp), so entropy = -diversity_loss (reused directly,
+      # no need to recompute).
+      self._effective_K_population = torch.exp(-self._vamp_diversity_loss.detach())
+
+    # Shared reference scale for regularizers 2 and 3 below: median pairwise
+    # distance among the REAL batch's encoded posterior means (mu, not
+    # pu_mu). Ties "what counts as near/far in latent space" to the actual
+    # current scale/spread of the encoder's output, so neither regularizer
+    # needs re-tuning per latent_dim / encoder architecture / dataset (and
+    # automatically tracks the DEQ's tanh-bounded scale for
+    # DEQEncoderVampVAE, vs. an unbounded scale for plain VampPriorVAE,
+    # without needing to know which subclass this is). Detached
+    # deliberately: this is a reference scale, not something we want
+    # gradients flowing back through into the real batch's mu.
+    K = pu_mu.shape[0]
+    B = mu.shape[0]
+    with torch.no_grad():
+      if B >= 2:
+        batch_pdist = torch.cdist(mu, mu, p=2)  # (B, B)
+        off_diag_b = ~torch.eye(B, dtype=torch.bool, device=mu.device)
+        typical_scale = batch_pdist[off_diag_b].median()
+      else:
+        typical_scale = mu.new_tensor(1.0)
+      self._vamp_repulsion_typical_scale = typical_scale.detach()
+
+    # --- Anti-collapse regularizer 2: adaptive-margin pairwise repulsion ---
+    # Forces the pseudo-inputs' *encoded* posterior means (pu_mu) apart in
+    # latent space, independent of how responsibility mass happens to be
+    # distributed (closing regularizer 1's blind spot: K clones can't
+    # satisfy this one, since their pairwise distance is ~0).
+    #
+    # Caveat learned from a real training run: this alone is NOT sufficient
+    # to prevent effective_K collapse. Mutual repulsion only pushes
+    # pseudo-inputs apart from EACH OTHER -- it has no notion of "near the
+    # real data". In a high-dimensional ambient latent space, pseudo-inputs
+    # can become nicely spread out from each other (confirmed: this
+    # regularizer converges with pu_mu pairwise distance comfortably above
+    # margin) while still mostly scattering away from the (comparatively
+    # low-dimensional, per requirements.md) data manifold, leaving only ~1
+    # of K ever close enough to compete for responsibility. Regularizer 3
+    # below (coverage) is what actually targets that.
+    if K >= 2:
+      with torch.no_grad():
+        margin = typical_scale * self.repulsion_margin_frac
+        self._vamp_repulsion_margin = margin.detach()
+
+      # Hinge repulsion: only pairs closer than `margin` incur any penalty
+      # (bounded, and gives zero gradient once components are adequately
+      # spread out -- doesn't fight reconstruction/KL once diversity is
+      # achieved).
+      pu_pdist = torch.cdist(pu_mu, pu_mu, p=2)  # (K, K), differentiable
+      off_diag_k = ~torch.eye(K, dtype=torch.bool, device=pu_mu.device)
+      self._vamp_repulsion_loss = F.relu(margin - pu_pdist[off_diag_k]).pow(2).mean()
+
+      with torch.no_grad():
+        self._vamp_pu_mu_pairwise_median = pu_pdist[off_diag_k].median().detach()
+        raw_pdist = torch.cdist(self.pseudo_inputs, self.pseudo_inputs, p=2)  # (K, K), raw gene-expression space
+        self._vamp_pseudo_inputs_raw_pairwise_median = raw_pdist[off_diag_k].median().detach()
+    else:
+      self._vamp_repulsion_loss                     = pu_mu.new_tensor(0.0)
+      self._vamp_repulsion_margin                    = pu_mu.new_tensor(float('nan'))
+      self._vamp_pu_mu_pairwise_median               = pu_mu.new_tensor(float('nan'))
+      self._vamp_pseudo_inputs_raw_pairwise_median   = pu_mu.new_tensor(float('nan'))
+
+    # --- Anti-collapse regularizer 3: attraction to the real data manifold ---
+    # Pulls each pseudo-input toward its *nearest* real-batch encoded mu
+    # (a Chamfer-style coverage loss), so pseudo-inputs individually land
+    # near where the data actually is -- something regularizer 2's mutual
+    # repulsion cannot provide on its own (it only discourages pseudo-inputs
+    # from being close to EACH OTHER; nothing pulls them toward the data).
+    # Combined with repulsion, this gives the standard "attract to data,
+    # repel from siblings" pattern: pseudo-inputs get pulled onto the
+    # manifold individually, but can't all pile onto the same nearby point
+    # because repulsion still pushes them apart from each other.
+    #
+    # Distances are normalized by typical_scale (same reference as the
+    # repulsion margin) so the loss magnitude/weighting is comparable
+    # across different latent scales/architectures rather than tied to
+    # whatever the raw absolute latent-space units happen to be.
+    if K >= 1 and B >= 1:
+      # mu.detach(): this pull should be one-directional (move pu_mu toward
+      # the real data), NOT the reverse -- without detaching, gradients
+      # would also flow into the real batch's mu, pulling actual data
+      # points toward wherever the pseudo-inputs happen to be, which would
+      # distort the encoder's fit to real data instead of just repositioning
+      # the pseudo-inputs.
+      dist_to_real = torch.cdist(pu_mu, mu.detach())       # (K, B); differentiable only w.r.t. pu_mu
+      nearest_dist = dist_to_real.min(dim=1).values        # (K,) -- each pseudo-input's distance to its closest real cell
+      normalized_nearest_dist = nearest_dist / (typical_scale + 1e-6)
+      self._vamp_coverage_loss = normalized_nearest_dist.pow(2).mean()
+      with torch.no_grad():
+        self._vamp_coverage_mean_nearest_dist = nearest_dist.mean().detach()
+    else:
+      self._vamp_coverage_loss               = pu_mu.new_tensor(0.0)
+      self._vamp_coverage_mean_nearest_dist  = pu_mu.new_tensor(float('nan'))
+
     log_p = torch.logsumexp(log_p_k, dim=1) - math.log(self.n_pseudo)  # (B,)
 
-    return (log_q - log_p).mean()  # scalar
+    kl_per_sample = log_q - log_p  # (B,)
+    with torch.no_grad():
+      # Per-cell KL cost, detached -- diagnostic only (the differentiable
+      # kl_per_sample.mean() below is still what's actually optimized).
+      # Purpose: test a DIFFERENT question from vamp_usage_by_class's
+      # class-vs-pseudo-input routing. That showed classes route to
+      # disjoint pseudo-inputs (a RATE-ALLOCATION effect: it's cheaper for
+      # a class to sit in its own dedicated region than to be forced near a
+      # single global N(0,I) mode) -- but rate allocation being more
+      # class-fair doesn't imply reconstruction FIDELITY is more
+      # class-fair, since fidelity is governed by posterior precision
+      # (logvar) and decoder capacity, not by where the prior's mass sits.
+      # Group this per-cell value with class_grouped_stats and compare its
+      # between_class_variance against the equivalent quantity for a
+      # standard-prior model (see standard_gaussian_kl_per_sample) to test
+      # whether VampPrior actually makes per-class KL COST more uniform,
+      # even if per-class reconstruction ERROR (per_cell_masked_error)
+      # isn't.
+      self._vamp_kl_per_sample = kl_per_sample.detach()  # (B,)
+
+    return kl_per_sample.mean()  # scalar
 
   def forward(self, x: torch.Tensor):
     """
     Returns: (recon, mu, logvar, None, None, None)
-    Side-effect: stores VampPrior KL in self._vamp_kl after each call.
+    Side-effect: stores VampPrior KL in self._vamp_kl, plus the three
+    anti-collapse regularizer terms self._vamp_diversity_loss /
+    self._vamp_repulsion_loss / self._vamp_coverage_loss (see vampprior_kl),
+    after each call. All are picked up automatically by epoch_vae via
+    getattr/isinstance checks.
     """
     _, mu, logvar = self.encode(x)
     z = self.reparameterize(mu, logvar)
@@ -688,11 +1028,12 @@ class DEQEncoderVampVAE(VampPriorVAE):
                coeff:        float = 0.9,
                max_iter:     int = 30,
                tol:          float = 1e-4,
-               pseudo_init_samples: torch.Tensor|None = None):
+               pseudo_init_samples: torch.Tensor|None = None,
+               repulsion_margin_frac: float = 0.5):
 
     super().__init__(n_genes, latent_dim, n_pseudo,
                       hidden_dims, encoder_dims, decoder_dims, dropout,
-                      pseudo_init_samples)
+                      pseudo_init_samples, repulsion_margin_frac)
     # VampPriorVAE.__init__ already built self.encoder, self.decoder,
     # self.pseudo_inputs, and (see Subtlety #3) fc_mu/fc_logvar sized for
     # the *wrong* input dim -- replace them here.
@@ -760,7 +1101,7 @@ class DEQEncoderVampVAE(VampPriorVAE):
     return recon, mu, logvar, None, None, None
 
 
-def epoch_vae(model, loader, opt=None, mask_fraction=0.1, beta=1.0, gamma=0.2, min_free_bits=0.05, lambda_entropy=0.1):
+def epoch_vae(model, loader, opt=None, mask_fraction=0.1, beta=1.0, gamma=0.2, min_free_bits=0.05, lambda_entropy=0.1, lambda_vamp_repulsion=0.1, lambda_vamp_coverage=0.1):
   total_loss, total_err, grad_norm, recon_loss, kl_loss = 0.,0.,0.,0.,0.
 
   model.eval() if opt is None else model.train()
@@ -816,6 +1157,25 @@ def epoch_vae(model, loader, opt=None, mask_fraction=0.1, beta=1.0, gamma=0.2, m
         lambda_entropy=lambda_entropy,
         kl_override=kl_override)
 
+    # Anti-collapse regularizers for VampPriorVAE / DEQEncoderVampVAE (see
+    # VampPriorVAE.vampprior_kl docstring). Additive, independent weights:
+    # the entropy term reuses lambda_entropy (same convention as MoVEVAE's
+    # gating_entropy_loss); repulsion and coverage each get their own weight
+    # since they're geometric constraints rather than entropy targets, and
+    # target different failure modes (repulsion alone was confirmed
+    # insufficient -- see vampprior_kl -- coverage is what actually pulls
+    # pseudo-inputs toward the data manifold).
+    vamp_diversity_loss = getattr(model, '_vamp_diversity_loss', None)
+    if vamp_diversity_loss is not None:
+      loss = loss + lambda_entropy * vamp_diversity_loss
+
+    vamp_repulsion_loss = getattr(model, '_vamp_repulsion_loss', None)
+    if vamp_repulsion_loss is not None:
+      loss = loss + lambda_vamp_repulsion * vamp_repulsion_loss
+
+    vamp_coverage_loss = getattr(model, '_vamp_coverage_loss', None)
+    if vamp_coverage_loss is not None:
+      loss = loss + lambda_vamp_coverage * vamp_coverage_loss
 
     if opt:
       loss.backward()
@@ -2384,6 +2744,191 @@ def collect_deq_diagnostics(model: nn.Module) -> dict:
     return out
 
 
+def _scalar_or_none(x) -> float|None:
+    """torch scalar tensor (possibly NaN) or None -> plain float or None."""
+    if x is None:
+        return None
+    return float(x.item()) if torch.is_tensor(x) else float(x)
+
+
+def collect_vamp_diagnostics(model: nn.Module) -> dict:
+    """
+    Snapshot VampPriorVAE's collapse-related diagnostics into plain floats,
+    populated as a side effect of its most recent forward() call. Designed
+    to be called once per epoch (e.g. right after epoch_vae(...)) and
+    logged, to track whether the anti-collapse regularizers are actually
+    working over the course of training -- see VampPriorVAE's class
+    docstring and vampprior_kl's inline comments for what each field
+    distinguishes.
+
+    Safe to call on any model type -- returns a dict of Nones if *model* is
+    not a VampPriorVAE (or subclass, e.g. DEQEncoderVampVAE).
+
+    Returns a dict with keys:
+        'effective_K'                       : float or None -- PER-SAMPLE
+            mixture usage, averaged over the last training batch seen.
+            IMPORTANT: reads exactly 1.0 even in the theoretical best case
+            (see VampPriorVAE class docstring, "effective_K vs
+            effective_K_population") -- near 1.0 here is expected/routine
+            in a high-dimensional latent space, NOT necessarily collapse.
+            Use 'effective_K_population' below to actually judge collapse.
+        'effective_K_population'            : float or None -- POPULATION
+            mixture usage (entropy computed on the batch-AVERAGED
+            responsibility distribution, not averaged per-sample entropies).
+            1.0 = true collapse (one pseudo-input absorbs the whole batch),
+            up to n_pseudo = every component gets equal aggregate use. This
+            is the metric that answers whether the regularizers are
+            actually fixing collapse.
+        'diversity_loss'                     : float or None -- regularizer 1's
+            raw value (population responsibility-entropy term; more negative
+            == more uniform aggregate usage, 0 == fully collapsed)
+        'repulsion_loss'                     : float or None -- regularizer 2's
+            raw value (0 once all pseudo-input pairs clear the margin)
+        'repulsion_typical_scale'            : float or None -- real batch's
+            own mu pairwise-distance median (the margin's raw ingredient --
+            watch for this shrinking over training, see Hypothesis 1)
+        'repulsion_margin'                   : float or None -- the derived
+            threshold actually used this step (typical_scale * frac)
+        'pu_mu_pairwise_median'              : float or None -- what the
+            pseudo-inputs actually achieve post-encoding; compare against
+            repulsion_margin (gap closing/flat/widening tells you whether
+            the regularizer is winning)
+        'pseudo_inputs_raw_pairwise_median'  : float or None -- pre-encoding,
+            raw gene-expression-space spread of the pseudo_inputs parameters
+            themselves; compare against pu_mu_pairwise_median to see whether
+            any collapse originates in the raw parameters or is introduced
+            by the shared encoder/DEQ mapping them together regardless.
+        'coverage_loss'                      : float or None -- regularizer 3's
+            raw value (normalized mean squared nearest-distance; shrinks as
+            pseudo-inputs land closer to real data).
+        'coverage_mean_nearest_dist'          : float or None -- mean (over K
+            pseudo-inputs) distance to nearest real-batch cell, in raw
+            latent units (unnormalized, unlike coverage_loss) -- should
+            trend toward 0 as coverage improves; the actual diagnostic to
+            watch to confirm regularizer 3 is fixing effective_K collapse.
+    """
+    out = {
+        'effective_K':                      None,
+        'effective_K_population':           None,
+        'diversity_loss':                   None,
+        'repulsion_loss':                   None,
+        'repulsion_typical_scale':          None,
+        'repulsion_margin':                 None,
+        'pu_mu_pairwise_median':            None,
+        'pseudo_inputs_raw_pairwise_median': None,
+        'coverage_loss':                    None,
+        'coverage_mean_nearest_dist':       None,
+    }
+    if not isinstance(model, VampPriorVAE):
+        return out
+
+    out['effective_K']                      = _scalar_or_none(getattr(model, '_effective_K', None))
+    out['effective_K_population']           = _scalar_or_none(getattr(model, '_effective_K_population', None))
+    out['diversity_loss']                   = _scalar_or_none(getattr(model, '_vamp_diversity_loss', None))
+    out['repulsion_loss']                   = _scalar_or_none(getattr(model, '_vamp_repulsion_loss', None))
+    out['repulsion_typical_scale']          = _scalar_or_none(getattr(model, '_vamp_repulsion_typical_scale', None))
+    out['repulsion_margin']                 = _scalar_or_none(getattr(model, '_vamp_repulsion_margin', None))
+    out['pu_mu_pairwise_median']            = _scalar_or_none(getattr(model, '_vamp_pu_mu_pairwise_median', None))
+    out['pseudo_inputs_raw_pairwise_median']= _scalar_or_none(getattr(model, '_vamp_pseudo_inputs_raw_pairwise_median', None))
+    out['coverage_loss']                    = _scalar_or_none(getattr(model, '_vamp_coverage_loss', None))
+    out['coverage_mean_nearest_dist']       = _scalar_or_none(getattr(model, '_vamp_coverage_mean_nearest_dist', None))
+
+    return out
+
+
+def standard_gaussian_kl_per_sample(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+    """
+    Per-cell analytic KL( q(z|x) || N(0,I) ) for a standard-prior model
+    (GeneExpressionVAE, DEQEncoderVAE) -- the direct counterpart of
+    VampPriorVAE's self._vamp_kl_per_sample, computed externally since
+    mu/logvar are already returned by forward() for every model in this
+    file (no model changes needed to use this).
+
+    NOTE: intentionally does NOT apply the free-bits floor
+    (`clamp(min=free_bits)`) that masked_loss applies during training --
+    this is meant to measure each cell's actual/raw KL cost for comparison
+    against VampPriorVAE's self._vamp_kl_per_sample (which has no
+    analogous per-dimension floor either, see masked_loss's kl_override
+    branch), not to reproduce the training loss exactly.
+
+    Args:
+        mu, logvar : (B, D), as returned by encode()/forward().
+    Returns:
+        (B,) tensor -- per-cell KL cost, in the same units/scale as
+        self._vamp_kl_per_sample, so class_grouped_stats' between_class_variance
+        is directly comparable across a VampPrior model and a standard-prior
+        model at matched latent_dim.
+    """
+    kl_per_dim = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())  # (B, D)
+    return kl_per_dim.sum(dim=1)
+
+
+def analyze_kl_per_sample(models: list, x: torch.Tensor,
+                           mask_fraction: float = 0.05, *,
+                           device=device) -> dict:
+    """
+    Run a single forward pass of `x` through each model in `models` and
+    extract each model's per-cell KL cost, so a VampPrior model and a
+    standard-N(0,I)-prior model can be compared on equal footing (same
+    input batch, same masking draw, same units) via class_grouped_stats.
+
+    Uses the same masking/fill/mask-channel preprocessing as impute() (and
+    training), so every model sees input in the format/distribution it was
+    trained on -- no caller-side preprocessing needed.
+
+    Args:
+        models        : list of trained model instances (any mix of
+                         VampPriorVAE-family models -- VampPriorVAE,
+                         DEQEncoderVampVAE -- and standard-prior VAEBase
+                         models -- GeneExpressionVAE, DEQEncoderVAE, etc.
+                         Each model is `eval()`'d internally.
+        x             : (B, n_genes) raw gene-expression tensor, may
+                         contain NaN for type-1 missing values (same
+                         convention as impute()'s x_raw).
+        mask_fraction : fraction of observed positions to additionally mask
+                         out (get_random_mask-style type-2 masking), same
+                         convention/typical value as training.
+        device        : torch.device to run inference on.
+
+    Returns:
+        dict keyed by f"{type(model).__name__}#{i}" (i = models list index,
+        disambiguates multiple instances of the same class), each value a
+        (B,) CPU tensor of per-cell KL cost:
+          - VampPriorVAE-family: model._vamp_kl_per_sample (log_q - log_p)
+          - everything else (assumed standard N(0,I) prior):
+            standard_gaussian_kl_per_sample(mu, logvar)
+
+    Usage:
+        kl_by_model = analyze_kl_per_sample([vamp_model, baseline_model], x)
+        for name, kl in kl_by_model.items():
+            per_class_means, between_class_var = class_grouped_stats(kl, labels)
+            print(name, between_class_var)
+    """
+    x = x.to(device)
+    nan_mask = torch.isnan(x)                                   # type-1 positions
+    type2_mask = (torch.rand_like(x) < mask_fraction) & ~nan_mask
+    combined_mask = type2_mask | nan_mask                       # everything the model sees as missing
+
+    x_masked = _random_fill(x, combined_mask)
+    x_masked = x_masked + torch.randn_like(x_masked) * 0.05 * (~combined_mask).float()
+    x_in = torch.cat((x_masked, combined_mask.float()), dim=1)  # (B, n_genes*2)
+
+    out = {}
+    for i, model in enumerate(models):
+        model.eval()
+        with torch.no_grad():
+            _, mu, logvar, *_ = model(x_in)
+
+        if isinstance(model, VampPriorVAE):
+            kl_per_sample = model._vamp_kl_per_sample
+        else:
+            kl_per_sample = standard_gaussian_kl_per_sample(mu, logvar)
+
+        out[f"{type(model).__name__}#{i}"] = kl_per_sample.detach().cpu()
+
+    return out
+
+
 def class_grouped_stats(values: torch.Tensor, labels) -> tuple[dict, float]:
     """
     Group a per-cell diagnostic (e.g. per_cell_masked_error(...) output, or
@@ -2415,6 +2960,139 @@ def class_grouped_stats(values: torch.Tensor, labels) -> tuple[dict, float]:
 
     between_class_variance = float(np.var(list(per_class_means.values())))
     return per_class_means, between_class_variance
+
+
+def vamp_usage_by_class(model: nn.Module, labels) -> dict:
+    """
+    Test whether VampPriorVAE's mixture-usage diversity is aligned with an
+    external class/cell-type label, or merely diverse in the aggregate
+    irrespective of class (see VampPriorVAE class docstring's note on
+    self._vamp_resp).
+
+    Motivation: a healthy self._effective_K_population (e.g. ~40 out of 50)
+    confirms the mixture is used diversely *in aggregate*, but says nothing
+    about *which* cells route to *which* pseudo-inputs. It's consistent with
+    two very different scenarios: (a) different classes are routed to
+    different pseudo-inputs (class-aligned specialization -- the mechanism
+    that would predict more *consistent* per-class reconstruction error vs.
+    a single global N(0,I) prior), or (b) every class independently spreads
+    across ~the same broad set of components (diversity with no relation to
+    class identity -- which predicts no change in per-class error variance
+    relative to a standard prior, despite aggregate diversity being
+    perfectly healthy). This function distinguishes the two.
+
+    Populated as a side effect of the model's most recent forward() call
+    (self._vamp_resp, set in vampprior_kl). Call this right after a forward
+    pass over a batch/eval-set whose row order matches `labels`, same
+    convention as class_grouped_stats. Ideally called over an
+    accumulated/full eval pass rather than a single small training
+    minibatch -- per-class responsibility averages computed from only a
+    handful of cells per class (e.g. batch_size=200 split across 8 classes)
+    will be noisy.
+
+    Args:
+        model  : any model instance; safe to call on non-VampPriorVAE models
+                  (returns a dict of empty/None entries, see below).
+        labels : (B,) array-like of class ids, aligned row-for-row with the
+                  batch that produced model._vamp_resp.
+
+    Returns a dict with keys:
+        'per_class_avg_resp'               : {label: (K,) np.ndarray} -- mean
+            responsibility vector for cells of that class.
+        'per_class_effective_K_population' : {label: float} -- the SAME
+            exp(entropy(.)) metric as self._effective_K_population, computed
+            on that one class's avg_resp instead of the whole batch's.
+            Directly comparable to 'global_effective_K_population' below.
+        'global_effective_K_population'    : float or None -- recomputed
+            from the same batch's full avg_resp, for reference (should
+            match self._effective_K_population from the same forward pass,
+            up to floating point).
+        'class_pairwise_js_divergence'     : {(label_a, label_b): float} --
+            Jensen-Shannon divergence (nats) between each pair of classes'
+            avg_resp distributions. ~0 means the two classes use the
+            mixture identically; higher means they route to different
+            pseudo-inputs.
+
+    Interpretation:
+        If every class's per_class_effective_K_population is close to
+        global_effective_K_population (and pairwise JS divergences are all
+        small/near 0), the mixture's aggregate diversity is NOT
+        class-aligned -- explaining a null result on per-class
+        reconstruction error variance despite healthy aggregate diversity.
+
+        If per-class values are much LOWER than the global value (each
+        class concentrating on a distinct handful of components) and/or
+        pairwise JS divergences are large, class-aligned specialization
+        does exist -- in which case a null result on per-class error
+        variance would need a different explanation (e.g. the weak
+        effective beta / latent_dim-mismatch confounds noted alongside
+        this investigation).
+    """
+    out = {
+        'per_class_avg_resp':               {},
+        'per_class_effective_K_population': {},
+        'global_effective_K_population':    None,
+        'class_pairwise_js_divergence':     {},
+    }
+    if not isinstance(model, VampPriorVAE):
+        return out
+
+    resp = getattr(model, '_vamp_resp', None)
+    if resp is None:
+        return out
+
+    resp_np   = resp.detach().cpu().numpy()  # (B, K)
+    labels_np = np.asarray(labels)
+    assert resp_np.shape[0] == labels_np.shape[0], \
+        f"resp ({resp_np.shape[0]}) and labels ({labels_np.shape[0]}) must align"
+
+    # float64 throughout: avg_resp arrays originate from a torch tensor that
+    # may be float32, and per-sample responsibility in a high-dimensional
+    # (latent_dim=32) mixture is often extremely peaked -- many components'
+    # probability mass can be a tiny (near-subnormal) float32 value. Halving
+    # such a value while forming the JS midpoint below can round/flush to
+    # exactly 0.0 on some numpy/BLAS builds even though it's mathematically
+    # nonzero, which -- combined with the missing epsilon guard that used to
+    # be here -- produced spurious `inf` JS-divergence values (confirmed:
+    # JS divergence between two valid probability distributions is always
+    # bounded by ln(2), so `inf` can only be a numerical artifact, never a
+    # real value). float64 promotion plus the epsilon guard below closes
+    # this off directly regardless of the exact underlying rounding cause.
+    _EPS = 1e-20
+
+    def _entropy_effK(p: np.ndarray) -> float:
+        p = p.astype(np.float64)
+        p = p / p.sum()
+        ent = -(p * np.log(p + _EPS)).sum()
+        return float(np.exp(ent))
+
+    def _js_divergence(p: np.ndarray, q: np.ndarray) -> float:
+        p = p.astype(np.float64); p = p / p.sum()
+        q = q.astype(np.float64); q = q / q.sum()
+        m = 0.5 * (p + q)
+        def _kl(a, b):
+            mask = a > 0
+            # epsilon guard on both numerator and denominator: guarantees a
+            # finite result (KL/JS between valid probability distributions
+            # is mathematically always finite) even if b[mask] rounds
+            # arbitrarily close to (or, pre-fix, exactly) 0.
+            return float((a[mask] * np.log((a[mask] + _EPS) / (b[mask] + _EPS))).sum())
+        return 0.5 * _kl(p, m) + 0.5 * _kl(q, m)
+
+    out['global_effective_K_population'] = _entropy_effK(resp_np.mean(axis=0))
+
+    unique_labels = np.unique(labels_np)
+    for lbl in unique_labels:
+        avg = resp_np[labels_np == lbl].mean(axis=0)  # (K,)
+        out['per_class_avg_resp'][lbl]               = avg
+        out['per_class_effective_K_population'][lbl] = _entropy_effK(avg)
+
+    for i, lbl_a in enumerate(unique_labels):
+        for lbl_b in unique_labels[i + 1:]:
+            out['class_pairwise_js_divergence'][(lbl_a, lbl_b)] = _js_divergence(
+                out['per_class_avg_resp'][lbl_a], out['per_class_avg_resp'][lbl_b])
+
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -2474,7 +3152,7 @@ def _make_vamp_vae(n_genes:int):
         latent_dim=24,
         pseudo_init_samples=None)
 
-def _make_deq_vamp_vae(n_genes:int):
+def _make_deq_vamp_vae(n_genes:int, pseudo_init_samples=None):
     # encoder_dims/decoder_dims/latent_dim match _make_deq_encoder_vae so
     # DEQEncoderVAE vs DEQEncoderVampVAE isolates only the prior (Gaussian vs
     # Vamp); n_pseudo matches _make_vamp_vae so VampPriorVAE vs
@@ -2489,7 +3167,7 @@ def _make_deq_vamp_vae(n_genes:int):
         coeff=0.9,
         max_iter=30,
         tol=1e-4,
-        pseudo_init_samples=None)
+        pseudo_init_samples=pseudo_init_samples)
 
 def _make_means_model(n_genes:int):
     return MeansModel(n_genes=n_genes)

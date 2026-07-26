@@ -127,16 +127,20 @@ loader_train_no_batch = DataLoader(data_train, batch_size=n_cells, shuffle=True)
 #   {
 #     'model_type': <key from model_factories>,
 #     'state_dict': <model.state_dict()>,
+#     'config':     <optional dict of architecture hyperparameters, as found
+#                    on model.config after construction -- merged over the
+#                    factory's documented *_CONFIG defaults if present>,
 #   }
 # ---------------------------------------------------------------------------
 
-def load_model(path, factories=model_factories, device=device):
+def load_model(path, n_genes, factories=model_factories, device=device):
     """Load a pre-trained model from *path* and return it in eval mode.
 
     Expected checkpoint format (saved with torch.save):
         {
             'model_type': <key in model_factories>,
             'state_dict': <model.state_dict()>,
+            'config':     <optional dict, see module docstring above>,
         }
 
     Post-load fixups applied automatically:
@@ -151,7 +155,7 @@ def load_model(path, factories=model_factories, device=device):
     if model_type not in factories:
         raise ValueError(f"Unknown model_type '{model_type}'. "
                          f"Available: {list(factories)}")
-    m = factories[model_type]().to(device)
+    m = factories[model_type](n_genes, ckpt.get('config')).to(device)
     m.load_state_dict(ckpt['state_dict'])
     m.eval()
     if isinstance(m, MeansModel):
@@ -166,7 +170,7 @@ def load_model(path, factories=model_factories, device=device):
 # ---------------------------------------------------------------------------
 
 _active_model_type = 'GeneExpressionVAE'
-model = model_factories[_active_model_type]().to(device)
+model = model_factories[_active_model_type](n_genes).to(device)
 if isinstance(model, MeansModel):
     model.means.data = data_train.nanmean(dim=0).to(device)
 learning_graph_train = []
@@ -269,7 +273,7 @@ plt.ylabel('Imputation correlation');
 it_loader_train = DataLoader(data_train, batch_size=it_batch_size, shuffle=True)
 it_loader_test  = DataLoader(data_test,  batch_size=n_cells,       shuffle=False)
 
-it_model = models._make_imputation_transformer().to(device)
+it_model = models._make_imputation_transformer(n_genes).to(device)
 # Attach bin_edges as a model attribute so load_model and impute() can access
 # them without needing a separate argument.
 it_model.bin_edges = models.it_bin_edges

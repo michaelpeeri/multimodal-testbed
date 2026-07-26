@@ -3097,92 +3097,160 @@ def vamp_usage_by_class(model: nn.Module, labels) -> dict:
 
 # ---------------------------------------------------------------------------
 # Model factories
-# One callable per named architecture; each accepts a single argument: n_genes
-# an *un-trained* model instance (not yet moved to device).
+# One callable per named architecture. Each accepts:
+#   n_genes : int            -- data-dependent, not a hyperparameter
+#   config  : dict | None    -- architecture hyperparameter overrides
+# and returns an *un-trained* model instance (not yet moved to device).
+#
+# Each factory's default hyperparameters live in a named *_CONFIG dict right
+# above it -- the single source of truth for that architecture's tunables,
+# and the shape a future JSON config file would need to match. `config`, if
+# given, only needs to specify the keys it wants to change: it is merged
+# over the defaults (`{**DEFAULT_CONFIG, **(config or {})}`) and splatted
+# into the model constructor as **kwargs, so no per-key wiring is needed here
+# and unknown keys surface naturally as a TypeError from the constructor.
+# The resolved dict is stored on the returned model as `model.config`, so a
+# model's exact architecture is inspectable/self-documenting after the fact
+# (e.g. when reloaded from a checkpoint).
 # ---------------------------------------------------------------------------
 
-def _make_gene_vae(n_genes:int):
-    return GeneExpressionVAE(
-        n_genes=n_genes,
-        dropout=0.02,
-        encoder_dims=[512, 256, 128],
-        decoder_dims=[128, 256, 256],
-        latent_dim=32)
+GENE_EXPRESSION_VAE_CONFIG = {
+    'latent_dim':   32,
+    'dropout':      0.02,
+    'encoder_dims': [512, 256, 128],
+    'decoder_dims': [128, 256, 256],
+}
 
-def _make_deq_encoder_vae(n_genes:int):
-    # Matched encoder/decoder capacity to _make_gene_vae for a direct,
-    # single-variable (encoder architecture) A/B comparison.
-    return DEQEncoderVAE(
-        n_genes=n_genes,
-        dropout=0.02,
-        encoder_dims=[512, 256, 128],
-        decoder_dims=[128, 256, 256],
-        latent_dim=32,
-        coeff=0.9,
-        max_iter=30,
-        tol=1e-4)
-
-def _make_move_vae_k3(n_genes:int):
-    return MoVEVAE(
-        n_genes=n_genes,
-        n_components=3,
-        dropout=0.05,
-        encoder_dims=[200, 164, 96],
-        decoder_dims=[64, 128],
-        latent_dim=30)
-
-def _make_move_vae_k1(n_genes:int):
-    return MoVEVAE(
-        n_genes=n_genes,
-        n_components=1,
-        dropout=0.05,
-        encoder_dims=[512, 256, 128],
-        decoder_dims=[128, 200, 200],
-        latent_dim=80)
-
-def _make_vamp_vae(n_genes:int):
-    # pseudo_init_samples=None → random pseudo-inputs; a loaded state_dict will
-    # overwrite them with the saved values.
-    return VampPriorVAE(
-        n_genes=n_genes,
-        n_pseudo=50,
-        dropout=0.02,
-        encoder_dims=[512, 256],
-        decoder_dims=[200, 200],
-        latent_dim=24,
-        pseudo_init_samples=None)
-
-def _make_deq_vamp_vae(n_genes:int, pseudo_init_samples=None):
-    # encoder_dims/decoder_dims/latent_dim match _make_deq_encoder_vae so
-    # DEQEncoderVAE vs DEQEncoderVampVAE isolates only the prior (Gaussian vs
-    # Vamp); n_pseudo matches _make_vamp_vae so VampPriorVAE vs
-    # DEQEncoderVampVAE isolates only the encoder (MLP vs DEQ).
-    return DEQEncoderVampVAE(
-        n_genes=n_genes,
-        dropout=0.02,
-        encoder_dims=[512, 256, 128],
-        decoder_dims=[128, 256, 256],
-        latent_dim=32,
-        n_pseudo=50,
-        coeff=0.9,
-        max_iter=30,
-        tol=1e-4,
-        pseudo_init_samples=pseudo_init_samples)
-
-def _make_means_model(n_genes:int):
-    return MeansModel(n_genes=n_genes)
+def _make_gene_vae(n_genes:int, config:dict|None=None) -> GeneExpressionVAE:
+    cfg = {**GENE_EXPRESSION_VAE_CONFIG, **(config or {})}
+    model = GeneExpressionVAE(n_genes=n_genes, **cfg)
+    model.config = cfg
+    return model
 
 
-# Hyper-parameters (small config for ~200 genes)
-it_n_bins       = 24
-it_n_conf_bins  = 8
-it_d_gene       = 64
-it_d_count      = 64
-it_d_conf       = 32
-it_d_model      = 128   # smaller than full 256 for 200-gene scale
-it_n_heads      = 4
-it_n_layers     = 3
-it_dropout      = 0.1
+DEQ_ENCODER_VAE_CONFIG = {
+    # Matched encoder/decoder capacity to GENE_EXPRESSION_VAE_CONFIG for a
+    # direct, single-variable (encoder architecture) A/B comparison.
+    'latent_dim':   32,
+    'dropout':      0.02,
+    'encoder_dims': [512, 256, 128],
+    'decoder_dims': [128, 256, 256],
+    'coeff':        0.9,
+    'max_iter':     30,
+    'tol':          1e-4,
+}
+
+def _make_deq_encoder_vae(n_genes:int, config:dict|None=None) -> DEQEncoderVAE:
+    cfg = {**DEQ_ENCODER_VAE_CONFIG, **(config or {})}
+    model = DEQEncoderVAE(n_genes=n_genes, **cfg)
+    model.config = cfg
+    return model
+
+
+MOVE_VAE_K3_CONFIG = {
+    'latent_dim':     30,
+    'n_components':   3,
+    'gating_net_dim': 32,
+    'dropout':        0.05,
+    'encoder_dims':   [200, 164, 96],
+    'decoder_dims':   [64, 128],
+}
+
+def _make_move_vae_k3(n_genes:int, config:dict|None=None) -> MoVEVAE:
+    cfg = {**MOVE_VAE_K3_CONFIG, **(config or {})}
+    model = MoVEVAE(n_genes=n_genes, **cfg)
+    model.config = cfg
+    return model
+
+
+MOVE_VAE_K1_CONFIG = {
+    'latent_dim':     80,
+    'n_components':   1,
+    'gating_net_dim': 32,
+    'dropout':        0.05,
+    'encoder_dims':   [512, 256, 128],
+    'decoder_dims':   [128, 200, 200],
+}
+
+def _make_move_vae_k1(n_genes:int, config:dict|None=None) -> MoVEVAE:
+    cfg = {**MOVE_VAE_K1_CONFIG, **(config or {})}
+    model = MoVEVAE(n_genes=n_genes, **cfg)
+    model.config = cfg
+    return model
+
+
+VAMP_PRIOR_VAE_CONFIG = {
+    'latent_dim':            24,
+    'n_pseudo':              50,
+    'dropout':               0.02,
+    'encoder_dims':          [512, 256],
+    'decoder_dims':          [200, 200],
+    'repulsion_margin_frac': 0.5,
+}
+
+def _make_vamp_vae(n_genes:int, config:dict|None=None,
+                    pseudo_init_samples:torch.Tensor|None=None) -> VampPriorVAE:
+    # pseudo_init_samples is data-dependent (sampled from a real batch at
+    # construction time) and not JSON-serializable, so it stays a separate
+    # runtime kwarg rather than part of the config dict. None -> random
+    # pseudo-inputs; a loaded state_dict will overwrite them with the saved
+    # values regardless.
+    cfg = {**VAMP_PRIOR_VAE_CONFIG, **(config or {})}
+    model = VampPriorVAE(n_genes=n_genes, pseudo_init_samples=pseudo_init_samples, **cfg)
+    model.config = cfg
+    return model
+
+
+DEQ_ENCODER_VAMP_VAE_CONFIG = {
+    # encoder_dims/decoder_dims/latent_dim/coeff/max_iter/tol match
+    # DEQ_ENCODER_VAE_CONFIG so DEQEncoderVAE vs DEQEncoderVampVAE isolates
+    # only the prior (Gaussian vs Vamp); n_pseudo matches
+    # VAMP_PRIOR_VAE_CONFIG so VampPriorVAE vs DEQEncoderVampVAE isolates
+    # only the encoder (MLP vs DEQ).
+    'latent_dim':            32,
+    'n_pseudo':              50,
+    'dropout':               0.02,
+    'encoder_dims':          [512, 256, 128],
+    'decoder_dims':          [128, 256, 256],
+    'coeff':                 0.9,
+    'max_iter':              30,
+    'tol':                   1e-4,
+    'repulsion_margin_frac': 0.5,
+}
+
+def _make_deq_vamp_vae(n_genes:int, config:dict|None=None,
+                        pseudo_init_samples:torch.Tensor|None=None) -> DEQEncoderVampVAE:
+    cfg = {**DEQ_ENCODER_VAMP_VAE_CONFIG, **(config or {})}
+    model = DEQEncoderVampVAE(n_genes=n_genes, pseudo_init_samples=pseudo_init_samples, **cfg)
+    model.config = cfg
+    return model
+
+
+MEANS_MODEL_CONFIG = {}  # no architecture hyperparameters beyond n_genes
+
+def _make_means_model(n_genes:int, config:dict|None=None) -> MeansModel:
+    cfg = {**MEANS_MODEL_CONFIG, **(config or {})}
+    model = MeansModel(n_genes=n_genes, **cfg)
+    model.config = cfg
+    return model
+
+
+# Architecture hyperparameters (small config for ~200 genes) -- consumed by
+# _make_imputation_transformer/model_factories, not by the training loop.
+IMPUTATION_TRANSFORMER_CONFIG = {
+    'n_bins':      24,
+    'n_conf_bins': 8,
+    'd_gene':      64,
+    'd_count':     64,
+    'd_conf':      32,
+    'd_model':     128,   # smaller than full 256 for 200-gene scale
+    'n_heads':     4,
+    'n_layers':    3,
+    'dropout':     0.1,
+}
+
+# Training-loop hyperparameters (not part of the model's architecture config
+# -- consumed by epoch_transformer / the training script, not the factory).
 it_lr           = 3e-4
 it_batch_size   = 128
 it_max_epochs   = 100
@@ -3190,20 +3258,13 @@ it_mask_frac    = 0.10
 it_lambda_conf  = 0.10
 
 # Bin edges -- shared between training and evaluation
-it_bin_edges = make_log_bin_edges(it_n_bins, max_val=8.5)
+it_bin_edges = make_log_bin_edges(IMPUTATION_TRANSFORMER_CONFIG['n_bins'], max_val=8.5)
 
-def _make_imputation_transformer(n_genes:int):
-    return ImputationTransformer(
-        n_genes     = n_genes,
-        n_bins      = it_n_bins,
-        n_conf_bins = it_n_conf_bins,
-        d_gene      = it_d_gene,
-        d_count     = it_d_count,
-        d_conf      = it_d_conf,
-        d_model     = it_d_model,
-        n_heads     = it_n_heads,
-        n_layers    = it_n_layers,
-        dropout     = it_dropout)
+def _make_imputation_transformer(n_genes:int, config:dict|None=None) -> ImputationTransformer:
+    cfg = {**IMPUTATION_TRANSFORMER_CONFIG, **(config or {})}
+    model = ImputationTransformer(n_genes=n_genes, **cfg)
+    model.config = cfg
+    return model
 
 model_factories = {
     'MeansModel':           _make_means_model,

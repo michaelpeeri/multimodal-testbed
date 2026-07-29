@@ -104,11 +104,24 @@ rather than a knob to be optimized away, so it is read directly from the
 config's top-level "mask_fraction" key (same value applied to every
 model/trial) instead of being suggested by Optuna.
 
-The objective being minimized is the held-out test loss (`epoch_vae`'s for
-VAE_FAMILY_MODELS, `epoch_transformer`'s for TRANSFORMER_FAMILY_MODELS --
-both return total loss as their first element). Trials report intermediate
-test loss every `eval_every` epochs so the configured pruner can stop
-clearly-bad trials early.
+The objective being minimized is `imputation_mse_mean` -- the held-out
+imputation MSE from `models.evaluate_imputation()` (the same
+model-family-agnostic metric sample_efficiency.py reports), evaluated with
+`eval_mask_fraction`/`n_eval_mask_draws` -- NOT the raw training loss.
+Raw training loss (`epoch_vae`'s / `epoch_transformer`'s total loss) is
+still computed every `eval_every` epochs and recorded as a trial user
+attribute (`trial.user_attrs["test_loss"]`) for diagnostic/health-check
+purposes (see benchmark_plan.md's convergence checklist), but it is NOT
+comparable across model families -- see models.evaluate_imputation()'s and
+sample_efficiency.py's module docstrings for why (different loss units for
+ImputationTransformer vs. the VAE family; independently-tuned
+beta/gamma/regularizer weights baked into the VAE family's own loss
+number) -- so using it as the tuning objective would let Optuna minimize
+"loss" partly by de-weighting the very quantity (held-out reconstruction)
+that actually determines imputation quality, rather than by improving
+imputation quality itself. Trials report intermediate imputation_mse_mean
+every `eval_every` epochs so the configured pruner can stop clearly-bad
+trials early.
 
 Only models trained via `epoch_vae`'s standard 6-tuple `forward()`
 signature (VAE_FAMILY_MODELS) or `epoch_transformer`'s (count_bins,
@@ -156,6 +169,20 @@ examples. Keys:
                     observed genes masked for training/eval, forwarded as
                     epoch_vae's/epoch_transformer's mask_fraction kwarg for
                     every trial.
+    eval_mask_fraction : float, default: same as mask_fraction -- fraction
+                    used for the imputation_mse_mean objective (see
+                    "The objective being minimized" above). Exposed
+                    separately from mask_fraction in case you want the
+                    tuning objective itself evaluated at a different
+                    (e.g. harder/fixed) difficulty than the training-time
+                    masking -- mirrors sample_efficiency.py's own
+                    mask_fraction/eval_mask_fraction split.
+    n_eval_mask_draws : int, default 3 -- number of independent mask draws
+                    to average per eval_every-epoch evaluation. Kept lower
+                    than sample_efficiency.py's default of 10 since this
+                    runs every eval_every epochs x every trial (much more
+                    frequently); noise partly averages out across the many
+                    evaluations within a trial and across trials.
     min_layer_width : int, default 4 -- lower bound on every derived
                     encoder/decoder layer width (VAE_FAMILY_MODELS) or on
                     "d_model" (TRANSFORMER_FAMILY_MODELS); trials that fall
@@ -175,8 +202,18 @@ examples. Keys:
     sampler       : "tpe" (default; only option for now)
     pruner        : "median" (default; only option for now)
     output        : str, default "tuned_configs.json" -- where the final
-                    {model_name: {best_value, best_params}} summary is written
-                    (see `run()` below for the richer in-memory return value)
+                    {model_name: {best_value, best_params, best_test_loss,
+                    best_imputation_corr}, ..., "_meta": {batch_size,
+                    mask_fraction, max_epochs, eval_mask_fraction,
+                    n_eval_mask_draws}} summary is written (see `run()`
+                    below for the richer in-memory return value).
+                    best_value is imputation_mse_mean (the tuning
+                    objective, see above); "_meta" is provenance read back
+                    by sample_efficiency.py to warn about batch_size/
+                    mask_fraction mismatches between tuning and replay
+                    (see sample_efficiency.py's module docstring) -- it is
+                    not a model name and downstream readers of this file
+                    should skip keys starting with "_".
     checkpoint_dir : str, default "checkpoints" -- directory where the
                     actual trained weights of the best trial seen so far for
                     each model are kept up to date during tuning, one file
@@ -190,11 +227,13 @@ Accessing the best trained model
 Unlike `output`'s tuned_configs.json (hyperparameters only), each trial's
 *actual trained weights* are checkpointed live to
 {checkpoint_dir}/{model_name}_best.pt every time a trial improves on the
-best test loss seen so far for that model -- so at any point during, or at
-the end of, a tuning run you already have the literal best-performing
-model on disk, no retraining required. The saved dict is exactly the
-{'model_type', 'state_dict', 'config'} format vae-test.py's load_model()
-expects (plus 'test_loss', 'params', 'trial_number' for provenance)::
+best imputation_mse_mean seen so far for that model (see "The objective
+being minimized" above) -- so at any point during, or at the end of, a
+tuning run you already have the literal best-performing model on disk, no
+retraining required. The saved dict is exactly the {'model_type',
+'state_dict', 'config'} format vae-test.py's load_model() expects (plus
+'imputation_mse_mean', 'test_loss', 'imputation_corr_mean', 'params',
+'trial_number' for provenance)::
 
     from vae_test import load_model   # or however load_model is imported
     best_model = load_model("checkpoints/GeneExpressionVAE_best.pt", n_genes)
@@ -233,10 +272,12 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from models import (
-    model_factories, epoch_vae, VampPriorVAE, device,
+    model_factories, epoch_vae, device,
     epoch_transformer, make_log_bin_edges,
     IMPUTATION_TRANSFORMER_CONFIG,
+    evaluate_imputation, collect_vamp_diagnostics,
 )
+from synthetic_data import _random_fill
 
 
 # Models trainable via epoch_vae's standard 6-tuple forward() convention.
@@ -261,6 +302,12 @@ TRANSFORMER_FAMILY_MODELS = [
 
 # All models `run()`/`load_config()` will accept in config["models"].
 ALL_TUNABLE_MODELS = VAE_FAMILY_MODELS + TRANSFORMER_FAMILY_MODELS
+
+# VAE_FAMILY_MODELS subset that uses a VampPrior (pseudo-input mixture
+# prior) -- these get their pseudo_inputs initialized from real training
+# data rather than random noise (see run_trial/retrain and models.py's
+# _make_vamp_vae/_make_deq_vamp_vae docstrings).
+VAMP_FAMILY_MODELS = {"VampPriorVAE", "DEQEncoderVampVAE"}
 
 _SAMPLERS = {
     "tpe": lambda: optuna.samplers.TPESampler(seed=0),
@@ -315,6 +362,8 @@ _CONFIG_DEFAULTS = {
     "pruner":          "median",
     "output":          "tuned_configs.json",
     "mask_fraction":   0.1,
+    "eval_mask_fraction": None,  # default: same as mask_fraction, see load_config
+    "n_eval_mask_draws":  3,
     "min_layer_width": 4,
     "max_layer_width": 4096,
     "checkpoint_dir":  "checkpoints",
@@ -369,6 +418,9 @@ def load_config(path: str) -> dict:
         raise ValueError(f"Unsupported sampler {config['sampler']!r}. Supported: {list(_SAMPLERS)}")
     if config["pruner"] not in _PRUNERS:
         raise ValueError(f"Unsupported pruner {config['pruner']!r}. Supported: {list(_PRUNERS)}")
+
+    if config["eval_mask_fraction"] is None:
+        config["eval_mask_fraction"] = config["mask_fraction"]
 
     return config
 
@@ -564,11 +616,19 @@ def retrain(model_name: str,
     tuning run's chosen hyperparameters -- e.g. to build an ensemble, or to
     check run-to-run variance of a given architecture/training-loop config.
 
+    VampPrior-family models (VAMP_FAMILY_MODELS) have their pseudo-inputs
+    initialized from a real batch of loader_train's data (type-1 NaNs
+    replaced via `_random_fill`'s per-gene N(mean, std) draw, same as
+    everywhere else in this file real data is fed to a model -- see
+    AGENTS.md's "Known Issues"), matching run_trial -- see models.py's
+    `_make_vamp_vae` docstring.
+
     Returns a list of `n_copies` trained (eval-mode) model instances, in the
     same order they were trained. If `checkpoint_dir` is given, each copy is
     also saved to {checkpoint_dir}/{model_name}_retrain_{i}.pt in the same
     {'model_type', 'state_dict', 'config'} format vae-test.py's load_model()
-    expects (plus 'test_loss' and 'params' for provenance).
+    expects (plus 'test_loss', 'imputation_mse_mean', 'imputation_corr_mean'
+    and 'params' for provenance).
 
     `mask_fraction` and `max_epochs` are passed explicitly (rather than read
     from `params`) for the same reason tuning.py never tunes mask_fraction
@@ -603,8 +663,17 @@ def retrain(model_name: str,
     is_transformer = model_name in TRANSFORMER_FAMILY_MODELS
     trained = []
 
+    # Real-batch pseudo-input init for VampPrior-family models (see
+    # VAMP_FAMILY_MODELS / models.py's _make_vamp_vae docstring).
+    pseudo_init_samples = None
+    if model_name in VAMP_FAMILY_MODELS:
+        for x in loader_train:
+            pseudo_init_samples = _random_fill(x, torch.isnan(x)).to(device)
+            break
+
     for i in range(n_copies):
-        model = model_factories[model_name](n_genes, config=arch_cfg).to(device)
+        factory_kwargs = {"pseudo_init_samples": pseudo_init_samples} if model_name in VAMP_FAMILY_MODELS else {}
+        model = model_factories[model_name](n_genes, config=arch_cfg, **factory_kwargs).to(device)
         opt = optim.AdamW(model.parameters(), lr=lr)
 
         if is_transformer:
@@ -625,16 +694,22 @@ def retrain(model_name: str,
             test_loss, *_ = epoch_vae(model, loader_test, None, mask_fraction=mask_fraction, **train_kwargs)
 
         test_loss = float(test_loss)
-        print(f"  retrain {i + 1}/{n_copies} of {model_name}: test_loss={test_loss:.4f}")
+        imp_metrics = evaluate_imputation(model, loader_test, mask_fraction, n_draws=3, device=device)
+        print(f"  retrain {i + 1}/{n_copies} of {model_name}: test_loss={test_loss:.4f} "
+              f"(diagnostic only, not cross-model-comparable) "
+              f"imputation_mse={imp_metrics['imputation_mse_mean']:.4f} "
+              f"imputation_corr={imp_metrics['imputation_corr_mean']:.4f}")
 
         if checkpoint_dir is not None:
             path = Path(checkpoint_dir) / f"{model_name}_retrain_{i}.pt"
             torch.save({
-                "model_type": model_name,
-                "state_dict": model.state_dict(),
-                "config":     model.config,
-                "test_loss":  test_loss,
-                "params":     params,
+                "model_type":            model_name,
+                "state_dict":            model.state_dict(),
+                "config":                model.config,
+                "test_loss":             test_loss,
+                "imputation_mse_mean":   imp_metrics["imputation_mse_mean"],
+                "imputation_corr_mean":  imp_metrics["imputation_corr_mean"],
+                "params":                params,
             }, path)
 
         trained.append(model)
@@ -642,11 +717,12 @@ def retrain(model_name: str,
     return trained
 
 
-def _save_if_best_checkpoint(model, model_name: str, test_loss: float,
-                              trial: optuna.Trial, checkpoint_dir: str) -> None:
-    """If *test_loss* improves on whatever is currently recorded in
-    {checkpoint_dir}/{model_name}_best.pt (or that file doesn't exist yet),
-    overwrite it with *model*'s current weights.
+def _save_if_best_checkpoint(model, model_name: str, objective_value: float,
+                              extra_info: dict, trial: optuna.Trial, checkpoint_dir: str) -> None:
+    """If *objective_value* (imputation_mse_mean -- see module docstring's
+    "The objective being minimized") improves on whatever is currently
+    recorded in {checkpoint_dir}/{model_name}_best.pt (or that file doesn't
+    exist yet), overwrite it with *model*'s current weights.
 
     Deliberately self-contained: the "current best" is read straight back
     out of the checkpoint file itself rather than from Optuna's study state,
@@ -656,34 +732,37 @@ def _save_if_best_checkpoint(model, model_name: str, test_loss: float,
     session simply becomes the new saved baseline.
 
     The saved dict is exactly the {'model_type', 'state_dict', 'config'}
-    format vae-test.py's load_model() expects, plus 'test_loss', 'params'
-    and 'trial_number' for provenance -- 'params' is also directly reusable
-    as the `params` argument to resolve_model_config()/retrain() if you want
-    to train further independent copies of this exact configuration.
+    format vae-test.py's load_model() expects, plus 'imputation_mse_mean',
+    whatever's in *extra_info* (e.g. 'test_loss', 'imputation_corr_mean' --
+    diagnostic only, see module docstring), 'params' and 'trial_number' for
+    provenance -- 'params' is also directly reusable as the `params`
+    argument to resolve_model_config()/retrain() if you want to train
+    further independent copies of this exact configuration.
     """
-    test_loss = float(test_loss)
-    if not math.isfinite(test_loss):
+    objective_value = float(objective_value)
+    if not math.isfinite(objective_value):
         return
 
     path = Path(checkpoint_dir) / f"{model_name}_best.pt"
     if path.exists():
         try:
-            prev_loss = torch.load(path, map_location="cpu").get("test_loss", float("inf"))
+            prev_value = torch.load(path, map_location="cpu").get("imputation_mse_mean", float("inf"))
         except Exception:
-            prev_loss = float("inf")
-        if test_loss >= prev_loss:
+            prev_value = float("inf")
+        if objective_value >= prev_value:
             return
 
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save({
-        "model_type":   model_name,
-        "state_dict":   model.state_dict(),
-        "config":       model.config,
-        "test_loss":    test_loss,
-        "params":       trial.params,
-        "trial_number": trial.number,
+        "model_type":          model_name,
+        "state_dict":          model.state_dict(),
+        "config":              model.config,
+        "imputation_mse_mean": objective_value,
+        **extra_info,
+        "params":              trial.params,
+        "trial_number":        trial.number,
     }, path)
-    tqdm.write(f"  [checkpoint] new best {model_name}: test_loss={test_loss:.4f} -> {path}")
+    tqdm.write(f"  [checkpoint] new best {model_name}: imputation_mse_mean={objective_value:.4f} -> {path}")
 
 
 def run_trial(trial: optuna.Trial,
@@ -695,14 +774,27 @@ def run_trial(trial: optuna.Trial,
               max_epochs: int,
               eval_every: int,
               mask_fraction: float,
+              eval_mask_fraction: float,
+              n_eval_mask_draws: int,
               default_latent_dim: int,
               n_encoder_layers: int,
               n_decoder_layers: int,
               min_layer_width: int,
               max_layer_width: int,
-              checkpoint_dir: str) -> float:
+              checkpoint_dir: str,
+              pseudo_init_data: torch.Tensor | None = None) -> float:
     """Build a fresh model, train it for max_epochs, report intermediate
-    held-out test loss for pruning, and return the final test loss."""
+    imputation_mse_mean for pruning (see module docstring's "The objective
+    being minimized"), and return the final imputation_mse_mean.
+
+    pseudo_init_data: a real (possibly NaN-containing) batch of training
+    data, used to initialize VampPrior-family models' (VAMP_FAMILY_MODELS)
+    pseudo-inputs instead of random noise -- ignored for other model
+    families. Type-1 NaNs are replaced via `_random_fill` (per-gene
+    N(mean, std), not a fixed sentinel -- see AGENTS.md's "Known Issues")
+    before being handed to the model factory. See models.py's
+    `_make_vamp_vae`/`_make_deq_vamp_vae` docstrings.
+    """
     cfg = suggest_train_cfg(trial, search_space)
     lr = cfg.pop("lr", 3e-4)
     cfg["mask_fraction"] = mask_fraction
@@ -723,10 +815,16 @@ def run_trial(trial: optuna.Trial,
     if arch_cfg:
         trial.set_user_attr("arch_cfg", arch_cfg)
 
-    model = model_factories[model_name](n_genes, config=arch_cfg).to(device)
+    factory_kwargs = {}
+    if model_name in VAMP_FAMILY_MODELS and pseudo_init_data is not None:
+        factory_kwargs["pseudo_init_samples"] = _random_fill(pseudo_init_data, torch.isnan(pseudo_init_data)).to(device)
+
+    model = model_factories[model_name](n_genes, config=arch_cfg, **factory_kwargs).to(device)
     opt = optim.AdamW(model.parameters(), lr=lr)
 
-    test_loss = float("inf")
+    test_loss = float("inf")  # diagnostic only, see module docstring -- NOT the objective
+    imputation_mse = float("inf")
+    imp_metrics = {"imputation_corr_mean": float("nan")}
     epoch_bar = tqdm(range(max_epochs), desc=f"{model_name} #{trial.number}", leave=False)
     for epoch in epoch_bar:
         epoch_vae(model, loader_train, opt, **cfg)
@@ -736,25 +834,40 @@ def run_trial(trial: optuna.Trial,
             if not math.isfinite(test_loss):
                 raise optuna.TrialPruned()
 
+            imp_metrics = evaluate_imputation(model, loader_test, eval_mask_fraction,
+                                               n_eval_mask_draws, device=device)
+            imputation_mse = imp_metrics["imputation_mse_mean"]
+            if not math.isfinite(imputation_mse):
+                raise optuna.TrialPruned()
+
             try:
                 best = trial.study.best_value
             except ValueError:
                 best = None
             epoch_bar.set_postfix(
+                imp_mse=f"{imputation_mse:.4f}",
                 test_loss=f"{test_loss:.4f}",
                 best=f"{best:.4f}" if best is not None else "n/a",
             )
 
-            trial.report(test_loss, epoch)
+            trial.report(imputation_mse, epoch)
             if trial.should_prune():
                 raise optuna.TrialPruned()
 
-    if isinstance(model, VampPriorVAE):
-        trial.set_user_attr("effective_K_population", model._effective_K_population.item())
+    vamp_diag = collect_vamp_diagnostics(model)
+    if vamp_diag["effective_K_population"] is not None:
+        trial.set_user_attr("effective_K_population", vamp_diag["effective_K_population"])
 
-    _save_if_best_checkpoint(model, model_name, test_loss, trial, checkpoint_dir)
+    trial.set_user_attr("test_loss", test_loss)
+    trial.set_user_attr("imputation_corr_mean", imp_metrics["imputation_corr_mean"])
 
-    return test_loss
+    _save_if_best_checkpoint(
+        model, model_name, imputation_mse,
+        {"test_loss": test_loss, "imputation_corr_mean": imp_metrics["imputation_corr_mean"]},
+        trial, checkpoint_dir,
+    )
+
+    return imputation_mse
 
 
 def run_trial_transformer(trial: optuna.Trial,
@@ -766,12 +879,15 @@ def run_trial_transformer(trial: optuna.Trial,
                            max_epochs: int,
                            eval_every: int,
                            mask_fraction: float,
+                           eval_mask_fraction: float,
+                           n_eval_mask_draws: int,
                            min_layer_width: int,
                            max_layer_width: int,
                            checkpoint_dir: str) -> float:
     """ImputationTransformer counterpart of run_trial: build a fresh model,
     train it for max_epochs via epoch_transformer, report intermediate
-    held-out test loss for pruning, and return the final test loss."""
+    imputation_mse_mean for pruning (see module docstring's "The objective
+    being minimized"), and return the final imputation_mse_mean."""
     cfg = suggest_transformer_train_cfg(trial, search_space)
     lr = cfg.pop("lr", 3e-4)
     lambda_conf = cfg.pop("lambda_conf", 0.10)
@@ -798,9 +914,12 @@ def run_trial_transformer(trial: optuna.Trial,
 
     model = model_factories[model_name](n_genes, config=arch_cfg).to(device)
     bin_edges = make_log_bin_edges(model.n_bins, max_val=8.5)
+    model.bin_edges = bin_edges  # impute()/evaluate_imputation() read this attribute
     opt = optim.AdamW(model.parameters(), lr=lr)
 
-    test_loss = float("inf")
+    test_loss = float("inf")  # diagnostic only, see module docstring -- NOT the objective
+    imputation_mse = float("inf")
+    imp_metrics = {"imputation_corr_mean": float("nan")}
     epoch_bar = tqdm(range(max_epochs), desc=f"{model_name} #{trial.number}", leave=False)
     for epoch in epoch_bar:
         epoch_transformer(model, loader_train, bin_edges, opt,
@@ -812,22 +931,36 @@ def run_trial_transformer(trial: optuna.Trial,
             if not math.isfinite(test_loss):
                 raise optuna.TrialPruned()
 
+            imp_metrics = evaluate_imputation(model, loader_test, eval_mask_fraction,
+                                               n_eval_mask_draws, device=device)
+            imputation_mse = imp_metrics["imputation_mse_mean"]
+            if not math.isfinite(imputation_mse):
+                raise optuna.TrialPruned()
+
             try:
                 best = trial.study.best_value
             except ValueError:
                 best = None
             epoch_bar.set_postfix(
+                imp_mse=f"{imputation_mse:.4f}",
                 test_loss=f"{test_loss:.4f}",
                 best=f"{best:.4f}" if best is not None else "n/a",
             )
 
-            trial.report(test_loss, epoch)
+            trial.report(imputation_mse, epoch)
             if trial.should_prune():
                 raise optuna.TrialPruned()
 
-    _save_if_best_checkpoint(model, model_name, test_loss, trial, checkpoint_dir)
+    trial.set_user_attr("test_loss", test_loss)
+    trial.set_user_attr("imputation_corr_mean", imp_metrics["imputation_corr_mean"])
 
-    return test_loss
+    _save_if_best_checkpoint(
+        model, model_name, imputation_mse,
+        {"test_loss": test_loss, "imputation_corr_mean": imp_metrics["imputation_corr_mean"]},
+        trial, checkpoint_dir,
+    )
+
+    return imputation_mse
 
 
 def trial_summary_callback(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
@@ -863,12 +996,18 @@ def run_study_for_model(model_name: str,
                          config: dict,
                          n_genes: int,
                          loader_train,
-                         loader_test) -> optuna.Study:
+                         loader_test,
+                         pseudo_init_data: torch.Tensor | None = None) -> optuna.Study:
+    """pseudo_init_data: a real batch of training data (possibly
+    NaN-containing -- run_trial applies `_random_fill` before use, see its
+    docstring), forwarded to run_trial for VAMP_FAMILY_MODELS' pseudo-input
+    initialization -- ignored for other model families (including all of
+    TRANSFORMER_FAMILY_MODELS)."""
     if model_name in TRANSFORMER_FAMILY_MODELS:
         objective = lambda trial: run_trial_transformer(
             trial, model_name, n_genes, loader_train, loader_test,
             config["search_space"], config["max_epochs"], config["eval_every"],
-            config["mask_fraction"],
+            config["mask_fraction"], config["eval_mask_fraction"], config["n_eval_mask_draws"],
             config["min_layer_width"], config["max_layer_width"],
             config["checkpoint_dir"],
         )
@@ -886,10 +1025,11 @@ def run_study_for_model(model_name: str,
         objective = lambda trial: run_trial(
             trial, model_name, n_genes, loader_train, loader_test,
             config["search_space"], config["max_epochs"], config["eval_every"],
-            config["mask_fraction"],
+            config["mask_fraction"], config["eval_mask_fraction"], config["n_eval_mask_draws"],
             default_latent_dim, n_encoder_layers, n_decoder_layers,
             config["min_layer_width"], config["max_layer_width"],
             config["checkpoint_dir"],
+            pseudo_init_data=pseudo_init_data,
         )
 
     study = optuna.create_study(
@@ -936,8 +1076,17 @@ def run(config_path: str) -> dict:
     (the sqlite db, by default) under study_name f"tune_{model_name}", so it
     can be reloaded/resumed later via optuna.load_study() even without
     calling this function again. A plain-JSON summary
-    ({model_name: {"best_value": float, "best_params": dict}}) is written
-    to config["output"] (default tuned_configs.json) for convenience.
+    ({model_name: {"best_value": float, "best_params": dict, "best_test_loss":
+    float, "best_imputation_corr": float}, ..., "_meta": {...}}) is written
+    to config["output"] (default tuned_configs.json) for convenience --
+    best_value is imputation_mse_mean (the tuning objective, see module
+    docstring's "The objective being minimized"); best_test_loss/
+    best_imputation_corr are read back from the best trial's user_attrs
+    (diagnostic only, not cross-model-comparable for test_loss -- see
+    module docstring); "_meta" is provenance consumed by
+    sample_efficiency.py to warn about batch_size/mask_fraction mismatches
+    between tuning and replay (see sample_efficiency.py's module
+    docstring) -- not a model name.
     """
     config = load_config(config_path)
 
@@ -955,19 +1104,47 @@ def run(config_path: str) -> dict:
     loader_train = DataLoader(loaded["gene_reads_train"], batch_size=batch_size, shuffle=True )
     loader_test  = DataLoader(loaded["gene_reads_test"],  batch_size=n_cells,    shuffle=False)
 
+    # Real training data used to initialize VAMP_FAMILY_MODELS' pseudo-inputs
+    # (see run_trial/run_study_for_model) -- ignored for other families.
+    # The full tensor (not just one minibatch) is used since it's only ever
+    # indexed into (torch.randint sampling in VampPriorVAE.__init__), never
+    # trained on directly, so there's no cost to it being large/representative.
+    # (run_trial applies _random_fill to replace type-1 NaNs before use.)
+    pseudo_init_data = loaded["gene_reads_train"]
+
     print(
         f"n_genes={n_genes}  n_cells={n_cells}  batch_size={batch_size}  "
-        f"mask_fraction={mask_fraction}  device={device}"
+        f"mask_fraction={mask_fraction}  eval_mask_fraction={config['eval_mask_fraction']}  "
+        f"n_eval_mask_draws={config['n_eval_mask_draws']}  device={device}"
     )
 
     studies = {}
     for model_name in config["models"]:
-        studies[model_name] = run_study_for_model(model_name, config, n_genes, loader_train, loader_test)
+        studies[model_name] = run_study_for_model(
+            model_name, config, n_genes, loader_train, loader_test,
+            pseudo_init_data=pseudo_init_data,
+        )
 
-    summary = {
-        model_name: {"best_value": study.best_value, "best_params": study.best_params}
-        for model_name, study in studies.items()
+    summary = {}
+    for model_name, study in studies.items():
+        user_attrs = study.best_trial.user_attrs
+        summary[model_name] = {
+            "best_value":           study.best_value,
+            "best_params":          study.best_params,
+            "best_test_loss":       user_attrs.get("test_loss"),
+            "best_imputation_corr": user_attrs.get("imputation_corr_mean"),
+        }
+        if "effective_K_population" in user_attrs:
+            summary[model_name]["best_effective_K_population"] = user_attrs["effective_K_population"]
+
+    summary["_meta"] = {
+        "batch_size":         batch_size,
+        "mask_fraction":      mask_fraction,
+        "max_epochs":         config["max_epochs"],
+        "eval_mask_fraction": config["eval_mask_fraction"],
+        "n_eval_mask_draws":  config["n_eval_mask_draws"],
     }
+
     out_path = Path(config["output"])
     with open(out_path, "w") as f:
         json.dump(summary, f, indent=2)

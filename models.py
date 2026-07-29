@@ -2646,6 +2646,73 @@ def impute(model, x_raw, frac, *, device=device):
     return recon, type2_mask.cpu()
 
 
+def evaluate_imputation(model, loader_test, mask_fraction: float, n_draws: int,
+                         device=device) -> dict:
+    """Unified imputation-quality metric, usable for *any* model type
+    supported by impute() (VAEBase subclasses / MeansModel /
+    ImputationTransformer).
+
+    This is the single source of truth for "how good is this model's
+    imputation" -- both tuning.py's Optuna objective and
+    sample_efficiency.py's reported metrics call this, specifically so the
+    two pipelines can't drift apart and so the resulting number is
+    comparable *across model families* (unlike each model's own training
+    loss -- see sample_efficiency.py's module docstring / benchmark_plan.md
+    for why raw loss values are not comparable across architectures: they
+    mix incommensurable units -- e.g. ImputationTransformer's categorical
+    cross-entropy vs. the VAE family's Gaussian MSE + KL -- and bake in
+    independently-tuned per-model loss weights like beta/gamma).
+
+    Draws a fresh type-2 mask *n_draws* times (via impute()) over every
+    batch in loader_test and pools all (true, predicted) pairs from every
+    draw before computing MSE/correlation, matching how
+    sample_efficiency.py's original correlation-only metric was computed.
+
+    Args:
+        model:         any model type impute() supports; must already be
+                       trained (this puts it in eval mode itself).
+        loader_test:   DataLoader over the held-out test set.
+        mask_fraction: fraction of observed positions to hold out for
+                       scoring on each draw (impute()'s `frac`).
+        n_draws:       number of independent mask draws to average over --
+                       a single draw is noisy (see benchmark_plan.md's
+                       "Metrics" section).
+        device:        torch device to run inference on.
+
+    Returns:
+        {'imputation_mse_mean':  float, 'imputation_mse_std':  float,
+         'imputation_corr_mean': float, 'imputation_corr_std': float}
+        -- mean/std are taken across the n_draws per-draw values (matching
+        sample_efficiency.py's original semantics for the correlation
+        fields), std is 0.0 if n_draws == 1.
+    """
+    mses, corrs = [], []
+    model.eval()
+    with torch.no_grad():
+        for _ in range(n_draws):
+            true_all, pred_all = [], []
+            for x in loader_test:
+                recon, type2_mask = impute(model, x, mask_fraction, device=device)
+                if type2_mask.any():
+                    true_all.append(x[type2_mask].numpy())
+                    pred_all.append(recon[type2_mask].numpy())
+            if true_all:
+                true_vals = np.concatenate(true_all)
+                pred_vals = np.concatenate(pred_all)
+                mses.append(float(np.mean((pred_vals - true_vals) ** 2)))
+                corrs.append(np.corrcoef(true_vals, pred_vals)[0, 1] if len(true_vals) > 1 else float("nan"))
+            else:
+                mses.append(float("nan"))
+                corrs.append(float("nan"))
+
+    return {
+        "imputation_mse_mean":  float(np.nanmean(mses)),
+        "imputation_mse_std":   float(np.nanstd(mses)),
+        "imputation_corr_mean": float(np.nanmean(corrs)),
+        "imputation_corr_std":  float(np.nanstd(corrs)),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Per-cell / per-class diagnostics
 #

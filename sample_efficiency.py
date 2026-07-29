@@ -31,18 +31,38 @@ this:
      evaluated at its own best-found hyperparameters, not a shared default.
   3. Trains it from scratch on the subset for "max_epochs" epochs.
   4. Evaluates it on the *full, fixed* held-out test set (never subsetted):
-       - held-out loss (epoch_vae's / epoch_transformer's total loss), and
-       - imputation correlation on type-2-masked positions at a fixed
-         "eval_mask_fraction", averaged over "n_eval_mask_draws" independent
-         mask draws (a single draw is noisy -- see benchmark_plan.md's
-         "Metrics" section).
+       - held-out loss (epoch_vae's / epoch_transformer's total loss --
+         diagnostic only, see "Cross-model metric comparability" below),
+       - imputation MSE and correlation on type-2-masked positions at a
+         fixed "eval_mask_fraction", averaged over "n_eval_mask_draws"
+         independent mask draws (a single draw is noisy -- see
+         benchmark_plan.md's "Metrics" section), and
+       - health-check diagnostics (effective_K_population for
+         VampPrior-family models, DEQ residual for DEQ-family models --
+         None when not applicable).
   5. Repeats steps 1-4 "n_repeats" times with different random subsets, so
      the write-up can report mean +/- std instead of a single noisy run.
 
-Both the model's own imputation-correlation metric and the fact that
-`models.impute()` already handles every supported model type uniformly
-(VAEBase subclasses, MeansModel, ImputationTransformer) is what lets this
-script sweep "a few model families" through one unified loop.
+`models.evaluate_imputation()` (which wraps `models.impute()`, itself
+uniform across VAEBase subclasses / MeansModel / ImputationTransformer) is
+what lets this script sweep multiple model families through one loop.
+
+Cross-model metric comparability
+-----------------------------------
+`test_loss` is **not comparable across model families** and should be
+treated as a diagnostic/health-check signal only (per benchmark_plan.md's
+convergence checklist), not as a cross-model quality metric:
+ImputationTransformer's loss is categorical cross-entropy (a different
+unit entirely from the VAE family's Gaussian MSE + KL), and each VAE
+family model's `beta`/`gamma`/regularizer weights are independently tuned
+by tuning.py, so even within the VAE family the *same* total_loss number
+reflects a different weighted mixture of quantities per model. Use
+`imputation_mse_mean` or `imputation_corr_mean` (both from the shared
+`models.evaluate_imputation()`, the same function tuning.py's Optuna
+objective now uses -- see tuning.py's module docstring) for any
+cross-model comparison instead. `recon_loss_type2` (the VAE family's raw,
+un-weighted MSE on held-out positions, `None` for ImputationTransformer/
+MeansModel) is also reported for within-VAE-family diagnostics.
 
 Paired subsets
 ---------------
@@ -83,8 +103,8 @@ equalized, since that's the confound that otherwise dominates. The actual
 recorded in the output CSV. Set `steps_budget` explicitly in the config to
 bypass this derivation and specify the total step count directly.
 
-mask_fraction caveat
----------------------
+mask_fraction / batch_size caveat, and tuning-provenance validation
+----------------------------------------------------------------------
 tuned_configs.json's best_params never includes `mask_fraction` (tuning.py
 treats it as a fixed problem-difficulty knob, not something to tune -- see
 tuning.py's module docstring). For the training/eval budget replayed here
@@ -93,6 +113,20 @@ mask_fraction value(s) that were used in the tuning run, via this script's
 own top-level "mask_fraction" config key (float, applied to every model) or
 a per-model dict ({"GeneExpressionVAE": 0.1, "ImputationTransformer": 0.2,
 ...}) if different model families were tuned with different mask fractions.
+Similarly, `batch_size` here should match tuning.py's `batch_size`: a
+mismatch silently changes the number of optimizer steps/epoch relative to
+what tuning saw (see "Training budget" above), which previously caused a
+model retrained here at the largest train_size to train for a different
+total step count -- and therefore reach a different loss -- than tuning.py
+did for the exact same hyperparameters.
+
+tuning.py's run() now writes both of these (plus max_epochs) into a
+reserved "_meta" key in tuned_configs.json (see tuning.py's module
+docstring). run() here reads it back and prints a warning (not a hard
+error) if this sweep's own `batch_size`/`mask_fraction` don't match --
+check that warning if your results look surprising. tuned_configs.json
+files from before this check existed simply have no "_meta" key, in which
+case the check is skipped.
 
 Problem file schema
 --------------------
@@ -104,7 +138,8 @@ JSON config schema
     problem_fn         : str, required
     tuned_configs_fn    : str, default "tuned_configs.json" -- summary written
                           by tuning.run() ({model_name: {"best_value":...,
-                          "best_params":...}})
+                          "best_params":...}, ..., "_meta": {"batch_size":...,
+                          "mask_fraction":..., "max_epochs":...}})
     models              : list[str], default: every key in tuned_configs_fn.
                           "MeansModel" may be included even though it's never
                           tuned (no hyperparameters) -- it's fit directly from
@@ -131,14 +166,32 @@ JSON config schema
     batch_size          : int, default 256 (capped at the subset size)
     mask_fraction       : float | dict[str, float], default 0.1
     eval_mask_fraction  : float, default 0.2 -- fixed "hard" fraction used
-                          for the imputation-correlation eval metric.
+                          for the imputation MSE/correlation eval metric
+                          (models.evaluate_imputation()).
     n_eval_mask_draws   : int, default 10
     seed                : int, default 0
     output              : str, default "sample_efficiency_results.csv" --
-                          one row per (model, train_size, repeat)
+                          one row per (model, train_size, repeat), columns:
+                          model, train_size, repeat, epochs_run, steps_run,
+                          test_loss (diagnostic only -- see "Cross-model
+                          metric comparability" above), recon_loss_type2
+                          (VAE family only, None otherwise),
+                          imputation_mse_mean/std, imputation_corr_mean/std
+                          (both cross-model-comparable),
+                          effective_K_population (VampPrior family only),
+                          deq_residual (DEQ family only).
     summary_output      : str, default "sample_efficiency_summary.json" --
-                          mean/std aggregated over repeats
+                          mean/std of the above aggregated over repeats
     plot_output         : str, default "sample_efficiency.png"
+
+VampPrior-family pseudo-input initialization
+-----------------------------------------------
+VampPriorVAE / DEQEncoderVampVAE are constructed here with
+`pseudo_init_samples` set to the current subset's real data (type-1 NaNs
+replaced via `_random_fill`'s per-gene N(mean, std) draw, not a fixed
+sentinel -- see AGENTS.md's "Known Issues") rather than random noise,
+matching tuning.py's own run_trial/retrain (see tuning.py's module
+docstring and models.py's `_make_vamp_vae` docstring).
 """
 
 import argparse
@@ -153,11 +206,13 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from models import (
-    model_factories, epoch_vae, epoch_transformer, impute,
+    model_factories, epoch_vae, epoch_transformer, evaluate_imputation,
+    collect_deq_diagnostics, collect_vamp_diagnostics,
     make_log_bin_edges, device,
 )
+from synthetic_data import _random_fill
 from tuning import (
-    ALL_TUNABLE_MODELS, TRANSFORMER_FAMILY_MODELS,
+    ALL_TUNABLE_MODELS, TRANSFORMER_FAMILY_MODELS, VAMP_FAMILY_MODELS,
     resolve_model_config,
 )
 
@@ -232,6 +287,47 @@ def mask_fraction_for(config: dict, model_name: str) -> float:
     return mf
 
 
+def _check_tuning_provenance(config: dict, tuned_configs: dict, models_to_run: list[str]) -> None:
+    """Warn (not error) if this sweep's batch_size/mask_fraction don't match
+    what tuning.py actually used to produce tuned_configs -- a mismatch here
+    silently changes the total optimizer-step count and/or task difficulty
+    relative to what each model's hyperparameters were tuned for (see the
+    module docstring's "mask_fraction caveat" and "Training budget"
+    sections). tuning.py's run() writes this provenance into a reserved
+    "_meta" key (added alongside the per-model entries) -- older
+    tuned_configs.json files without it are simply skipped (nothing to
+    check against)."""
+    meta = tuned_configs.get("_meta")
+    if not meta:
+        print("  [provenance] tuned_configs has no '_meta' block (produced by an older "
+              "tuning.py) -- skipping batch_size/mask_fraction consistency check.")
+        return
+
+    if "batch_size" in meta and meta["batch_size"] != config["batch_size"]:
+        print(
+            f"  [provenance WARNING] sample_efficiency batch_size={config['batch_size']!r} "
+            f"!= tuning batch_size={meta['batch_size']!r}. This changes the number of "
+            f"optimizer steps/epoch relative to what these hyperparameters were tuned for "
+            f"(see module docstring's 'Training budget' section) -- results, especially at "
+            f"the largest train_size, may not reproduce what tuning.py saw."
+        )
+
+    for model_name in models_to_run:
+        if model_name == "MeansModel":
+            continue
+        try:
+            mf = mask_fraction_for(config, model_name)
+        except ValueError:
+            continue
+        if "mask_fraction" in meta and mf != meta["mask_fraction"]:
+            print(
+                f"  [provenance WARNING] {model_name}: sample_efficiency mask_fraction={mf!r} "
+                f"!= tuning mask_fraction={meta['mask_fraction']!r} -- this is a different "
+                f"task difficulty than what this model's hyperparameters were tuned for "
+                f"(see module docstring's 'mask_fraction caveat')."
+            )
+
+
 def train_and_eval_one(model_name: str,
                         arch_cfg: dict,
                         train_kwargs: dict,
@@ -248,13 +344,27 @@ def train_and_eval_one(model_name: str,
     loader_train for n_epochs epochs (the caller resolves this per
     train_size to hit a fixed total-step budget -- see run()/module
     docstring's "Training budget: gradient steps, not epochs"), evaluate
-    it on loader_test (held-out loss + imputation correlation), and return
-    a metrics dict.
+    it on loader_test (held-out loss + unified imputation metrics), and
+    return a metrics dict.
 
     subset_data is passed separately (rather than re-derived from
-    loader_train) purely so MeansModel -- which has no training loop at all
-    -- can fit its per-gene means directly.
+    loader_train) so that (a) MeansModel -- which has no training loop at
+    all -- can fit its per-gene means directly, and (b) VampPriorVAE /
+    DEQEncoderVampVAE can initialize their pseudo-inputs from real data
+    (see VAMP_FAMILY_MODELS below) instead of random noise.
+
+    NOTE on cross-model comparability: `test_loss` is returned for
+    diagnostic/health-check purposes only (see benchmark_plan.md's
+    convergence checklist) -- it is NOT comparable across model families
+    (different loss units for ImputationTransformer vs. the VAE family,
+    different independently-tuned beta/gamma/regularizer weights baked
+    into the VAE family's own loss number). Use `imputation_mse_mean` /
+    `imputation_corr_mean` (from models.evaluate_imputation(), the same
+    function tuning.py's Optuna objective uses) for any cross-model
+    comparison instead.
     """
+    recon_loss_type2 = None  # only meaningful for VAE-family models
+
     if model_name == "MeansModel":
         model = model_factories["MeansModel"](n_genes).to(device)
         model.means.data = subset_data.nanmean(dim=0).to(device)
@@ -275,40 +385,54 @@ def train_and_eval_one(model_name: str,
                                            mask_fraction=mask_fraction, device=device, **train_kwargs)
 
     else:
-        model = model_factories[model_name](n_genes, config=arch_cfg).to(device)
+        # VampPriorVAE / DEQEncoderVampVAE: initialize pseudo-inputs from
+        # real data (subset_data) instead of random noise -- type-1 NaNs are
+        # replaced via _random_fill's per-gene N(mean, std) draw, not a
+        # fixed sentinel (see AGENTS.md's "Known Issues" and
+        # VAMP_FAMILY_MODELS / models.py's _make_vamp_vae docstring).
+        factory_kwargs = {}
+        if model_name in VAMP_FAMILY_MODELS:
+            factory_kwargs["pseudo_init_samples"] = _random_fill(
+                subset_data, torch.isnan(subset_data)).to(device)
+
+        model = model_factories[model_name](n_genes, config=arch_cfg, **factory_kwargs).to(device)
         opt = optim.AdamW(model.parameters(), lr=lr)
 
         for _ in range(n_epochs):
             epoch_vae(model, loader_train, opt, mask_fraction=mask_fraction, **train_kwargs)
 
         model.eval()
-        test_loss, *_ = epoch_vae(model, loader_test, None, mask_fraction=mask_fraction, **train_kwargs)
+        test_loss, _grad_norm, _recon_loss, recon_loss_type2, _kl_loss = epoch_vae(
+            model, loader_test, None, mask_fraction=mask_fraction, **train_kwargs)
+        recon_loss_type2 = float(recon_loss_type2)
 
     if not isinstance(test_loss, float):
         test_loss = float(test_loss)
 
-    # Unified imputation-correlation metric -- models.impute() already
+    # Health-check diagnostics (safe to call on any model type -- entries
+    # are None if not applicable, e.g. DEQEncoderVAE has no VampPrior
+    # diagnostics and GeneExpressionVAE has no DEQ diagnostics). Snapshot
+    # right after the eval-mode forward pass above and before
+    # evaluate_imputation()'s own forward passes overwrite this state.
+    deq_diag = collect_deq_diagnostics(model)
+    vamp_diag = collect_vamp_diagnostics(model)
+
+    # Unified imputation metrics -- models.evaluate_imputation() already
     # handles VAEBase subclasses / MeansModel / ImputationTransformer with
-    # the same call signature, which is exactly what lets this script sweep
-    # multiple model families through one loop.
-    corrs = []
-    model.eval()
-    with torch.no_grad():
-        for _ in range(n_eval_mask_draws):
-            for x in loader_test:
-                recon, type2_mask = impute(model, x, eval_mask_fraction, device=device)
-                if type2_mask.any():
-                    true_vals = x[type2_mask].numpy()
-                    pred_vals = recon[type2_mask].numpy()
-                    corr = np.corrcoef(true_vals, pred_vals)[0, 1] if len(true_vals) > 1 else float("nan")
-                else:
-                    corr = float("nan")
-                corrs.append(corr)
+    # the same call signature (via impute()), which is exactly what lets
+    # this script sweep multiple model families through one loop, and is
+    # the SAME function tuning.py's Optuna objective uses -- so these
+    # numbers are directly comparable across model families, unlike
+    # test_loss above.
+    imp_metrics = evaluate_imputation(model, loader_test, eval_mask_fraction,
+                                       n_eval_mask_draws, device=device)
 
     return {
         "test_loss": test_loss if math.isfinite(test_loss) else None,
-        "imputation_corr_mean": float(np.nanmean(corrs)),
-        "imputation_corr_std": float(np.nanstd(corrs)),
+        "recon_loss_type2": recon_loss_type2,
+        **imp_metrics,
+        "effective_K_population": vamp_diag["effective_K_population"],
+        "deq_residual": deq_diag["deq_residual"],
     }
 
 
@@ -320,11 +444,13 @@ def run(config_path: str) -> tuple[list[dict], dict]:
 
     Returns (rows, summary):
         rows    -- list of per-(model, train_size, repeat) result dicts,
-                   also written to config["output"] as CSV.
+                   also written to config["output"] as CSV (see "JSON config
+                   schema"'s "output" entry above for the full column list).
         summary -- {model_name: {train_size: {"imputation_corr_mean": ...,
-                    "imputation_corr_std": ..., "test_loss_mean": ...}}},
-                   also written to config["summary_output"] as JSON and
-                   plotted to config["plot_output"].
+                    "imputation_mse_mean": ..., "test_loss_mean": ..., ...}}}
+                   (see _summarize()), also written to
+                   config["summary_output"] as JSON and plotted to
+                   config["plot_output"].
     """
     config = load_config(config_path)
 
@@ -332,7 +458,11 @@ def run(config_path: str) -> tuple[list[dict], dict]:
     with open(config["tuned_configs_fn"]) as f:
         tuned_configs = json.load(f)
 
-    models_to_run = config.get("models") or list(tuned_configs.keys())
+    # "_meta" (if present) is tuning.py's own provenance block, not a model
+    # name -- exclude it from the default model list.
+    models_to_run = config.get("models") or [k for k in tuned_configs if not k.startswith("_")]
+
+    _check_tuning_provenance(config, tuned_configs, models_to_run)
 
     print(f"Loading problem from {config['problem_fn']!r} ...")
     loaded = torch.load(config["problem_fn"])
@@ -476,22 +606,38 @@ def _write_csv(rows: list[dict], path: str) -> None:
 
 def _summarize(rows: list[dict]) -> dict:
     """{model_name: {train_size: {imputation_corr_mean, imputation_corr_std,
-    test_loss_mean, test_loss_std, n}}}, aggregated over repeats."""
+    imputation_mse_mean, imputation_mse_std, test_loss_mean, test_loss_std,
+    recon_loss_type2_mean, recon_loss_type2_std, effective_K_population_mean,
+    deq_residual_mean, n}}}, aggregated over repeats.
+
+    imputation_mse_mean/std -- unlike test_loss -- is directly comparable
+    across model families (see models.evaluate_imputation()'s docstring),
+    so it (or imputation_corr_mean) is the right field to use for any
+    cross-model comparison.
+    """
     by_key: dict[tuple[str, int], list[dict]] = {}
     for row in rows:
         by_key.setdefault((row["model"], row["train_size"]), []).append(row)
 
+    # Fields that are already per-repeat means (or None when not
+    # applicable, e.g. recon_loss_type2 for ImputationTransformer, or
+    # effective_K_population for non-VampPrior models) -- aggregated the
+    # same generic way rather than one-off per field.
+    mean_fields = [
+        "imputation_corr_mean", "imputation_mse_mean",
+        "test_loss", "recon_loss_type2",
+        "effective_K_population", "deq_residual",
+    ]
+
     summary: dict = {}
     for (model_name, size), group in by_key.items():
-        corrs = np.array([r["imputation_corr_mean"] for r in group], dtype=float)
-        losses = np.array([r["test_loss"] for r in group if r["test_loss"] is not None], dtype=float)
-        summary.setdefault(model_name, {})[str(size)] = {
-            "imputation_corr_mean": float(np.nanmean(corrs)),
-            "imputation_corr_std":  float(np.nanstd(corrs)),
-            "test_loss_mean": float(np.nanmean(losses)) if losses.size else None,
-            "test_loss_std":  float(np.nanstd(losses)) if losses.size else None,
-            "n": len(group),
-        }
+        entry = {"n": len(group)}
+        for field in mean_fields:
+            vals = np.array([r[field] for r in group if r.get(field) is not None], dtype=float)
+            out_name = field if field.endswith("_mean") else f"{field}_mean"
+            entry[out_name] = float(np.nanmean(vals)) if vals.size else None
+            entry[out_name.replace("_mean", "_std")] = float(np.nanstd(vals)) if vals.size else None
+        summary.setdefault(model_name, {})[str(size)] = entry
     return summary
 
 

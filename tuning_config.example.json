@@ -1,18 +1,18 @@
 {
-  "problem_fn":   "/content/Drive/MyDrive/colab/test_problem_3.pt",
-  "storage":      "sqlite:///tuning.db",
-  "output":       "tuned_configs.2.attempt2.json",
-  "batch_size":   256,
-  "n_trials":      50,
-  "max_epochs":    50,
-  "eval_every":     1,
-  "mask_fraction":  0.4,
+  "problem_fn":       "/content/Drive/MyDrive/colab/test_problem_3.pt",
+  "storage":          "sqlite:///tuning.db",
+  "output":           "tuned_configs.3.json",
+  "checkpoint_dir":   "/content/Drive/MyDrive/colab/checkpoints",
+  "batch_size":       256,
+  "n_trials":          50,
+  "max_epochs":        50,
+  "eval_every":         1,
+  "mask_fraction":      0.4,
+  "min_layer_width":    8,
+  "max_layer_width": 2048,
   "sampler":    "tpe",
   "pruner":     "median",
   "models": [
-    "GeneExpressionVAE",
-    "DEQEncoderVAE",
-    "VampPriorVAE",
     "DEQEncoderVampVAE"
   ],
   "search_space": {
@@ -22,6 +22,10 @@
     "min_free_bits":         { "type": "float", "low": 0.001, "high": 0.05, "log": true },
     "lambda_entropy":        { "type": "float", "low": 1e-3,  "high": 0.3,  "log": true },
     "lambda_vamp_repulsion": { "type": "float", "low": 1e-3,  "high": 0.5,  "log": true },
-    "lambda_vamp_coverage":  { "type": "float", "low": 1e-3,  "high": 0.5,  "log": true }
+    "lambda_vamp_coverage":  { "type": "float", "low": 1e-3,  "high": 0.5,  "log": true },
+
+    "latent_dim":            { "type": "int",   "low": 8,   "high": 80  },
+    "encoder_width_factor":  { "type": "float", "low": 1.1, "high": 2.2 },
+    "decoder_width_factor":  { "type": "float", "low": 1.1, "high": 2.2 }
   }
 }

@@ -1,0 +1,32 @@
+{
+  "problem_fn":       "/content/Drive/MyDrive/colab/test_problem_3.pt",
+  "storage":          "sqlite:///tuning.transformer.db",
+  "output":           "tuned_configs.transformer.json",
+  "checkpoint_dir":   "/content/Drive/MyDrive/colab/checkpoints",
+  "batch_size":       256,
+  "n_trials":          50,
+  "max_epochs":        50,
+  "eval_every":         1,
+  "mask_fraction":      0.4,
+  "min_layer_width":   32,
+  "max_layer_width":  512,
+  "sampler":    "tpe",
+  "pruner":     "median",
+  "models": [
+    "ImputationTransformer"
+  ],
+  "search_space": {
+    "lr":            { "type": "float", "low": 1e-4, "high": 1e-3, "log": true },
+    "lambda_conf":   { "type": "float", "low": 1e-3, "high": 1.0,  "log": true },
+
+    "d_model":       { "type": "int",   "low": 64,  "high": 384 },
+    "n_heads":       { "type": "int",   "low": 2,   "high": 8   },
+    "n_layers":      { "type": "int",   "low": 2,   "high": 6   },
+    "n_bins":        { "type": "int",   "low": 12,  "high": 32  },
+    "n_conf_bins":   { "type": "int",   "low": 4,   "high": 12  },
+    "d_gene":        { "type": "int",   "low": 16,  "high": 96  },
+    "d_count":       { "type": "int",   "low": 16,  "high": 96  },
+    "d_conf":        { "type": "int",   "low": 8,   "high": 48  },
+    "dropout":       { "type": "float", "low": 0.0, "high": 0.3 }
+  }
+}

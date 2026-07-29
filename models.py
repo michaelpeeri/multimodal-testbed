@@ -1853,8 +1853,8 @@ class Controller:
                 max_norm=1.0)
             self._pretrain_opt.step()
 
-            pretrain_log.append( float(loss/n) )
-            #print(f'pretrain loss: {float(loss/n):.3g}')
+            pretrain_log.append( float((loss/n).detach()) )
+            #print(f'pretrain loss: {float((loss/n).detach()):.3g}')
 
         ## DEBUG ONLY #### DEBUG ONLY #### DEBUG ONLY #### DEBUG ONLY #### DEBUG ONLY #### DEBUG ONLY ##
         plt.subplots()
@@ -2334,7 +2334,10 @@ class ImputationTransformer(nn.Module):
             batch_first     = True,   # (B, G, d_model) convention
             norm_first      = True,   # pre-norm: more stable for deeper models
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer, num_layers=n_layers,
+            enable_nested_tensor=False,  # norm_first=True disables the fast path anyway
+        )
 
         self.head_count = nn.Linear(d_model, n_bins)
         self.head_conf  = nn.Linear(d_model, n_conf_bins)
@@ -2490,9 +2493,9 @@ def epoch_transformer(
                 opt.step()
                 grad_norm_sum += float(gn)
 
-            total_loss   += float(loss)
-            count_ce_sum += float(count_ce)
-            conf_ce_sum  += float(conf_ce)
+            total_loss   += float(loss.detach())
+            count_ce_sum += float(count_ce.detach())
+            conf_ce_sum  += float(conf_ce.detach())
             n_batches    += 1
 
     n_batches = max(n_batches, 1)

@@ -22,9 +22,11 @@ so results/progress persist across separate invocations -- e.g. across
 Colab runtime restarts).
 
 For VAE_FAMILY_MODELS, this searches the training-loop hyperparameters
-listed in "search_space" (learning rate, beta, gamma, min_free_bits,
+listed in "search_space" (learning rate, gamma, min_free_bits,
 lambda_entropy, lambda_vamp_repulsion, lambda_vamp_coverage -- any subset
-of epoch_vae's kwargs other than mask_fraction). For TRANSFORMER_FAMILY_MODELS
+of epoch_vae's kwargs other than mask_fraction and beta). `beta` is
+deliberately *not* tunable -- see "beta is fixed, not tuned" below. For
+TRANSFORMER_FAMILY_MODELS
 (currently just ImputationTransformer), the analogous training-loop keys are
 "lr" and "lambda_conf" (any subset of epoch_transformer's kwargs other than
 mask_fraction) -- see "ImputationTransformer architecture search" below for
@@ -104,6 +106,29 @@ rather than a knob to be optimized away, so it is read directly from the
 config's top-level "mask_fraction" key (same value applied to every
 model/trial) instead of being suggested by Optuna.
 
+beta is fixed, not tuned
+-------------------------
+`beta` (the VAE family's KL weight, see synthetic_data.masked_loss) is
+*also* deliberately excluded from the search space, for a different reason
+than mask_fraction: under a pure reconstruction/imputation-accuracy
+objective (which is what `imputation_mse_mean` is -- see "The objective
+being minimized" below), there is no term in the metric that rewards a
+non-trivial KL weight at all, so Optuna has every incentive to drive beta
+toward the lowest value it's allowed to reach, regardless of what that
+range is. Empirically this is exactly what happened: across all 4
+VAE-family models in an earlier tuning run, beta converged to
+0.0002-0.0011 -- pinned at the floor of its old [1e-4, 0.2] search range --
+while `min_free_bits` (the other KL-related knob, still tunable) spanned
+0.004-0.040, i.e. it did *not* show the same floor-pinning behavior and
+apparently carries real signal even under this objective. So only `beta`
+is fixed here, read from the top-level "beta" config key (default 1e-4,
+matching models.py's own `beta_constant()` helper's default -- an
+independent piece of evidence, from an unrelated RL-controller subsystem
+in this codebase, that ~1e-4 is this architecture's established
+"reasonable" fixed operating point rather than an arbitrary pick) and
+applied identically to every VAE_FAMILY_MODELS trial, the same way
+mask_fraction is.
+
 The objective being minimized is `imputation_mse_mean` -- the held-out
 imputation MSE from `models.evaluate_imputation()` (the same
 model-family-agnostic metric sample_efficiency.py reports), evaluated with
@@ -154,7 +179,8 @@ examples. Keys:
                     and "decoder_width_factor" (type "float") control the
                     limited architecture search described above; any other
                     name must be one of _VAE_TRAIN_SEARCH_SPACE_KEYS (an
-                    epoch_vae() kwarg). For TRANSFORMER_FAMILY_MODELS: "lr"
+                    epoch_vae() kwarg other than beta -- see "beta is fixed,
+                    not tuned" above). For TRANSFORMER_FAMILY_MODELS: "lr"
                     and "lambda_conf" control epoch_transformer's kwargs;
                     "d_model"/"n_heads"/"n_layers"/"n_bins"/"n_conf_bins"/
                     "d_gene"/"d_count"/"d_conf" (type "int") and "dropout"
@@ -163,12 +189,17 @@ examples. Keys:
                     simply ignored for that model (left at its own default),
                     so VAE and transformer search_space keys may coexist in
                     the same dict when tuning both families together.
-                    "mask_fraction" may not be listed here -- see the
-                    top-level "mask_fraction" config key instead.
+                    "mask_fraction" and "beta" may not be listed here -- see
+                    the top-level "mask_fraction"/"beta" config keys instead.
     mask_fraction : float, default 0.1 -- fixed (not tuned) fraction of
                     observed genes masked for training/eval, forwarded as
                     epoch_vae's/epoch_transformer's mask_fraction kwarg for
                     every trial.
+    beta          : float, default 1e-4 -- fixed (not tuned) VAE_FAMILY_MODELS
+                    KL weight, forwarded as epoch_vae's beta kwarg for every
+                    trial (ignored for TRANSFORMER_FAMILY_MODELS). See "beta
+                    is fixed, not tuned" above for why this isn't part of
+                    search_space.
     eval_mask_fraction : float, default: same as mask_fraction -- fraction
                     used for the imputation_mse_mean objective (see
                     "The objective being minimized" above). Exposed
@@ -204,7 +235,7 @@ examples. Keys:
     output        : str, default "tuned_configs.json" -- where the final
                     {model_name: {best_value, best_params, best_test_loss,
                     best_imputation_corr}, ..., "_meta": {batch_size,
-                    mask_fraction, max_epochs, eval_mask_fraction,
+                    mask_fraction, beta, max_epochs, eval_mask_fraction,
                     n_eval_mask_draws}} summary is written (see `run()`
                     below for the richer in-memory return value).
                     best_value is imputation_mse_mean (the tuning
@@ -323,14 +354,15 @@ _PRUNERS = {
 _ARCH_SEARCH_SPACE_KEYS = {"latent_dim", "encoder_width_factor", "decoder_width_factor"}
 
 # search_space keys accepted for VAE_FAMILY_MODELS training-loop tuning --
-# must match epoch_vae's kwargs (other than mask_fraction, which is fixed).
+# must match epoch_vae's kwargs (other than mask_fraction and beta, which
+# are fixed -- see module docstring's "beta is fixed, not tuned" section).
 # Whitelisted (rather than "everything not an arch key") so that a
 # search_space shared with TRANSFORMER_FAMILY_MODELS in the same config (e.g.
 # tuning ImputationTransformer alongside VampPriorVAE) doesn't leak
 # transformer-only keys like "lambda_conf" into epoch_vae() as unexpected
 # kwargs.
 _VAE_TRAIN_SEARCH_SPACE_KEYS = {
-    "lr", "beta", "gamma", "min_free_bits",
+    "lr", "gamma", "min_free_bits",
     "lambda_entropy", "lambda_vamp_repulsion", "lambda_vamp_coverage",
 }
 
@@ -362,6 +394,7 @@ _CONFIG_DEFAULTS = {
     "pruner":          "median",
     "output":          "tuned_configs.json",
     "mask_fraction":   0.1,
+    "beta":            1e-4,  # fixed, not tuned -- see module docstring's "beta is fixed, not tuned"
     "eval_mask_fraction": None,  # default: same as mask_fraction, see load_config
     "n_eval_mask_draws":  3,
     "min_layer_width": 4,
@@ -393,6 +426,15 @@ def load_config(path: str) -> dict:
             "search_space['mask_fraction'] is not allowed -- mask_fraction is a "
             "fixed problem-difficulty knob, set it via the top-level "
             "'mask_fraction' config key instead"
+        )
+
+    if "beta" in config["search_space"]:
+        raise ValueError(
+            "search_space['beta'] is not allowed -- beta has no interior "
+            "optimum under a pure imputation-accuracy objective (it converges "
+            "to whatever floor the search range allows, see module "
+            "docstring's 'beta is fixed, not tuned'); set it via the "
+            "top-level 'beta' config key instead"
         )
 
     for name, spec in config["search_space"].items():
@@ -554,14 +596,16 @@ def resolve_model_config(model_name: str, params: dict, n_genes: int) -> tuple[d
         arch_cfg, train_kwargs, lr = resolve_model_config(model_name, params, n_genes)
         model = model_factories[model_name](n_genes, config=arch_cfg).to(device)
         opt   = optim.AdamW(model.parameters(), lr=lr)
-        epoch_vae(model, loader, opt, mask_fraction=..., **train_kwargs)   # VAE_FAMILY_MODELS
+        epoch_vae(model, loader, opt, mask_fraction=..., beta=..., **train_kwargs)   # VAE_FAMILY_MODELS
         epoch_transformer(model, loader, bin_edges, opt, mask_fraction=..., **train_kwargs)  # TRANSFORMER_FAMILY_MODELS
 
-    `mask_fraction` is deliberately never part of the returned train_kwargs
-    (it was never part of `params` either -- see the module docstring's
-    "mask_fraction is deliberately not part of the search space" note):
-    callers must supply it themselves, matching whatever fixed
-    `mask_fraction` was used for the tuning run that produced `params`.
+    `mask_fraction` (both families) and `beta` (VAE_FAMILY_MODELS only) are
+    deliberately never part of the returned train_kwargs (neither was ever
+    part of `params` either -- see the module docstring's "mask_fraction is
+    deliberately not part of the search space" and "beta is fixed, not
+    tuned" notes): callers must supply both themselves, matching whatever
+    fixed `mask_fraction`/`beta` was used for the tuning run that produced
+    `params`.
 
     Used directly by scripts that replay tuned configs outside of tuning.py
     itself (e.g. sample_efficiency.py's per-model-family evaluation sweeps).
@@ -602,7 +646,8 @@ def retrain(model_name: str,
             max_epochs: int,
             n_copies: int = 1,
             checkpoint_dir: str | None = None,
-            device=device) -> list:
+            device=device,
+            beta: float = 1e-4) -> list:
     """Train `n_copies` fresh, independently-initialized instances of
     `model_name` on the *full* loader_train/loader_test data, using the
     architecture + training-loop hyperparameters in `params` (typically a
@@ -627,14 +672,27 @@ def retrain(model_name: str,
     same order they were trained. If `checkpoint_dir` is given, each copy is
     also saved to {checkpoint_dir}/{model_name}_retrain_{i}.pt in the same
     {'model_type', 'state_dict', 'config'} format vae-test.py's load_model()
-    expects (plus 'test_loss', 'imputation_mse_mean', 'imputation_corr_mean'
-    and 'params' for provenance).
+    expects (plus 'test_loss', 'imputation_mse_mean', 'imputation_corr_mean',
+    'imputation_corr_per_gene_mean', 'imputation_corr_shuffled_mean',
+    'imputation_corr_gap_mean' and 'params' for provenance -- see
+    models.evaluate_imputation()'s docstring for what the per-gene/shuffled/
+    gap fields mean and why they matter for telling genuine per-sample
+    imputation apart from output-distribution matching; unlike run_trial's
+    hot per-epoch objective evaluation, this is a one-off post-hoc call per
+    copy so the extra shuffle_control forward pass is cheap here).
 
     `mask_fraction` and `max_epochs` are passed explicitly (rather than read
     from `params`) for the same reason tuning.py never tunes mask_fraction
     itself: it's a fixed problem-difficulty knob, not part of the tuned
     config, and the tuning run's own `max_epochs` may not be the epoch
     budget you want for a final/production training run.
+
+    `beta` is likewise passed explicitly rather than read from `params`:
+    it's fixed (not tuned) in tuning.py too -- see tuning.py's module
+    docstring's "beta is fixed, not tuned" -- so it was never part of
+    `params` to begin with. Defaults to 1e-4, matching tuning.py's own
+    default; pass the same value used for the tuning run that produced
+    `params` if it was overridden there.
 
     Example (from a notebook, after a tuning run)::
 
@@ -689,27 +747,38 @@ def retrain(model_name: str,
         else:
             epoch_bar = tqdm(range(max_epochs), desc=f"{model_name} retrain {i + 1}/{n_copies}", leave=False)
             for _ in epoch_bar:
-                epoch_vae(model, loader_train, opt, mask_fraction=mask_fraction, **train_kwargs)
+                epoch_vae(model, loader_train, opt, mask_fraction=mask_fraction, beta=beta, **train_kwargs)
             model.eval()
-            test_loss, *_ = epoch_vae(model, loader_test, None, mask_fraction=mask_fraction, **train_kwargs)
+            test_loss, *_ = epoch_vae(model, loader_test, None, mask_fraction=mask_fraction, beta=beta, **train_kwargs)
 
         test_loss = float(test_loss)
-        imp_metrics = evaluate_imputation(model, loader_test, mask_fraction, n_draws=3, device=device)
+        # shuffle_control=True: post-hoc diagnostic, run once per retrained
+        # copy (not every eval_every epochs x every trial like run_trial's
+        # objective), so the extra forward pass is cheap here -- see
+        # models.evaluate_imputation()'s docstring for what
+        # imputation_corr_per_gene_mean / imputation_corr_gap_mean measure.
+        imp_metrics = evaluate_imputation(model, loader_test, mask_fraction, n_draws=3,
+                                           device=device, shuffle_control=True)
         print(f"  retrain {i + 1}/{n_copies} of {model_name}: test_loss={test_loss:.4f} "
               f"(diagnostic only, not cross-model-comparable) "
               f"imputation_mse={imp_metrics['imputation_mse_mean']:.4f} "
-              f"imputation_corr={imp_metrics['imputation_corr_mean']:.4f}")
+              f"imputation_corr={imp_metrics['imputation_corr_mean']:.4f} "
+              f"imputation_corr_per_gene={imp_metrics['imputation_corr_per_gene_mean']:.4f} "
+              f"imputation_corr_gap={imp_metrics['imputation_corr_gap_mean']:.4f}")
 
         if checkpoint_dir is not None:
             path = Path(checkpoint_dir) / f"{model_name}_retrain_{i}.pt"
             torch.save({
-                "model_type":            model_name,
-                "state_dict":            model.state_dict(),
-                "config":                model.config,
-                "test_loss":             test_loss,
-                "imputation_mse_mean":   imp_metrics["imputation_mse_mean"],
-                "imputation_corr_mean":  imp_metrics["imputation_corr_mean"],
-                "params":                params,
+                "model_type":                     model_name,
+                "state_dict":                     model.state_dict(),
+                "config":                         model.config,
+                "test_loss":                      test_loss,
+                "imputation_mse_mean":            imp_metrics["imputation_mse_mean"],
+                "imputation_corr_mean":           imp_metrics["imputation_corr_mean"],
+                "imputation_corr_per_gene_mean":  imp_metrics["imputation_corr_per_gene_mean"],
+                "imputation_corr_shuffled_mean":  imp_metrics["imputation_corr_shuffled_mean"],
+                "imputation_corr_gap_mean":       imp_metrics["imputation_corr_gap_mean"],
+                "params":                         params,
             }, path)
 
         trained.append(model)
@@ -774,6 +843,7 @@ def run_trial(trial: optuna.Trial,
               max_epochs: int,
               eval_every: int,
               mask_fraction: float,
+              beta: float,
               eval_mask_fraction: float,
               n_eval_mask_draws: int,
               default_latent_dim: int,
@@ -787,6 +857,9 @@ def run_trial(trial: optuna.Trial,
     imputation_mse_mean for pruning (see module docstring's "The objective
     being minimized"), and return the final imputation_mse_mean.
 
+    beta: fixed (not tuned) KL weight, applied identically to every trial
+    -- see module docstring's "beta is fixed, not tuned".
+
     pseudo_init_data: a real (possibly NaN-containing) batch of training
     data, used to initialize VampPrior-family models' (VAMP_FAMILY_MODELS)
     pseudo-inputs instead of random noise -- ignored for other model
@@ -798,6 +871,7 @@ def run_trial(trial: optuna.Trial,
     cfg = suggest_train_cfg(trial, search_space)
     lr = cfg.pop("lr", 3e-4)
     cfg["mask_fraction"] = mask_fraction
+    cfg["beta"] = beta
 
     arch_cfg = suggest_arch_cfg(trial, search_space, default_latent_dim, n_encoder_layers, n_decoder_layers)
 
@@ -1025,7 +1099,8 @@ def run_study_for_model(model_name: str,
         objective = lambda trial: run_trial(
             trial, model_name, n_genes, loader_train, loader_test,
             config["search_space"], config["max_epochs"], config["eval_every"],
-            config["mask_fraction"], config["eval_mask_fraction"], config["n_eval_mask_draws"],
+            config["mask_fraction"], config["beta"],
+            config["eval_mask_fraction"], config["n_eval_mask_draws"],
             default_latent_dim, n_encoder_layers, n_decoder_layers,
             config["min_layer_width"], config["max_layer_width"],
             config["checkpoint_dir"],
@@ -1114,7 +1189,8 @@ def run(config_path: str) -> dict:
 
     print(
         f"n_genes={n_genes}  n_cells={n_cells}  batch_size={batch_size}  "
-        f"mask_fraction={mask_fraction}  eval_mask_fraction={config['eval_mask_fraction']}  "
+        f"mask_fraction={mask_fraction}  beta={config['beta']}  "
+        f"eval_mask_fraction={config['eval_mask_fraction']}  "
         f"n_eval_mask_draws={config['n_eval_mask_draws']}  device={device}"
     )
 
@@ -1140,6 +1216,7 @@ def run(config_path: str) -> dict:
     summary["_meta"] = {
         "batch_size":         batch_size,
         "mask_fraction":      mask_fraction,
+        "beta":               config["beta"],
         "max_epochs":         config["max_epochs"],
         "eval_mask_fraction": config["eval_mask_fraction"],
         "n_eval_mask_draws":  config["n_eval_mask_draws"],

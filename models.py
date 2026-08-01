@@ -2591,27 +2591,44 @@ def impute_transformer(
 # Unified imputation adapter
 # ---------------------------------------------------------------------------
 
-def impute(model, x_raw, frac, *, device=device):
-    """Apply a type-2 mask at rate *frac* and return imputed values.
+def _draw_type2_mask(x_raw, frac):
+    """Draw a random type-2 (deliberately-held-out) mask over the *observed*
+    (non-type-1-missing) positions of x_raw at rate *frac*.
 
-    Works for all model types without any caller-side preprocessing.
+    Extracted out of impute() so that callers needing a *fixed* mask shared
+    across multiple forward passes (e.g. evaluate_imputation()'s
+    shuffle_control, which scores a real and a row-shuffled forward pass
+    against the same held-out positions) can draw it once and reuse it via
+    impute_with_mask().
+
+    Returns: (B, G) bool tensor, same device as x_raw.
+    """
+    nan_mask = torch.isnan(x_raw)  # type-1 positions
+    return (torch.rand_like(x_raw) < frac) & ~nan_mask
+
+
+def impute_with_mask(model, x_raw, type2_mask, *, device=device):
+    """Like impute(), but takes a pre-drawn type2_mask instead of drawing one
+    from `frac`. See impute()'s docstring for the per-model-type behavior --
+    this is exactly that logic, factored out so the mask can be shared
+    across multiple calls (e.g. real vs. row-shuffled input, scored against
+    the same held-out positions).
 
     Args:
-        model   : any of GeneExpressionVAE / MoVEVAE / VampPriorVAE /
-                  MeansModel / ImputationTransformer — must be in eval mode.
-        x_raw   : (B, n_genes) float tensor with NaN for type-1 missing values.
-        frac    : float, fraction of *observed* positions to mask for evaluation.
-        device  : torch.device to run inference on.
+        model      : any of GeneExpressionVAE / MoVEVAE / VampPriorVAE /
+                     MeansModel / ImputationTransformer — must be in eval mode.
+        x_raw      : (B, n_genes) float tensor with NaN for type-1 missing values.
+        type2_mask : (B, n_genes) bool tensor, positions to hold out/score.
+        device     : torch.device to run inference on.
 
     Returns:
         recon      : (B, n_genes) float tensor on CPU, imputed continuous values.
-        type2_mask : (B, n_genes) bool tensor on CPU, positions used for scoring.
+        type2_mask : (B, n_genes) bool tensor on CPU, positions used for scoring
+                     (echoed back for a call signature symmetric with impute()).
     """
     x_raw = x_raw.to(device)
-    nan_mask = torch.isnan(x_raw)                          # type-1 positions
-
-    # Draw type-2 mask: observed positions only
-    type2_mask = (torch.rand_like(x_raw) < frac) & ~nan_mask   # (B, G), CPU-safe
+    type2_mask = type2_mask.to(device)
+    nan_mask = torch.isnan(x_raw)  # type-1 positions, of *this* x_raw
 
     model.eval()
     with torch.no_grad():
@@ -2641,13 +2658,110 @@ def impute(model, x_raw, frac, *, device=device):
             recon = recon.detach().cpu()
 
         else:
-            raise TypeError(f"impute(): unsupported model type {type(model).__name__}")
+            raise TypeError(f"impute_with_mask(): unsupported model type {type(model).__name__}")
 
     return recon, type2_mask.cpu()
 
 
+def impute(model, x_raw, frac, *, device=device):
+    """Apply a type-2 mask at rate *frac* and return imputed values.
+
+    Works for all model types without any caller-side preprocessing. Thin
+    wrapper around _draw_type2_mask() + impute_with_mask() -- see
+    impute_with_mask()'s docstring for the per-model-type behavior.
+
+    Args:
+        model   : any of GeneExpressionVAE / MoVEVAE / VampPriorVAE /
+                  MeansModel / ImputationTransformer — must be in eval mode.
+        x_raw   : (B, n_genes) float tensor with NaN for type-1 missing values.
+        frac    : float, fraction of *observed* positions to mask for evaluation.
+        device  : torch.device to run inference on.
+
+    Returns:
+        recon      : (B, n_genes) float tensor on CPU, imputed continuous values.
+        type2_mask : (B, n_genes) bool tensor on CPU, positions used for scoring.
+    """
+    x_raw = x_raw.to(device)
+    type2_mask = _draw_type2_mask(x_raw, frac)
+    return impute_with_mask(model, x_raw, type2_mask, device=device)
+
+
+def _per_gene_mean_corr(true_mat: np.ndarray, pred_mat: np.ndarray, min_count: int = 3) -> float:
+    """Average Pearson correlation computed *independently within each gene
+    column* (i.e. across cells, at that gene's masked positions), Fisher-z
+    averaged across genes and transformed back.
+
+    Rationale: the pooled correlation (plain np.corrcoef over every masked
+    (gene, cell) entry, regardless of gene identity) is dominated by
+    *between-gene* variance whenever different genes have very different
+    mean/scale (very common here -- 200+ genes with heterogeneous
+    group-membership/NB parameters, see synthetic_data.py's
+    make_synthetic_data4/5). A model that predicts nothing but each gene's
+    *population* mean -- i.e. uses zero per-sample information, like
+    MeansModel -- can still score a high pooled correlation purely by
+    "knowing which gene it is". This per-gene decomposition removes that
+    confound: it can only be high if the model's prediction tracks
+    cell-to-cell variation *within* a gene, which requires using this
+    specific cell's own data. See the imputation-methodology discussion in
+    the project's session notes for the full argument.
+
+    Args:
+        true_mat, pred_mat: (N, G) arrays; entries outside the type-2 mask
+            for this draw must be NaN (see evaluate_imputation()).
+        min_count: genes with fewer than this many valid (masked) entries
+            in this draw are skipped -- too few points for a meaningful r.
+
+    Returns:
+        float, NaN if no gene had enough valid entries or nonzero variance.
+    """
+    n_genes = true_mat.shape[1]
+    zs = []
+    for g in range(n_genes):
+        t = true_mat[:, g]
+        valid = ~np.isnan(t)
+        if valid.sum() < min_count:
+            continue
+        tv, pv = t[valid], pred_mat[valid, g]
+        # Near-zero-variance check uses a relative tolerance rather than an
+        # exact `== 0` comparison: a genuinely-constant column (e.g.
+        # MeansModel's per-gene prediction) can still show ~1e-16-scale
+        # "variance" here because np.std's mean-then-subtract algorithm
+        # accumulates float round-off even when every element is
+        # bit-identical -- an exact-zero check silently lets these leak
+        # through as a spurious (usually near-zero but nonzero) correlation.
+        tv_scale = max(float(np.abs(tv).max()), 1.0) if tv.size else 1.0
+        pv_scale = max(float(np.abs(pv).max()), 1.0) if pv.size else 1.0
+        if tv.std() < 1e-8 * tv_scale or pv.std() < 1e-8 * pv_scale:
+            continue
+        r = np.corrcoef(tv, pv)[0, 1]
+        if not np.isfinite(r):
+            continue
+        zs.append(np.arctanh(np.clip(r, -0.999999, 0.999999)))
+    if not zs:
+        return float("nan")
+    return float(np.tanh(np.mean(zs)))
+
+
+def _shuffled_rows(x: torch.Tensor) -> torch.Tensor:
+    """Row-permuted copy of x via a cyclic shift by a random nonzero offset.
+
+    Used by evaluate_imputation()'s shuffle_control to build a "chimeric"
+    input where every row's *observed* genes actually come from a
+    different, randomly chosen row -- a plain torch.randperm can (rarely)
+    map a row to itself, silently contaminating the control for that row;
+    a cyclic shift by any offset in [1, B-1] is a guaranteed derangement
+    (no fixed points) as long as B > 1.
+    """
+    B = x.shape[0]
+    if B <= 1:
+        return x
+    offset = int(torch.randint(1, B, (1,)).item())
+    perm = (torch.arange(B, device=x.device) + offset) % B
+    return x[perm]
+
+
 def evaluate_imputation(model, loader_test, mask_fraction: float, n_draws: int,
-                         device=device) -> dict:
+                         device=device, shuffle_control: bool = False) -> dict:
     """Unified imputation-quality metric, usable for *any* model type
     supported by impute() (VAEBase subclasses / MeansModel /
     ImputationTransformer).
@@ -2663,9 +2777,9 @@ def evaluate_imputation(model, loader_test, mask_fraction: float, n_draws: int,
     cross-entropy vs. the VAE family's Gaussian MSE + KL -- and bake in
     independently-tuned per-model loss weights like beta/gamma).
 
-    Draws a fresh type-2 mask *n_draws* times (via impute()) over every
-    batch in loader_test and pools all (true, predicted) pairs from every
-    draw before computing MSE/correlation, matching how
+    Draws a fresh type-2 mask *n_draws* times (via _draw_type2_mask()) over
+    every batch in loader_test and pools all (true, predicted) pairs from
+    every draw before computing MSE/correlation, matching how
     sample_efficiency.py's original correlation-only metric was computed.
 
     Args:
@@ -2678,39 +2792,110 @@ def evaluate_imputation(model, loader_test, mask_fraction: float, n_draws: int,
                        a single draw is noisy (see benchmark_plan.md's
                        "Metrics" section).
         device:        torch device to run inference on.
+        shuffle_control: if True, also compute a row-shuffled control (one
+                       extra forward pass per draw) -- for each batch, the
+                       *observed* genes fed to the model are swapped in
+                       from a different, randomly chosen row (same
+                       type2_mask, see _shuffled_rows()), but scoring still
+                       uses the original row's true values. If the model
+                       isn't actually using this cell's own observed genes
+                       to predict its masked values (i.e. it's just
+                       reproducing the output distribution / gene identity),
+                       this shuffled correlation will be nearly as high as
+                       the real one. Adds imputation_mse_shuffled_mean/std,
+                       imputation_corr_shuffled_mean/std, and
+                       imputation_corr_gap_mean/std (real minus shuffled
+                       correlation, per draw, then aggregated -- the
+                       cleanest single number for "how much of the
+                       correlation is genuine per-sample conditioning").
+                       Default False so tuning.py's per-epoch Optuna
+                       objective (which calls this every eval_every epochs,
+                       every trial) isn't slowed down by a diagnostic it
+                       doesn't need.
 
     Returns:
         {'imputation_mse_mean':  float, 'imputation_mse_std':  float,
-         'imputation_corr_mean': float, 'imputation_corr_std': float}
+         'imputation_corr_mean': float, 'imputation_corr_std': float,
+         'imputation_corr_per_gene_mean': float, 'imputation_corr_per_gene_std': float,
+         + (if shuffle_control) 'imputation_mse_shuffled_mean/std',
+           'imputation_corr_shuffled_mean/std', 'imputation_corr_gap_mean/std'}
         -- mean/std are taken across the n_draws per-draw values (matching
         sample_efficiency.py's original semantics for the correlation
         fields), std is 0.0 if n_draws == 1.
     """
-    mses, corrs = [], []
+    mses, corrs, gene_corrs = [], [], []
+    mses_shuf, corrs_shuf, gaps = [], [], []
     model.eval()
     with torch.no_grad():
         for _ in range(n_draws):
             true_all, pred_all = [], []
+            true_all_shuf, pred_all_shuf = [], []
             for x in loader_test:
-                recon, type2_mask = impute(model, x, mask_fraction, device=device)
+                x_dev = x.to(device)
+                type2_mask = _draw_type2_mask(x_dev, mask_fraction)
+                recon, _ = impute_with_mask(model, x_dev, type2_mask, device=device)
+                type2_mask = type2_mask.cpu()
+                nan_fill = torch.full_like(x, float('nan'))
                 if type2_mask.any():
-                    true_all.append(x[type2_mask].numpy())
-                    pred_all.append(recon[type2_mask].numpy())
+                    true_all.append(torch.where(type2_mask, x, nan_fill))
+                    pred_all.append(torch.where(type2_mask, recon, nan_fill))
+
+                if shuffle_control and type2_mask.any():
+                    x_shuf_input = _shuffled_rows(x_dev)
+                    recon_shuf, _ = impute_with_mask(model, x_shuf_input, type2_mask.to(device), device=device)
+                    # Scored against the ORIGINAL row's true values -- only
+                    # the model's *input* was row-shuffled.
+                    true_all_shuf.append(torch.where(type2_mask, x, nan_fill))
+                    pred_all_shuf.append(torch.where(type2_mask, recon_shuf, nan_fill))
+
             if true_all:
-                true_vals = np.concatenate(true_all)
-                pred_vals = np.concatenate(pred_all)
+                true_mat = torch.cat(true_all, dim=0).numpy()
+                pred_mat = torch.cat(pred_all, dim=0).numpy()
+                valid = ~np.isnan(true_mat)
+                true_vals, pred_vals = true_mat[valid], pred_mat[valid]
                 mses.append(float(np.mean((pred_vals - true_vals) ** 2)))
-                corrs.append(np.corrcoef(true_vals, pred_vals)[0, 1] if len(true_vals) > 1 else float("nan"))
+                corr = np.corrcoef(true_vals, pred_vals)[0, 1] if len(true_vals) > 1 else float("nan")
+                corrs.append(corr)
+                gene_corrs.append(_per_gene_mean_corr(true_mat, pred_mat))
             else:
                 mses.append(float("nan"))
                 corrs.append(float("nan"))
+                gene_corrs.append(float("nan"))
+                corr = float("nan")
 
-    return {
+            if shuffle_control:
+                if true_all_shuf:
+                    true_mat_s = torch.cat(true_all_shuf, dim=0).numpy()
+                    pred_mat_s = torch.cat(pred_all_shuf, dim=0).numpy()
+                    valid_s = ~np.isnan(true_mat_s)
+                    true_vals_s, pred_vals_s = true_mat_s[valid_s], pred_mat_s[valid_s]
+                    mses_shuf.append(float(np.mean((pred_vals_s - true_vals_s) ** 2)))
+                    corr_shuf = np.corrcoef(true_vals_s, pred_vals_s)[0, 1] if len(true_vals_s) > 1 else float("nan")
+                    corrs_shuf.append(corr_shuf)
+                else:
+                    mses_shuf.append(float("nan"))
+                    corr_shuf = float("nan")
+                    corrs_shuf.append(corr_shuf)
+                gaps.append(corr - corr_shuf)
+
+    out = {
         "imputation_mse_mean":  float(np.nanmean(mses)),
         "imputation_mse_std":   float(np.nanstd(mses)),
         "imputation_corr_mean": float(np.nanmean(corrs)),
         "imputation_corr_std":  float(np.nanstd(corrs)),
+        "imputation_corr_per_gene_mean": float(np.nanmean(gene_corrs)),
+        "imputation_corr_per_gene_std":  float(np.nanstd(gene_corrs)),
     }
+    if shuffle_control:
+        out.update({
+            "imputation_mse_shuffled_mean":  float(np.nanmean(mses_shuf)),
+            "imputation_mse_shuffled_std":   float(np.nanstd(mses_shuf)),
+            "imputation_corr_shuffled_mean": float(np.nanmean(corrs_shuf)),
+            "imputation_corr_shuffled_std":  float(np.nanstd(corrs_shuf)),
+            "imputation_corr_gap_mean":      float(np.nanmean(gaps)),
+            "imputation_corr_gap_std":       float(np.nanstd(gaps)),
+        })
+    return out
 
 
 # ---------------------------------------------------------------------------

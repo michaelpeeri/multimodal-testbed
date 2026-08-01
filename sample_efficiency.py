@@ -54,9 +54,11 @@ treated as a diagnostic/health-check signal only (per benchmark_plan.md's
 convergence checklist), not as a cross-model quality metric:
 ImputationTransformer's loss is categorical cross-entropy (a different
 unit entirely from the VAE family's Gaussian MSE + KL), and each VAE
-family model's `beta`/`gamma`/regularizer weights are independently tuned
-by tuning.py, so even within the VAE family the *same* total_loss number
-reflects a different weighted mixture of quantities per model. Use
+family model's `gamma`/other regularizer weights are independently tuned
+by tuning.py (only `beta` is now fixed identically across models -- see
+"mask_fraction / batch_size / beta caveat" below), so even within the VAE
+family the *same* total_loss number reflects a different weighted mixture
+of quantities per model. Use
 `imputation_mse_mean` or `imputation_corr_mean` (both from the shared
 `models.evaluate_imputation()`, the same function tuning.py's Optuna
 objective now uses -- see tuning.py's module docstring) for any
@@ -103,16 +105,20 @@ equalized, since that's the confound that otherwise dominates. The actual
 recorded in the output CSV. Set `steps_budget` explicitly in the config to
 bypass this derivation and specify the total step count directly.
 
-mask_fraction / batch_size caveat, and tuning-provenance validation
-----------------------------------------------------------------------
-tuned_configs.json's best_params never includes `mask_fraction` (tuning.py
-treats it as a fixed problem-difficulty knob, not something to tune -- see
-tuning.py's module docstring). For the training/eval budget replayed here
+mask_fraction / batch_size / beta caveat, and tuning-provenance validation
+----------------------------------------------------------------------------
+tuned_configs.json's best_params never includes `mask_fraction` or `beta`
+(tuning.py treats both as fixed, not tuned -- see tuning.py's module
+docstring's "mask_fraction is deliberately not part of the search space"
+and "beta is fixed, not tuned"). For the training/eval budget replayed here
 to match what the model was *tuned* for, you must supply the same
-mask_fraction value(s) that were used in the tuning run, via this script's
-own top-level "mask_fraction" config key (float, applied to every model) or
-a per-model dict ({"GeneExpressionVAE": 0.1, "ImputationTransformer": 0.2,
-...}) if different model families were tuned with different mask fractions.
+mask_fraction/beta value(s) that were used in the tuning run, via this
+script's own top-level "mask_fraction"/"beta" config keys (float, applied
+to every model, or -- for mask_fraction only -- a per-model dict
+({"GeneExpressionVAE": 0.1, "ImputationTransformer": 0.2, ...}) if
+different model families were tuned with different mask fractions; `beta`
+is VAE_FAMILY_MODELS-only and always a single float, since
+TRANSFORMER_FAMILY_MODELS has no such knob).
 Similarly, `batch_size` here should match tuning.py's `batch_size`: a
 mismatch silently changes the number of optimizer steps/epoch relative to
 what tuning saw (see "Training budget" above), which previously caused a
@@ -120,13 +126,13 @@ model retrained here at the largest train_size to train for a different
 total step count -- and therefore reach a different loss -- than tuning.py
 did for the exact same hyperparameters.
 
-tuning.py's run() now writes both of these (plus max_epochs) into a
+tuning.py's run() now writes all of these (plus max_epochs) into a
 reserved "_meta" key in tuned_configs.json (see tuning.py's module
 docstring). run() here reads it back and prints a warning (not a hard
-error) if this sweep's own `batch_size`/`mask_fraction` don't match --
-check that warning if your results look surprising. tuned_configs.json
-files from before this check existed simply have no "_meta" key, in which
-case the check is skipped.
+error) if this sweep's own `batch_size`/`mask_fraction`/`beta` don't match
+-- check that warning if your results look surprising. tuned_configs.json
+files from before this check existed simply have no "_meta" key (or no
+"beta" entry within it), in which case that part of the check is skipped.
 
 Problem file schema
 --------------------
@@ -165,12 +171,19 @@ JSON config schema
                           Set this directly to bypass that derivation.
     batch_size          : int, default 256 (capped at the subset size)
     mask_fraction       : float | dict[str, float], default 0.1
+    beta                : float, default 1e-4 -- fixed (not tuned)
+                          VAE_FAMILY_MODELS KL weight, forwarded to
+                          epoch_vae for every model/train_size/repeat
+                          (ignored for TRANSFORMER_FAMILY_MODELS/MeansModel).
+                          Should match the "beta" used for the tuning run
+                          that produced tuned_configs_fn -- see "mask_fraction
+                          / batch_size / beta caveat" above.
     eval_mask_fraction  : float, default 0.2 -- fixed "hard" fraction used
                           for the imputation MSE/correlation eval metric
                           (models.evaluate_imputation()).
     n_eval_mask_draws   : int, default 10
     seed                : int, default 0
-    output              : str, default "sample_efficiency_results.csv" --
+     output              : str, default "sample_efficiency_results.csv" --
                           one row per (model, train_size, repeat), columns:
                           model, train_size, repeat, epochs_run, steps_run,
                           test_loss (diagnostic only -- see "Cross-model
@@ -178,11 +191,18 @@ JSON config schema
                           (VAE family only, None otherwise),
                           imputation_mse_mean/std, imputation_corr_mean/std
                           (both cross-model-comparable),
+                          imputation_corr_per_gene_mean/std,
+                          imputation_corr_shuffled_mean/std,
+                          imputation_mse_shuffled_mean/std,
+                          imputation_corr_gap_mean/std (see "Imputation
+                          methodology diagnostics" below),
                           effective_K_population (VampPrior family only),
                           deq_residual (DEQ family only).
-    summary_output      : str, default "sample_efficiency_summary.json" --
+     summary_output      : str, default "sample_efficiency_summary.json" --
                           mean/std of the above aggregated over repeats
-    plot_output         : str, default "sample_efficiency.png"
+     plot_output         : str, default "sample_efficiency.png"
+     diagnostics_plot_output : str, default "sample_efficiency_diagnostics.png"
+                          -- see "Imputation methodology diagnostics" below.
 
 VampPrior-family pseudo-input initialization
 -----------------------------------------------
@@ -192,6 +212,38 @@ replaced via `_random_fill`'s per-gene N(mean, std) draw, not a fixed
 sentinel -- see AGENTS.md's "Known Issues") rather than random noise,
 matching tuning.py's own run_trial/retrain (see tuning.py's module
 docstring and models.py's `_make_vamp_vae` docstring).
+
+Imputation methodology diagnostics: is this just output-distribution matching?
+--------------------------------------------------------------------------------
+`imputation_corr_mean` (the original pooled metric) is computed over *all*
+masked (gene, cell) positions at once, regardless of which gene each
+position belongs to. Because different genes have very different
+mean/scale, a model that predicts nothing but each gene's *population*
+mean -- i.e. uses zero information from this specific cell's other
+observed genes -- can still score a deceptively high pooled correlation
+purely by "knowing which gene it is" (include "MeansModel" in `models` to
+see this floor directly: it has no per-sample conditioning whatsoever).
+Two extra diagnostics (both from `models.evaluate_imputation()`, so they
+come for free alongside the primary metric) help tell genuine per-sample
+imputation apart from this output-distribution-matching confound:
+
+  - `imputation_corr_per_gene_mean`: Pearson r computed independently
+    *within* each gene column (across cells, at that gene's masked
+    positions), Fisher-z averaged across genes. This removes the
+    between-gene confound entirely -- it can only be high if the model
+    tracks cell-to-cell variation within a gene.
+  - `imputation_corr_gap_mean` (= `imputation_corr_mean` minus
+    `imputation_corr_shuffled_mean`, per draw): the shuffled variant feeds
+    the model a "chimeric" input where every cell's *observed* genes are
+    swapped in from a different, randomly chosen cell (same mask pattern),
+    but scores predictions against the *original* cell's true values. If a
+    model doesn't actually use this cell's own observed genes, its
+    shuffled correlation will be nearly as high as the real one and the
+    gap will be ~0. A large gap is direct evidence of genuine per-sample
+    conditioning (which, given `make_synthetic_data5`'s linear generative
+    structure, is essentially equivalent to implicitly recovering
+    something latent-shaped -- see the project's imputation-methodology
+    discussion for the full argument).
 """
 
 import argparse
@@ -225,12 +277,14 @@ _CONFIG_DEFAULTS = {
     "steps_budget":        None,
     "batch_size":          256,
     "mask_fraction":       0.1,
+    "beta":                1e-4,  # fixed, not tuned -- see module docstring's beta caveat
     "eval_mask_fraction":  0.2,
     "n_eval_mask_draws":   10,
     "seed":                0,
     "output":              "sample_efficiency_results.csv",
     "summary_output":      "sample_efficiency_summary.json",
     "plot_output":         "sample_efficiency.png",
+    "diagnostics_plot_output": "sample_efficiency_diagnostics.png",
 }
 
 
@@ -288,19 +342,21 @@ def mask_fraction_for(config: dict, model_name: str) -> float:
 
 
 def _check_tuning_provenance(config: dict, tuned_configs: dict, models_to_run: list[str]) -> None:
-    """Warn (not error) if this sweep's batch_size/mask_fraction don't match
-    what tuning.py actually used to produce tuned_configs -- a mismatch here
-    silently changes the total optimizer-step count and/or task difficulty
-    relative to what each model's hyperparameters were tuned for (see the
-    module docstring's "mask_fraction caveat" and "Training budget"
+    """Warn (not error) if this sweep's batch_size/mask_fraction/beta don't
+    match what tuning.py actually used to produce tuned_configs -- a
+    mismatch here silently changes the total optimizer-step count and/or
+    task difficulty and/or KL regularization strength relative to what each
+    model's hyperparameters were tuned for (see the module docstring's
+    "mask_fraction / batch_size / beta caveat" and "Training budget"
     sections). tuning.py's run() writes this provenance into a reserved
     "_meta" key (added alongside the per-model entries) -- older
-    tuned_configs.json files without it are simply skipped (nothing to
-    check against)."""
+    tuned_configs.json files without it (or without a "beta" entry within
+    it, from before beta was fixed rather than tuned) simply have that part
+    of the check skipped (nothing to check against)."""
     meta = tuned_configs.get("_meta")
     if not meta:
         print("  [provenance] tuned_configs has no '_meta' block (produced by an older "
-              "tuning.py) -- skipping batch_size/mask_fraction consistency check.")
+              "tuning.py) -- skipping batch_size/mask_fraction/beta consistency check.")
         return
 
     if "batch_size" in meta and meta["batch_size"] != config["batch_size"]:
@@ -310,6 +366,15 @@ def _check_tuning_provenance(config: dict, tuned_configs: dict, models_to_run: l
             f"optimizer steps/epoch relative to what these hyperparameters were tuned for "
             f"(see module docstring's 'Training budget' section) -- results, especially at "
             f"the largest train_size, may not reproduce what tuning.py saw."
+        )
+
+    if "beta" in meta and meta["beta"] != config["beta"]:
+        print(
+            f"  [provenance WARNING] sample_efficiency beta={config['beta']!r} "
+            f"!= tuning beta={meta['beta']!r}. This changes the KL regularization "
+            f"strength relative to what these hyperparameters were tuned for "
+            f"(see module docstring's 'mask_fraction / batch_size / beta caveat' "
+            f"section) -- results may not reproduce what tuning.py saw."
         )
 
     for model_name in models_to_run:
@@ -324,7 +389,7 @@ def _check_tuning_provenance(config: dict, tuned_configs: dict, models_to_run: l
                 f"  [provenance WARNING] {model_name}: sample_efficiency mask_fraction={mf!r} "
                 f"!= tuning mask_fraction={meta['mask_fraction']!r} -- this is a different "
                 f"task difficulty than what this model's hyperparameters were tuned for "
-                f"(see module docstring's 'mask_fraction caveat')."
+                f"(see module docstring's 'mask_fraction / batch_size / beta caveat')."
             )
 
 
@@ -337,6 +402,7 @@ def train_and_eval_one(model_name: str,
                         loader_test,
                         n_epochs: int,
                         mask_fraction: float,
+                        beta: float,
                         eval_mask_fraction: float,
                         n_eval_mask_draws: int,
                         subset_data: torch.Tensor) -> dict:
@@ -346,6 +412,11 @@ def train_and_eval_one(model_name: str,
     docstring's "Training budget: gradient steps, not epochs"), evaluate
     it on loader_test (held-out loss + unified imputation metrics), and
     return a metrics dict.
+
+    beta: fixed (not tuned) VAE_FAMILY_MODELS KL weight, applied to every
+    epoch_vae call here -- ignored for TRANSFORMER_FAMILY_MODELS/MeansModel,
+    which have no such knob. See module docstring's "mask_fraction / batch_size
+    / beta caveat" for why this must match the tuning run's own "beta".
 
     subset_data is passed separately (rather than re-derived from
     loader_train) so that (a) MeansModel -- which has no training loop at
@@ -357,7 +428,7 @@ def train_and_eval_one(model_name: str,
     diagnostic/health-check purposes only (see benchmark_plan.md's
     convergence checklist) -- it is NOT comparable across model families
     (different loss units for ImputationTransformer vs. the VAE family,
-    different independently-tuned beta/gamma/regularizer weights baked
+    different independently-tuned gamma/other regularizer weights baked
     into the VAE family's own loss number). Use `imputation_mse_mean` /
     `imputation_corr_mean` (from models.evaluate_imputation(), the same
     function tuning.py's Optuna objective uses) for any cross-model
@@ -399,11 +470,11 @@ def train_and_eval_one(model_name: str,
         opt = optim.AdamW(model.parameters(), lr=lr)
 
         for _ in range(n_epochs):
-            epoch_vae(model, loader_train, opt, mask_fraction=mask_fraction, **train_kwargs)
+            epoch_vae(model, loader_train, opt, mask_fraction=mask_fraction, beta=beta, **train_kwargs)
 
         model.eval()
         test_loss, _grad_norm, _recon_loss, recon_loss_type2, _kl_loss = epoch_vae(
-            model, loader_test, None, mask_fraction=mask_fraction, **train_kwargs)
+            model, loader_test, None, mask_fraction=mask_fraction, beta=beta, **train_kwargs)
         recon_loss_type2 = float(recon_loss_type2)
 
     if not isinstance(test_loss, float):
@@ -424,8 +495,18 @@ def train_and_eval_one(model_name: str,
     # the SAME function tuning.py's Optuna objective uses -- so these
     # numbers are directly comparable across model families, unlike
     # test_loss above.
+    #
+    # shuffle_control=True here (unlike tuning.py's hot per-epoch objective
+    # call, which leaves it at the default False): this is a diagnostic
+    # against the "am I just measuring the model's ability to reconstruct
+    # the output distribution, rather than genuinely using each sample's
+    # own observed genes?" question -- see imputation_corr_per_gene_mean/
+    # imputation_corr_gap_mean in the module docstring. It costs one extra
+    # forward pass per mask draw, which is fine here since this only runs
+    # once per (model, train_size, repeat), not once per training epoch.
     imp_metrics = evaluate_imputation(model, loader_test, eval_mask_fraction,
-                                       n_eval_mask_draws, device=device)
+                                       n_eval_mask_draws, device=device,
+                                       shuffle_control=True)
 
     return {
         "test_loss": test_loss if math.isfinite(test_loss) else None,
@@ -450,7 +531,10 @@ def run(config_path: str) -> tuple[list[dict], dict]:
                     "imputation_mse_mean": ..., "test_loss_mean": ..., ...}}}
                    (see _summarize()), also written to
                    config["summary_output"] as JSON and plotted to
-                   config["plot_output"].
+                   config["plot_output"] (pooled correlation) and
+                   config["diagnostics_plot_output"] (per-gene correlation
+                   and real-vs-shuffled gap -- see module docstring's
+                   "Imputation methodology diagnostics").
     """
     config = load_config(config_path)
 
@@ -564,7 +648,7 @@ def run(config_path: str) -> tuple[list[dict], dict]:
                 metrics = train_and_eval_one(
                     model_name, arch_cfg, train_kwargs, lr, n_genes,
                     loader_train, loader_test, epochs_this_size,
-                    mask_fraction, eval_mask_fraction, n_eval_mask_draws,
+                    mask_fraction, config["beta"], eval_mask_fraction, n_eval_mask_draws,
                     subset_data,
                 )
 
@@ -590,6 +674,9 @@ def run(config_path: str) -> tuple[list[dict], dict]:
 
     _plot(summary, config["plot_output"])
     print(f"Wrote plot to {config['plot_output']}")
+
+    _plot_diagnostics(summary, config["diagnostics_plot_output"])
+    print(f"Wrote diagnostics plot to {config['diagnostics_plot_output']}")
 
     return rows, summary
 
@@ -623,8 +710,19 @@ def _summarize(rows: list[dict]) -> dict:
     # applicable, e.g. recon_loss_type2 for ImputationTransformer, or
     # effective_K_population for non-VampPrior models) -- aggregated the
     # same generic way rather than one-off per field.
+    #
+    # imputation_corr_per_gene_mean / imputation_corr_gap_mean (both from
+    # evaluate_imputation()'s shuffle_control=True, see train_and_eval_one)
+    # are the methodology-diagnostic fields: per-gene correlation removes
+    # the pooled metric's between-gene-mean confound (see
+    # models._per_gene_mean_corr's docstring), and the gap (real minus
+    # row-shuffled correlation) isolates genuine per-sample conditioning
+    # from output-distribution matching.
     mean_fields = [
         "imputation_corr_mean", "imputation_mse_mean",
+        "imputation_corr_per_gene_mean",
+        "imputation_corr_shuffled_mean", "imputation_mse_shuffled_mean",
+        "imputation_corr_gap_mean",
         "test_loss", "recon_loss_type2",
         "effective_K_population", "deq_residual",
     ]
@@ -656,6 +754,71 @@ def _plot(summary: dict, path: str) -> None:
     ax.set_ylabel("Imputation correlation (held-out test set)")
     ax.set_title("Sample efficiency: imputation quality vs. training-set size")
     ax.legend()
+    fig.tight_layout()
+    fig.savefig(path, dpi=120)
+    plt.close(fig)
+
+
+def _plot_diagnostics(summary: dict, path: str) -> None:
+    """Two-panel figure for the "is this just output-distribution matching?"
+    diagnostics (see module docstring's "Imputation methodology
+    diagnostics" section):
+
+      Left:  imputation_corr_mean (pooled, the original metric) vs.
+             imputation_corr_per_gene_mean (between-gene-confound-free) --
+             per model, vs. train_size. A model whose per-gene line sits
+             far below its pooled line is getting much of its pooled score
+             from "knowing which gene it is", not from per-sample signal.
+      Right: imputation_corr_gap_mean (real minus row-shuffled correlation)
+             vs. train_size, per model -- directly measures how much of the
+             correlation requires this specific cell's own observed genes.
+             A model near 0 here isn't doing genuine per-sample imputation
+             regardless of how high its pooled correlation is.
+
+    Silently skipped (with a printed note) if none of the required fields
+    are present, e.g. summaries produced before shuffle_control=True was
+    wired into train_and_eval_one.
+    """
+    import matplotlib.pyplot as plt
+
+    any_gene = any("imputation_corr_per_gene_mean" in e
+                   for by_size in summary.values() for e in by_size.values())
+    any_gap = any("imputation_corr_gap_mean" in e
+                  for by_size in summary.values() for e in by_size.values())
+    if not (any_gene or any_gap):
+        print("  [diagnostics plot] no imputation_corr_per_gene_mean/imputation_corr_gap_mean "
+              "fields found in summary -- skipping diagnostics plot.")
+        return
+
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+
+    for model_name, by_size in summary.items():
+        sizes = sorted((int(s) for s in by_size), reverse=True)
+
+        pooled = [by_size[str(s)].get("imputation_corr_mean") for s in sizes]
+        per_gene = [by_size[str(s)].get("imputation_corr_per_gene_mean") for s in sizes]
+        line, = axes[0].plot(sizes, pooled, marker="o", ms=4, label=f"{model_name} (pooled)")
+        axes[0].plot(sizes, per_gene, marker="s", ms=4, ls="--",
+                     color=line.get_color(), label=f"{model_name} (per-gene)")
+
+        gap_mean = [by_size[str(s)].get("imputation_corr_gap_mean") for s in sizes]
+        gap_std = [by_size[str(s)].get("imputation_corr_gap_std") for s in sizes]
+        axes[1].errorbar(sizes, gap_mean, yerr=gap_std, marker="o", ms=4,
+                          capsize=3, label=model_name)
+
+    axes[0].set_xscale("log")
+    axes[0].set_xlabel("Training-set size (n_cells)")
+    axes[0].set_ylabel("Imputation correlation")
+    axes[0].set_title("Pooled (solid) vs. per-gene (dashed)\n-- gap = between-gene-mean confound")
+    axes[0].legend(fontsize=7)
+
+    axes[1].axhline(0.0, color="gray", lw=1, ls=":")
+    axes[1].set_xscale("log")
+    axes[1].set_xlabel("Training-set size (n_cells)")
+    axes[1].set_ylabel("Correlation gap (real - row-shuffled)")
+    axes[1].set_title("Genuine per-sample conditioning\n(0 = output-distribution matching only)")
+    axes[1].legend(fontsize=7)
+
     fig.tight_layout()
     fig.savefig(path, dpi=120)
     plt.close(fig)

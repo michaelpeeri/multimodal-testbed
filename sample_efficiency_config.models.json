@@ -4,8 +4,10 @@
   "output":              "/content/Drive/MyDrive/Colab Notebooks/sample_efficiency_results.3.models.csv",
   "summary_output":      "/content/Drive/MyDrive/Colab Notebooks/sample_efficiency_summary.3.models.json",
   "plot_output":         "/content/Drive/MyDrive/Colab Notebooks/sample_efficiency.3.models.png",
+  "diagnostics_plot_output": "/content/Drive/MyDrive/Colab Notebooks/sample_efficiency_diagnostics.3.models.png",
 
   "models": [
+    "MeansModel",
     "GeneExpressionVAE",
     "DEQEncoderVAE",
     "VampPriorVAE",
@@ -19,6 +21,7 @@
   "batch_size":          256,
 
   "mask_fraction":        0.4,
+  "beta":                 1e-4,
   "eval_mask_fraction":   0.4,
   "n_eval_mask_draws":   10,
   "seed":                 0

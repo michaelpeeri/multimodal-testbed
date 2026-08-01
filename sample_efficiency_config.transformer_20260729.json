@@ -1,0 +1,23 @@
+{
+  "problem_fn":          "/content/Drive/MyDrive/colab/test_problem_3.pt",
+  "tuned_configs_fn":    "/content/Drive/MyDrive/Colab Notebooks/tuned_configs.transformer_20260729.json",
+  "output":              "/content/Drive/MyDrive/Colab Notebooks/sample_efficiency_results.transformer_20260729.csv",
+  "summary_output":      "/content/Drive/MyDrive/Colab Notebooks/sample_efficiency_summary.transformer_20260729.json",
+  "plot_output":         "/content/Drive/MyDrive/Colab Notebooks/sample_efficiency.transformer_20260729.png",
+
+  "models": [
+    "ImputationTransformer",
+    "MeansModel"
+  ],
+
+  "min_train_size":      200,
+  "n_train_size_points":  12,
+  "n_repeats":             5,
+  "max_epochs":           50,
+  "batch_size":          256,
+
+  "mask_fraction":        0.4,
+  "eval_mask_fraction":   0.4,
+  "n_eval_mask_draws":   10,
+  "seed":                 0
+}

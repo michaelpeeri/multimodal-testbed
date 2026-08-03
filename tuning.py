@@ -222,9 +222,61 @@ examples. Keys:
                     driven by encoder_width_factor/decoder_width_factor/
                     d_model.
     max_layer_width : int, default 4096 -- upper bound, see min_layer_width.
+
+    VRAM guard (TRANSFORMER_FAMILY_MODELS only -- ignored for VAE_FAMILY_MODELS)
+    ----------------------------------------------------------------------------
+    ImputationTransformer's attention cost is O(batch * n_heads * n_genes^2),
+    so at larger n_genes an unlucky Optuna draw near the top of the search
+    space (large d_model/n_heads/n_layers) can request far more VRAM than a
+    "typical" trial -- enough to crash the whole study with a CUDA OOM
+    partway through a sweep. run_trial_transformer estimates each trial's
+    peak VRAM (via models.estimate_transformer_train_bytes/eval_bytes)
+    *before* constructing the model and prunes it (trial.user_attrs
+    ["prune_reason"] = "vram_budget_exceeded") if the estimate exceeds the
+    budget below -- the same "prune before training" pattern already used
+    for d_model/n_heads divisibility and min_layer_width/max_layer_width.
+    vram_budget_gb       : float, default None -- explicit VRAM budget
+                    override, in GB. If None (default), auto-detected as
+                    vram_budget_fraction * the current CUDA device's total
+                    memory; the guard is disabled (never prunes) if the
+                    device isn't CUDA and no explicit override is given.
+    vram_budget_fraction : float, default 0.9 -- only used for
+                    auto-detection (see vram_budget_gb); leaves headroom
+                    for CUDA context/other processes.
+    vram_overhead_factor : float, default 0.65 -- multiplies the raw
+                    estimate from estimate_transformer_train_bytes/
+                    estimate_transformer_eval_bytes (which models only the
+                    dominant tensors: Q/K/V, attention scores/softmax, FFN)
+                    to approximate real measured peak usage. Calibrated
+                    from a sanity-test measurement (n_genes=800, d_model=384,
+                    n_heads=8, n_layers=6, batch=128): raw estimate ~43.7GB
+                    vs. measured torch.cuda.max_memory_allocated() < 19GB
+                    (ratio <= ~0.435), with a ~1.5x safety margin applied.
+                    The raw formula OVER-estimates real usage here -- likely
+                    because nn.TransformerEncoderLayer's internal self_attn
+                    call uses need_weights=False, which lets PyTorch dispatch
+                    to a fused scaled_dot_product_attention kernel that never
+                    materializes the full O(batch*n_heads*n_genes^2)
+                    attention/softmax matrix the raw formula assumes. The
+                    margin (rather than the bare ~0.435 ratio) hedges against
+                    that fused kernel falling back to its slower "math"
+                    backend (full materialization) under some combination of
+                    dropout/mask/head_dim/GPU/PyTorch-version -- recalibrate
+                    as (measured peak bytes / raw estimate), with margin, if
+                    you get measurements at other architectures/batch sizes.
     storage       : str, default "sqlite:///tuning.db"
-    batch_size    : int, default 256 (train loader only; test loader always
-                    uses the full test set as one batch, matching n_cells)
+    batch_size    : int, default 256 (train loader only)
+    eval_batch_size : int, default: same as batch_size -- caps the test
+                    loader's batch size (capped again at the test-set size
+                    if smaller). Previously the test loader always used the
+                    whole test set as one batch; for ImputationTransformer
+                    that makes attention memory (O(batch * n_heads *
+                    n_genes^2)) scale with test-set size rather than
+                    architecture -- the actual cause of the 15-40GB VRAM
+                    usage observed at n_genes=200. epoch_transformer/
+                    epoch_vae/evaluate_imputation already pool/average
+                    across loader_test's batches, so lowering this only
+                    changes memory use, not results.
     n_trials      : int, default 50 (per model)
     max_epochs    : int, default 50
     eval_every    : int, default 1 -- epoch cadence for both the held-out
@@ -307,6 +359,7 @@ from models import (
     epoch_transformer, make_log_bin_edges,
     IMPUTATION_TRANSFORMER_CONFIG,
     evaluate_imputation, collect_vamp_diagnostics,
+    estimate_transformer_train_bytes, estimate_transformer_eval_bytes,
 )
 from synthetic_data import _random_fill
 
@@ -387,6 +440,13 @@ _TRANSFORMER_TRAIN_SEARCH_SPACE_KEYS = {"lr", "lambda_conf"}
 _CONFIG_DEFAULTS = {
     "storage":         "sqlite:///tuning.db",
     "batch_size":      256,
+    "eval_batch_size": None,  # default: same as batch_size, see load_config -- caps the
+                              # test-set DataLoader's batch size. Left at n_cells (the
+                              # whole test set as one batch) this scales ImputationTransformer's
+                              # O(batch * n_heads * n_genes^2) attention memory with dataset
+                              # size instead of architecture, which is what actually drove the
+                              # 15-40GB VRAM usage reported at n_genes=200 -- see AGENTS.md /
+                              # the VRAM investigation this key was added for.
     "n_trials":        50,
     "max_epochs":      50,
     "eval_every":      1,
@@ -400,6 +460,43 @@ _CONFIG_DEFAULTS = {
     "min_layer_width": 4,
     "max_layer_width": 4096,
     "checkpoint_dir":  "checkpoints",
+
+    # VRAM guard for ImputationTransformer trials (see run_trial_transformer /
+    # estimate_transformer_train_bytes|eval_bytes in models.py, and the module
+    # docstring's "VRAM guard" section below). Ignored for VAE_FAMILY_MODELS.
+    "vram_budget_gb":       None,  # default: auto-detect, see load_config --
+                                    # explicit override (in GB) for the VRAM
+                                    # budget a trial's estimated usage is
+                                    # checked against. Set to a number to
+                                    # bypass auto-detection (e.g. on a shared
+                                    # GPU, or to test the guard without CUDA).
+    "vram_budget_fraction": 0.9,    # only used for auto-detection: fraction of
+                                    # torch.cuda.get_device_properties(device)
+                                    # .total_memory to treat as the budget,
+                                    # leaving headroom for CUDA context/other
+                                    # processes. Auto-detection is a no-op
+                                    # (budget=None, guard never prunes) when
+                                    # device is not CUDA.
+    "vram_overhead_factor": 0.65,   # multiplies the raw estimate from
+                                    # estimate_transformer_train_bytes/
+                                    # estimate_transformer_eval_bytes to
+                                    # approximate real measured peak usage.
+                                    # Calibrated from a sanity-test measurement
+                                    # (n_genes=800, d_model=384, n_heads=8,
+                                    # n_layers=6, batch=128): raw estimate
+                                    # ~43.7GB vs. measured
+                                    # torch.cuda.max_memory_allocated() < 19GB
+                                    # (ratio <= ~0.435, x1.5 margin applied).
+                                    # The raw formula over-estimates here,
+                                    # likely because nn.TransformerEncoderLayer
+                                    # dispatches self-attention (need_weights=
+                                    # False) to a fused scaled_dot_product_
+                                    # attention kernel that avoids materializing
+                                    # the full O(batch*n_heads*n_genes^2)
+                                    # attention matrix the raw formula assumes.
+                                    # Recalibrate as (measured_bytes /
+                                    # raw_estimate), with margin, if you get
+                                    # measurements at other architectures.
 }
 
 
@@ -464,7 +561,29 @@ def load_config(path: str) -> dict:
     if config["eval_mask_fraction"] is None:
         config["eval_mask_fraction"] = config["mask_fraction"]
 
+    if config["eval_batch_size"] is None:
+        config["eval_batch_size"] = config["batch_size"]
+
+    # Derived (not user-facing) key: the resolved VRAM budget in bytes, computed
+    # once here so run()/run_study_for_model don't each need to repeat the
+    # auto-detection logic. None means "no guard" (non-CUDA device and no
+    # explicit vram_budget_gb override).
+    config["vram_budget_bytes"] = _resolve_vram_budget_bytes(config)
+
     return config
+
+
+def _resolve_vram_budget_bytes(config: dict) -> float | None:
+    """VRAM guard budget, in bytes, for ImputationTransformer trials (see
+    run_trial_transformer). Explicit config['vram_budget_gb'] wins if set;
+    otherwise auto-detected as vram_budget_fraction * the current CUDA
+    device's total memory, or None (guard disabled) if device isn't CUDA."""
+    if config["vram_budget_gb"] is not None:
+        return config["vram_budget_gb"] * 1e9
+    if device.type != "cuda":
+        return None
+    total_bytes = torch.cuda.get_device_properties(device).total_memory
+    return total_bytes * config["vram_budget_fraction"]
 
 
 def suggest_from_spec(trial: optuna.Trial, name: str, spec: dict):
@@ -701,9 +820,13 @@ def retrain(model_name: str,
         import tuning
 
         problem = torch.load("test_problem_3.pt")
-        n_genes, n_cells = problem["n_genes"], problem["n_cells"]
+        n_genes = problem["n_genes"]
+        n_cells_test = problem["gene_reads_test"].shape[0]
         loader_train = DataLoader(problem["gene_reads_train"], batch_size=256, shuffle=True)
-        loader_test  = DataLoader(problem["gene_reads_test"],  batch_size=n_cells, shuffle=False)
+        # Cap the test batch instead of using the whole test set as one batch --
+        # for ImputationTransformer especially, a single giant batch makes
+        # attention memory scale with test-set size (see run()'s eval_batch_size).
+        loader_test  = DataLoader(problem["gene_reads_test"],  batch_size=min(256, n_cells_test), shuffle=False)
 
         tuned  = json.load(open("tuned_configs.json"))
         params = tuned["GeneExpressionVAE"]["best_params"]
@@ -944,6 +1067,17 @@ def run_trial(trial: optuna.Trial,
     return imputation_mse
 
 
+def _prune(trial: optuna.Trial, reason: str, message: str = "") -> None:
+    """Raise optuna.TrialPruned after tagging *why* -- trial.user_attrs
+    ["prune_reason"] lets post-hoc study analysis (or trial_summary_callback,
+    live) distinguish structural prunes (d_model_not_divisible_by_n_heads,
+    d_model_out_of_bounds, vram_budget_exceeded -- all before any training)
+    from training-time prunes (non_finite_test_loss, non_finite_imputation_mse,
+    pruner_median_stopping), rather than lumping every PRUNED trial together."""
+    trial.set_user_attr("prune_reason", reason)
+    raise optuna.TrialPruned(message or reason)
+
+
 def run_trial_transformer(trial: optuna.Trial,
                            model_name: str,
                            n_genes: int,
@@ -957,11 +1091,21 @@ def run_trial_transformer(trial: optuna.Trial,
                            n_eval_mask_draws: int,
                            min_layer_width: int,
                            max_layer_width: int,
-                           checkpoint_dir: str) -> float:
+                           checkpoint_dir: str,
+                           batch_size: int | None = None,
+                           eval_batch_size: int | None = None,
+                           vram_budget_bytes: float | None = None,
+                           vram_overhead_factor: float = 0.65) -> float:
     """ImputationTransformer counterpart of run_trial: build a fresh model,
     train it for max_epochs via epoch_transformer, report intermediate
     imputation_mse_mean for pruning (see module docstring's "The objective
-    being minimized"), and return the final imputation_mse_mean."""
+    being minimized"), and return the final imputation_mse_mean.
+
+    batch_size/eval_batch_size/vram_budget_bytes/vram_overhead_factor drive
+    the pre-training VRAM guard (see module docstring's "VRAM guard" section)
+    -- the guard is a no-op if vram_budget_bytes is None (e.g. non-CUDA
+    device and no explicit vram_budget_gb override, see
+    _resolve_vram_budget_bytes)."""
     cfg = suggest_transformer_train_cfg(trial, search_space)
     lr = cfg.pop("lr", 3e-4)
     lambda_conf = cfg.pop("lambda_conf", 0.10)
@@ -971,20 +1115,36 @@ def run_trial_transformer(trial: optuna.Trial,
     # d_model must be divisible by n_heads (nn.TransformerEncoderLayer
     # requirement); an incompatible combination is pruned before any
     # training rather than crashing mid-trial.
-    resolved_d_model = arch_cfg.get("d_model", IMPUTATION_TRANSFORMER_CONFIG["d_model"])
-    resolved_n_heads = arch_cfg.get("n_heads", IMPUTATION_TRANSFORMER_CONFIG["n_heads"])
+    resolved_d_model  = arch_cfg.get("d_model",  IMPUTATION_TRANSFORMER_CONFIG["d_model"])
+    resolved_n_heads  = arch_cfg.get("n_heads",  IMPUTATION_TRANSFORMER_CONFIG["n_heads"])
+    resolved_n_layers = arch_cfg.get("n_layers", IMPUTATION_TRANSFORMER_CONFIG["n_layers"])
     if arch_cfg:
         trial.set_user_attr("arch_cfg", arch_cfg)
     if resolved_d_model % resolved_n_heads != 0:
-        raise optuna.TrialPruned(
-            f"d_model={resolved_d_model} not divisible by n_heads={resolved_n_heads}"
-        )
+        _prune(trial, "d_model_not_divisible_by_n_heads",
+               f"d_model={resolved_d_model} not divisible by n_heads={resolved_n_heads}")
     # d_model is the transformer's analogue of the VAE family's layer
     # width; enforce the same [min_layer_width, max_layer_width] guard.
     if "d_model" in arch_cfg and not (min_layer_width <= resolved_d_model <= max_layer_width):
-        raise optuna.TrialPruned(
-            f"d_model={resolved_d_model} outside [{min_layer_width}, {max_layer_width}]"
-        )
+        _prune(trial, "d_model_out_of_bounds",
+               f"d_model={resolved_d_model} outside [{min_layer_width}, {max_layer_width}]")
+
+    # VRAM guard: estimate this trial's peak VRAM (train and eval, take the
+    # max) *before* touching the GPU, and prune it the same way as the
+    # structural checks above if it's over budget -- see module docstring's
+    # "VRAM guard" section. No-op if vram_budget_bytes is None.
+    if vram_budget_bytes is not None:
+        est_train_bytes = estimate_transformer_train_bytes(
+            batch_size, n_genes, resolved_n_heads, resolved_d_model, resolved_n_layers)
+        est_eval_bytes = estimate_transformer_eval_bytes(
+            eval_batch_size, n_genes, resolved_n_heads, resolved_d_model, resolved_n_layers)
+        est_bytes = max(est_train_bytes, est_eval_bytes) * vram_overhead_factor
+        trial.set_user_attr("estimated_vram_gb", est_bytes / 1e9)
+        if est_bytes > vram_budget_bytes:
+            _prune(trial, "vram_budget_exceeded",
+                   f"estimated VRAM {est_bytes / 1e9:.1f}GB (d_model={resolved_d_model}, "
+                   f"n_heads={resolved_n_heads}, n_layers={resolved_n_layers}, n_genes={n_genes}, "
+                   f"batch_size={batch_size}) exceeds budget {vram_budget_bytes / 1e9:.1f}GB")
 
     model = model_factories[model_name](n_genes, config=arch_cfg).to(device)
     bin_edges = make_log_bin_edges(model.n_bins, max_val=8.5)
@@ -1003,13 +1163,13 @@ def run_trial_transformer(trial: optuna.Trial,
             test_loss, *_ = epoch_transformer(model, loader_test, bin_edges, None,
                                                mask_fraction=mask_fraction, lambda_conf=lambda_conf, device=device)
             if not math.isfinite(test_loss):
-                raise optuna.TrialPruned()
+                _prune(trial, "non_finite_test_loss", f"test_loss={test_loss}")
 
             imp_metrics = evaluate_imputation(model, loader_test, eval_mask_fraction,
                                                n_eval_mask_draws, device=device)
             imputation_mse = imp_metrics["imputation_mse_mean"]
             if not math.isfinite(imputation_mse):
-                raise optuna.TrialPruned()
+                _prune(trial, "non_finite_imputation_mse", f"imputation_mse={imputation_mse}")
 
             try:
                 best = trial.study.best_value
@@ -1023,7 +1183,8 @@ def run_trial_transformer(trial: optuna.Trial,
 
             trial.report(imputation_mse, epoch)
             if trial.should_prune():
-                raise optuna.TrialPruned()
+                _prune(trial, "pruner_median_stopping",
+                       f"pruned by {type(trial.study.pruner).__name__} at epoch {epoch}")
 
     trial.set_user_attr("test_loss", test_loss)
     trial.set_user_attr("imputation_corr_mean", imp_metrics["imputation_corr_mean"])
@@ -1039,7 +1200,12 @@ def run_trial_transformer(trial: optuna.Trial,
 
 def trial_summary_callback(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
     """One concise progress line per finished trial (via tqdm.write, so it
-    doesn't clobber any active progress bar)."""
+    doesn't clobber any active progress bar). For PRUNED trials, appends
+    reason=<prune_reason> when run_trial_transformer's _prune() tagged one
+    (see its docstring) -- e.g. to tell how often the vram_budget_exceeded
+    guard is firing versus the structural d_model_not_divisible_by_n_heads/
+    d_model_out_of_bounds prunes versus training-time prunes, rather than
+    lumping every PRUNED trial together under state=PRUNED alone."""
     if trial.datetime_complete and trial.datetime_start:
         duration = (trial.datetime_complete - trial.datetime_start).total_seconds()
     else:
@@ -1052,9 +1218,11 @@ def trial_summary_callback(study: optuna.Study, trial: optuna.trial.FrozenTrial)
 
     value_str = f"{trial.value:.4f}" if trial.value is not None else "n/a"
     best_str = f"{best:.4f}" if best is not None else "n/a"
+    reason = trial.user_attrs.get("prune_reason")
+    reason_str = f"  reason={reason}" if reason else ""
     tqdm.write(
         f"  trial {trial.number:>4d}  state={trial.state.name:<9s}  "
-        f"value={value_str:>10s}  best={best_str:>10s}  ({duration:5.1f}s)"
+        f"value={value_str:>10s}  best={best_str:>10s}  ({duration:5.1f}s){reason_str}"
     )
 
 
@@ -1084,6 +1252,8 @@ def run_study_for_model(model_name: str,
             config["mask_fraction"], config["eval_mask_fraction"], config["n_eval_mask_draws"],
             config["min_layer_width"], config["max_layer_width"],
             config["checkpoint_dir"],
+            batch_size=config["batch_size"], eval_batch_size=config["eval_batch_size"],
+            vram_budget_bytes=config["vram_budget_bytes"], vram_overhead_factor=config["vram_overhead_factor"],
         )
     else:
         # Cheap, data-free probe instance (default config, never trained) just to
@@ -1176,8 +1346,22 @@ def run(config_path: str) -> dict:
     batch_size = config["batch_size"]
     mask_fraction = config["mask_fraction"]
 
-    loader_train = DataLoader(loaded["gene_reads_train"], batch_size=batch_size, shuffle=True )
-    loader_test  = DataLoader(loaded["gene_reads_test"],  batch_size=n_cells,    shuffle=False)
+    # eval_batch_size (default: batch_size, see _CONFIG_DEFAULTS/load_config) caps the
+    # test-set loader's batch size instead of feeding the whole test set through in one
+    # batch -- for ImputationTransformer, a single giant batch makes attention memory
+    # (O(batch * n_heads * n_genes^2)) scale with test-set size rather than architecture,
+    # which is what actually drove the 15-40GB VRAM usage observed at n_genes=200.
+    # epoch_transformer/epoch_vae/evaluate_imputation already loop over and pool/average
+    # across loader_test's batches, so this only changes memory use, not results.
+    n_cells_test = loaded["gene_reads_test"].shape[0]
+    eval_batch_size = min(config["eval_batch_size"], n_cells_test)
+    # Written back so run_study_for_model's VRAM guard (which reads
+    # config["eval_batch_size"]) sees the actual capped runtime batch size,
+    # not the pre-cap configured value.
+    config["eval_batch_size"] = eval_batch_size
+
+    loader_train = DataLoader(loaded["gene_reads_train"], batch_size=batch_size,     shuffle=True )
+    loader_test  = DataLoader(loaded["gene_reads_test"],  batch_size=eval_batch_size, shuffle=False)
 
     # Real training data used to initialize VAMP_FAMILY_MODELS' pseudo-inputs
     # (see run_trial/run_study_for_model) -- ignored for other families.
@@ -1193,6 +1377,14 @@ def run(config_path: str) -> dict:
         f"eval_mask_fraction={config['eval_mask_fraction']}  "
         f"n_eval_mask_draws={config['n_eval_mask_draws']}  device={device}"
     )
+    if config["vram_budget_bytes"] is not None:
+        print(
+            f"ImputationTransformer VRAM guard: budget={config['vram_budget_bytes'] / 1e9:.1f}GB "
+            f"(vram_budget_gb={config['vram_budget_gb']!r}, vram_budget_fraction={config['vram_budget_fraction']}, "
+            f"vram_overhead_factor={config['vram_overhead_factor']})"
+        )
+    elif set(config["models"]) & set(TRANSFORMER_FAMILY_MODELS):
+        print("ImputationTransformer VRAM guard: disabled (no CUDA device and no vram_budget_gb override)")
 
     studies = {}
     for model_name in config["models"]:

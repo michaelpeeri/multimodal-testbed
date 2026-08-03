@@ -2388,6 +2388,83 @@ class ImputationTransformer(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# 3b. VRAM estimation -- used by tuning.py's pre-training VRAM guard for
+#     ImputationTransformer Optuna trials (see tuning.py's module docstring
+#     "VRAM guard" section). ImputationTransformer's attention cost is
+#     O(batch * n_heads * n_genes^2), so a single unlucky architecture draw
+#     (large d_model/n_heads/n_layers at large n_genes) can request far more
+#     VRAM than a "typical" trial -- these estimators let a trial be pruned
+#     *before* any GPU allocation happens, rather than crashing the whole
+#     Optuna study with a CUDA OOM partway through a sweep.
+#
+# Both functions return a *raw* byte count modeling only the dominant
+# tensors (Q/K/V projections, attention scores/softmax, attention output,
+# the two FFN linears) -- deliberately not attempting to capture autograd's
+# extra backward-pass buffers, cuDNN/cuBLAS workspace, or allocator
+# fragmentation. Callers must multiply by an empirically-calibrated
+# overhead factor (see tuning.py's "vram_overhead_factor" config key) to
+# approximate real measured peak usage.
+#
+# NOTE on the raw formula's accuracy: a sanity-test measurement (n_genes=800,
+# d_model=384, n_heads=8, n_layers=6, batch=128) found real peak usage
+# (torch.cuda.max_memory_allocated()) under 19GB, vs. this formula's raw
+# ~43.7GB estimate for the same config -- i.e. the raw formula OVER-estimates
+# by >2x here (tuning.py's default vram_overhead_factor is calibrated to
+# ~0.65, not >1, to reflect this). The likely reason: ImputationTransformer's
+# nn.TransformerEncoderLayer calls self_attn with need_weights=False, which
+# lets PyTorch dispatch to a fused scaled_dot_product_attention kernel that
+# never materializes the full (B, n_heads, G, G) attention/softmax matrix
+# this formula's attn_mat term assumes -- so real memory likely scales much
+# closer to linear in n_genes than the O(n_genes^2) this formula models.
+# That's a safe bias for a guard meant to prevent OOM (the raw formula stays
+# conservative, if anything increasingly so, as n_genes grows) -- but it can
+# regress toward the full O(n_genes^2) cost if the fused kernel falls back to
+# its slower "math" backend (full materialization) under some combination of
+# dropout/mask/head_dim/GPU/PyTorch-version, which is why tuning.py keeps a
+# margin above the bare measured ratio rather than matching it exactly.
+# ---------------------------------------------------------------------------
+
+def _transformer_layer_act_elems(batch_size: int, n_genes: int, n_heads: int, d_model: int) -> int:
+    """Element count (not bytes) of the tensors that must be simultaneously
+    alive to compute ONE ImputationTransformer/TransformerEncoderLayer
+    forward pass: Q/K/V projections, attention scores + softmax probs
+    (the O(batch * n_heads * n_genes^2) term), attention output, and the
+    two feedforward linears (dim_feedforward = d_model * 4, matching
+    ImputationTransformer's own TransformerEncoderLayer construction)."""
+    d_ff = d_model * 4
+    qkv      = batch_size * n_genes * d_model * 3
+    attn_mat = batch_size * n_heads * n_genes * n_genes * 2   # raw scores + softmax probs
+    attn_out = batch_size * n_genes * d_model
+    ff1      = batch_size * n_genes * d_ff * 2                # linear1 out + activation-derivative copy
+    ff2      = batch_size * n_genes * d_model
+    return qkv + attn_mat + attn_out + ff1 + ff2
+
+
+def estimate_transformer_train_bytes(batch_size: int, n_genes: int, n_heads: int,
+                                      d_model: int, n_layers: int, bytes_per_elem: int = 4) -> int:
+    """Raw (pre-overhead-factor) estimate of peak activation memory for one
+    ImputationTransformer training step (forward + backward). Summed across
+    n_layers because backward needs every layer's saved forward activations
+    retained simultaneously -- unlike eval (see estimate_transformer_eval_bytes),
+    training memory scales with n_layers, not just with the widest single
+    layer."""
+    return _transformer_layer_act_elems(batch_size, n_genes, n_heads, d_model) * n_layers * bytes_per_elem
+
+
+def estimate_transformer_eval_bytes(batch_size: int, n_genes: int, n_heads: int,
+                                     d_model: int, n_layers: int, bytes_per_elem: int = 4) -> int:
+    """Raw (pre-overhead-factor) estimate of peak activation memory for one
+    ImputationTransformer eval/inference step (torch.no_grad()). NOT summed
+    across n_layers: with no backward pass to retain activations for, each
+    layer's tensors are freed (and their allocator blocks reused) before the
+    next layer runs, so peak memory is ~one layer's worth regardless of
+    n_layers, plus a small constant number of (B, G, d_model) tensors
+    passed between layers."""
+    return (_transformer_layer_act_elems(batch_size, n_genes, n_heads, d_model)
+            + batch_size * n_genes * d_model * 2) * bytes_per_elem
+
+
+# ---------------------------------------------------------------------------
 # 4. epoch_transformer -- training / evaluation loop
 # ---------------------------------------------------------------------------
 
@@ -2543,7 +2620,7 @@ def impute_transformer(
     n_conf_bins = model.n_conf_bins
     x_raw       = x_raw.to(device)
 
-    nan_mask        = torch.isnan(x_raw)           # (B, G) -- positions to impute
+    nan_mask        = torch.isnan(x_raw)            # (B, G) -- positions to impute
     true_count_bins = discretize(x_raw, bin_edges)  # (B, G); NaN -> n_bins
 
     # Initialise: observed positions keep true bins + proportional conf; unknown = bin 0

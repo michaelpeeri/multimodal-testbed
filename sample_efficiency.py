@@ -170,6 +170,19 @@ JSON config schema
                           `max_epochs * steps_per_epoch(max(train_sizes))`.
                           Set this directly to bypass that derivation.
     batch_size          : int, default 256 (capped at the subset size)
+    eval_batch_size     : int, default: same as batch_size -- caps the
+                          test loader's batch size (capped again at the
+                          test-set size if smaller). Previously the test
+                          loader always used the whole test set as one
+                          batch; for ImputationTransformer that makes
+                          attention memory (O(batch * n_heads *
+                          n_genes^2)) scale with test-set size rather
+                          than architecture -- the actual cause of the
+                          15-40GB VRAM usage observed at n_genes=200.
+                          evaluate_imputation/epoch_transformer/epoch_vae
+                          already pool/average across loader_test's
+                          batches, so lowering this only changes memory
+                          use, not results.
     mask_fraction       : float | dict[str, float], default 0.1
     beta                : float, default 1e-4 -- fixed (not tuned)
                           VAE_FAMILY_MODELS KL weight, forwarded to
@@ -276,6 +289,7 @@ _CONFIG_DEFAULTS = {
     "max_epochs":          50,
     "steps_budget":        None,
     "batch_size":          256,
+    "eval_batch_size":     None,  # default: same as batch_size, see load_config
     "mask_fraction":       0.1,
     "beta":                1e-4,  # fixed, not tuned -- see module docstring's beta caveat
     "eval_mask_fraction":  0.2,
@@ -306,6 +320,9 @@ def load_config(path: str) -> dict:
                 f"Unsupported model(s) in config['models']: {sorted(unknown)}. "
                 f"Supported: {ALL_TUNABLE_MODELS + ['MeansModel']}"
             )
+
+    if config["eval_batch_size"] is None:
+        config["eval_batch_size"] = config["batch_size"]
 
     return config
 
@@ -556,7 +573,15 @@ def run(config_path: str) -> tuple[list[dict], dict]:
     n_cells_train = data_train_full.shape[0]
     n_cells_test = data_test.shape[0]
 
-    loader_test = DataLoader(data_test, batch_size=n_cells_test, shuffle=False)
+    # eval_batch_size (default: batch_size, see _CONFIG_DEFAULTS/load_config) caps the
+    # test-set loader's batch size instead of feeding the whole test set through in one
+    # batch -- for ImputationTransformer, a single giant batch makes attention memory
+    # (O(batch * n_heads * n_genes^2)) scale with test-set size rather than architecture,
+    # which is what actually drove the 15-40GB VRAM usage observed at n_genes=200.
+    # evaluate_imputation/epoch_transformer/epoch_vae already loop over and pool/average
+    # across loader_test's batches, so this only changes memory use, not results.
+    eval_batch_size = min(config["eval_batch_size"], n_cells_test)
+    loader_test = DataLoader(data_test, batch_size=eval_batch_size, shuffle=False)
 
     train_sizes = config.get("train_sizes") or default_train_sizes(
         n_cells_train, config["min_train_size"], config["n_train_size_points"]

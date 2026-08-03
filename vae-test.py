@@ -270,8 +270,14 @@ plt.ylabel('Imputation correlation');
 
 # Use the same data_train / data_test already built by the standard4 block above.
 # (data_train and data_test are (n_cells, n_genes) float tensors with NaN for missing.)
-it_loader_train = DataLoader(data_train, batch_size=it_batch_size, shuffle=True)
-it_loader_test  = DataLoader(data_test,  batch_size=n_cells,       shuffle=False)
+# it_loader_test is capped at it_batch_size rather than using the whole test set (n_cells)
+# as one batch -- ImputationTransformer's attention memory is O(batch * n_heads *
+# n_genes^2), so a single giant eval batch scales VRAM with n_cells instead of
+# architecture (this was the actual cause of the 15-40GB VRAM usage observed at
+# n_genes=200). epoch_transformer/impute() already loop over and pool/average across
+# loader batches, so this only changes memory use, not results.
+it_loader_train = DataLoader(data_train, batch_size=it_batch_size,               shuffle=True)
+it_loader_test  = DataLoader(data_test,  batch_size=min(it_batch_size, n_cells), shuffle=False)
 
 it_model = models._make_imputation_transformer(n_genes).to(device)
 # Attach bin_edges as a model attribute so load_model and impute() can access

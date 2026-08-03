@@ -1,4 +1,7 @@
+import csv
 import math
+import os
+import tempfile
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -643,4 +646,729 @@ def make_synthetic_data5(
   X[dropout] = float('nan')
 
   return X, group_membership.cpu().numpy()
+
+
+# --------------------------------------------------------------------------
+# SERGIO-backed synthetic data (make_synthetic_data6)
+# --------------------------------------------------------------------------
+# SERGIO (https://github.com/PayamDiba/SERGIO, Dibaeinia & Sinha 2020) is a
+# gene-regulatory-network (GRN) simulator: given a fixed GRN structure and a
+# vector of master-regulator (MR) basal production rates per cell type
+# ("bin"), it integrates a stochastic differential equation per gene and
+# returns realistic steady-state single-cell expression profiles. It is not
+# a dependency of this repo (not installed in this dev environment) -- import
+# is deferred to inside make_synthetic_data6, with a clear error otherwise.
+
+def _parse_sergio_targets_file(path: str) -> tuple[int, list[int]]:
+  """
+  Scan a SERGIO-format `input_file_targets` CSV (see SERGIO's build_graph
+  documentation) to determine the total gene count and the set of
+  master-regulator gene IDs, without depending on SERGIO's own parser (which
+  uses the `np.int`/`np.float` aliases removed in numpy>=1.24).
+
+  Row format (one row per *target* gene):
+      target_id, n_regs, reg_id_1,...,reg_id_n, K_1,...,K_n[, coop_1,...,coop_n]
+  Master regulators never appear as a target_id (column 0) in this file --
+  they are exactly the regulator IDs that are never a target.
+
+  Returns:
+    n_genes: total number of genes (targets + master regulators). Gene IDs
+             are asserted to form a contiguous zero-based range [0, n_genes),
+             as required by SERGIO.
+    mr_ids:  sorted list of inferred master-regulator gene IDs.
+  """
+  target_ids = set()
+  reg_ids    = set()
+
+  with open(path, 'r') as f:
+    reader = csv.reader(f, delimiter=',')
+    for row in reader:
+      row = [c.strip() for c in row if c.strip() != '']
+      if not row:
+        continue
+      target_id = int(float(row[0]))
+      n_regs    = int(float(row[1]))
+      target_ids.add(target_id)
+      for r in row[2 : 2 + n_regs]:
+        reg_ids.add(int(float(r)))
+
+  mr_ids  = sorted(reg_ids - target_ids)
+  all_ids = target_ids | reg_ids
+  n_genes = len(all_ids)
+
+  assert all_ids == set(range(n_genes)), (
+      f"{path}: gene IDs must be a contiguous zero-based range [0, {n_genes}), "
+      f"as required by SERGIO's build_graph."
+  )
+  return n_genes, mr_ids
+
+
+def _write_sergio_regs_file(mr_state: torch.Tensor, mr_ids: list[int]) -> str:
+  """
+  Write a SERGIO-format `input_file_regs` CSV to a fresh temp file: one row
+  per master regulator, `mr_id, rate_cluster_0, ..., rate_cluster_{K-1}`.
+
+  Args:
+    mr_state: (n_clusters, n_mrs) tensor of basal production rates; column i
+              holds the rates (across clusters) for mr_ids[i].
+    mr_ids:   ordered list of master-regulator gene IDs, len == n_mrs.
+
+  Returns:
+    Path to the written temp file. Caller is responsible for deleting it.
+  """
+  mr_state_np = mr_state.detach().cpu().numpy()
+  fd, path = tempfile.mkstemp(suffix='.csv', prefix='sergio_regs_')
+  with os.fdopen(fd, 'w', newline='') as f:
+    writer = csv.writer(f)
+    for i, mr_id in enumerate(mr_ids):
+      writer.writerow([mr_id] + mr_state_np[:, i].tolist())
+  return path
+
+
+def _sample_cluster_sizes(
+    n_cells:         int,
+    n_clusters:      int,
+    concentration:   float,
+    min_per_cluster: int,
+    rng:             np.random.Generator,
+) -> np.ndarray:
+  """
+  Split n_cells among n_clusters using Dirichlet-sampled proportions (higher
+  `concentration` => more even split), rounded to integers that sum exactly
+  to n_cells and are each >= min_per_cluster.
+  """
+  assert n_cells >= n_clusters * min_per_cluster, (
+      f"n_cells={n_cells} cannot satisfy min_cells_per_cluster={min_per_cluster} "
+      f"across n_clusters={n_clusters}"
+  )
+
+  proportions = rng.dirichlet(np.full(n_clusters, concentration))
+  raw         = proportions * n_cells
+  counts      = np.maximum(np.floor(raw).astype(int), min_per_cluster)
+
+  # Fix up rounding so counts sum exactly to n_cells (largest-remainder
+  # method), while respecting the min_per_cluster floor.
+  deficit = n_cells - counts.sum()
+  if deficit > 0:
+    remainder_order = np.argsort(-(raw - np.floor(raw)))
+    for i in range(deficit):
+      counts[remainder_order[i % n_clusters]] += 1
+  elif deficit < 0:
+    order = np.argsort(-counts)
+    i = 0
+    while deficit < 0:
+      idx = order[i % n_clusters]
+      if counts[idx] > min_per_cluster:
+        counts[idx] -= 1
+        deficit += 1
+      i += 1
+
+  assert counts.sum() == n_cells
+  return counts
+
+
+# --------------------------------------------------------------------------
+# Building a SERGIO `input_file_targets` GRN-structure file from a reference
+# regulatory network (e.g. TRRUST), rather than synthesizing topology from
+# scratch: a connected subgraph of the reference network is sampled, made
+# acyclic (SERGIO's layering algorithm requires a DAG), and written out with
+# randomly-parameterised K/Hill coefficients.
+# --------------------------------------------------------------------------
+
+def _sample_from_dist(spec: tuple, size: int, rng: np.random.Generator) -> np.ndarray:
+  """
+  Sample `size` iid values from a small named distribution spec, used for
+  both `k_dist` (interaction-strength magnitudes) and `hill_coeff_dist`
+  (per-edge Hill/cooperativity coefficients):
+    ('constant', v)
+    ('uniform', low, high)
+    ('lognormal', mu, sigma)
+    ('normal', mu, sigma)
+    ('choice', values[, weights])
+  """
+  kind = spec[0]
+  if kind == 'constant':
+    _, v = spec
+    return np.full(size, v, dtype=np.float64)
+  elif kind == 'uniform':
+    _, low, high = spec
+    return rng.uniform(low, high, size=size)
+  elif kind == 'lognormal':
+    _, mu, sigma = spec
+    return rng.lognormal(mu, sigma, size=size)
+  elif kind == 'normal':
+    _, mu, sigma = spec
+    return rng.normal(mu, sigma, size=size)
+  elif kind == 'choice':
+    values  = np.asarray(spec[1], dtype=np.float64)
+    weights = spec[2] if len(spec) > 2 else None
+    p = None
+    if weights is not None:
+      w = np.asarray(weights, dtype=np.float64)
+      p = w / w.sum()
+    return rng.choice(values, size=size, p=p)
+  else:
+    raise ValueError(f"unrecognized distribution spec kind: {kind!r}")
+
+
+def _parse_reference_grn_edges(
+    path:               str,
+    delimiter:          str,
+    regulator_col:      int,
+    target_col:         int,
+    mode_col:           int|None,
+    activation_labels:  frozenset,
+    repression_labels:  frozenset,
+) -> list[tuple[str, str, str]]:
+  """
+  Parse a generic reference-GRN edge-list file (e.g. TRRUST's rawdata TSV)
+  into deduplicated (regulator, target, sign_category) triples, where
+  sign_category is one of 'activation', 'repression', 'ambiguous'
+  ('ambiguous' covers unknown/unlabeled mode, and pairs with conflicting
+  mode labels across duplicate rows -- e.g. TRRUST has 845 (regulator,
+  target) pairs annotated as both Activation and Repression by different
+  papers). Self-loops (regulator == target) are dropped, since SERGIO's
+  input format cannot represent autoregulation.
+  """
+  needed_cols = [regulator_col, target_col] + ([mode_col] if mode_col is not None else [])
+  max_col = max(needed_cols)
+
+  pair_modes: dict[tuple[str, str], set[str]] = {}
+  with open(path, 'r', newline='') as f:
+    reader = csv.reader(f, delimiter=delimiter)
+    for row in reader:
+      if len(row) <= max_col:
+        continue
+      reg = row[regulator_col].strip()
+      tgt = row[target_col].strip()
+      if not reg or not tgt or reg == tgt:
+        continue
+      mode = row[mode_col].strip() if mode_col is not None else ''
+      pair_modes.setdefault((reg, tgt), set()).add(mode)
+
+  edges = []
+  for (reg, tgt), modes in pair_modes.items():
+    if modes <= activation_labels:
+      sign_category = 'activation'
+    elif modes <= repression_labels:
+      sign_category = 'repression'
+    else:
+      sign_category = 'ambiguous'
+    edges.append((reg, tgt, sign_category))
+  return edges
+
+
+def _sample_connected_subgraph(
+    edges:             list[tuple[str, str, str]],
+    n_genes:            int,
+    rng:                np.random.Generator,
+    max_seed_attempts:  int,
+) -> set[str]:
+  """
+  Build an undirected adjacency from `edges` (ignoring sign) and
+  snowball-sample a connected set of exactly `n_genes` node symbols via
+  randomized BFS from a random seed node, retrying from different seed
+  nodes (up to `max_seed_attempts`) if the first seed's connected component
+  turns out to be smaller than n_genes.
+  """
+  adj: dict[str, set[str]] = {}
+  for reg, tgt, _ in edges:
+    adj.setdefault(reg, set()).add(tgt)
+    adj.setdefault(tgt, set()).add(reg)
+
+  nodes = list(adj.keys())
+  assert len(nodes) >= n_genes, (
+      f"reference GRN has only {len(nodes)} nodes (after dropping self-loops "
+      f"and isolated-by-self-loop-only nodes), cannot sample a connected "
+      f"subgraph of n_genes={n_genes}"
+  )
+
+  best_component_size = 0
+  for _ in range(max_seed_attempts):
+    seed_node = nodes[rng.integers(len(nodes))]
+    visited  = {seed_node}
+    order    = [seed_node]
+    frontier = [seed_node]
+    while frontier and len(visited) < n_genes:
+      cur = frontier.pop(int(rng.integers(len(frontier))))
+      neighbors = list(adj[cur])
+      rng.shuffle(neighbors)
+      for nb in neighbors:
+        if nb not in visited:
+          visited.add(nb)
+          order.append(nb)
+          frontier.append(nb)
+          if len(visited) == n_genes:
+            break
+    best_component_size = max(best_component_size, len(visited))
+    if len(visited) >= n_genes:
+      return set(order[:n_genes])
+
+  raise ValueError(
+      f"could not find a connected subgraph of n_genes={n_genes} within "
+      f"max_seed_attempts={max_seed_attempts}; largest reachable component "
+      f"found was {best_component_size} nodes. Try a different seed, more "
+      f"max_seed_attempts, or a smaller n_genes."
+  )
+
+
+def _eades_dag_order(
+    nodes:            list[str],
+    directed_edges:   list[tuple[str, str]],
+) -> list[str]:
+  """
+  Greedy minimum-feedback-arc-set heuristic (Eades, Lin & Smyth 1993):
+  repeatedly strip sinks (no remaining out-edges; prepend to the right
+  sequence) and sources (no remaining in-edges; append to the left
+  sequence); when neither exists (i.e. only cycles remain), remove the
+  vertex maximizing (out-degree - in-degree) and append it to the left
+  sequence. The concatenated order minimizes (heuristically) the number of
+  edges that end up pointing "backward" and therefore have to be dropped to
+  make the graph acyclic, as SERGIO's layering algorithm requires.
+
+  Returns: `nodes` permuted into this order.
+  """
+  out_adj: dict[str, set[str]] = {n: set() for n in nodes}
+  in_adj:  dict[str, set[str]] = {n: set() for n in nodes}
+  for u, v in directed_edges:
+    out_adj[u].add(v)
+    in_adj[v].add(u)
+
+  remaining = set(nodes)
+  s1: list[str] = []
+  s2: list[str] = []
+
+  def remove(n):
+    remaining.discard(n)
+    for v in out_adj[n]:
+      in_adj[v].discard(n)
+    for u in in_adj[n]:
+      out_adj[u].discard(n)
+    out_adj[n].clear()
+    in_adj[n].clear()
+
+  while remaining:
+    progressed = True
+    while progressed:
+      progressed = False
+      for n in [n for n in remaining if not out_adj[n]]:
+        if n in remaining:
+          s2.insert(0, n)
+          remove(n)
+          progressed = True
+      for n in [n for n in remaining if not in_adj[n]]:
+        if n in remaining:
+          s1.append(n)
+          remove(n)
+          progressed = True
+
+    if remaining:
+      u = max(remaining, key=lambda n: len(out_adj[n]) - len(in_adj[n]))
+      s1.append(u)
+      remove(u)
+
+  return s1 + s2
+
+
+def generate_sergio_grn_from_reference(
+    reference_grn_path:            str,
+    n_genes:                       int,
+    output_path:                   str,
+    delimiter:                     str        = '\t',
+    regulator_col:                 int        = 0,
+    target_col:                    int        = 1,
+    mode_col:                      int|None   = 2,
+    activation_labels:             frozenset  = frozenset({'Activation'}),
+    repression_labels:             frozenset  = frozenset({'Repression'}),
+    unknown_mode_repressor_prob:   float      = 0.5,
+    k_dist:                        tuple      = ('uniform', 1.0, 5.0),
+    hill_coeff_dist:               tuple      = ('constant', 2.0),
+    max_seed_attempts:             int        = 20,
+    seed:                          int|None   = 42,
+) -> tuple[str, list[int], dict[int, str]]:
+  """
+  Generate a SERGIO-format `input_file_targets` GRN-structure CSV (consumed
+  by make_synthetic_data6) whose *topology* is derived from a connected,
+  DAG-ified subgraph of a real reference gene-regulatory network (e.g.
+  TRRUST's rawdata TSV), rather than synthesized from scratch. Only the
+  quantitative interaction parameters (K magnitude/sign, Hill/cooperativity
+  coefficient) are randomly sampled per this function's configuration.
+
+  Per-edge Hill/cooperativity coefficients are always written (one column
+  per regulator, alongside the reg-id and K columns) -- there is no
+  "shared_coop_state" option here. Correspondingly, the downstream
+  make_synthetic_data6(..., shared_coop_state=...) call MUST be given a
+  value <= 0, so that SERGIO's sim.build_graph() reads these per-edge
+  coop-state columns from the file instead of overriding every interaction
+  with a single global coefficient (see sergio.build_graph: coop states in
+  the file are only read when shared_coop_state <= 0; otherwise they are
+  silently ignored and the file's column layout would in fact be wrong,
+  since build_graph then expects only 2 column-blocks per row instead of 3).
+
+  Args:
+    reference_grn_path: path to a reference regulatory-network edge-list
+                  file, one row per (regulator, target[, mode, ...]) edge.
+                  Defaults match TRRUST's rawdata format (tab-delimited,
+                  columns: TF, target, mode in {Activation, Repression,
+                  Unknown}, PMIDs).
+    n_genes:      number of genes in the generated GRN (>= 2). A connected
+                  subgraph of exactly this many nodes is sampled from the
+                  reference network.
+    output_path:  where to write the generated SERGIO-format CSV.
+    delimiter/regulator_col/target_col/mode_col: parsing configuration for
+                  reference_grn_path. mode_col=None treats every edge as
+                  sign-unknown ('ambiguous').
+    activation_labels/repression_labels: sets of mode-column string values
+                  that mean "activation"/"repression"; any other value (or
+                  a (regulator, target) pair with conflicting labels across
+                  duplicate rows) is treated as sign-ambiguous.
+    unknown_mode_repressor_prob: P(repressor) applied to sign-ambiguous
+                  edges (known Activation/Repression edges always use their
+                  literal sign).
+    k_dist:       dist-spec (see _sample_from_dist) for interaction-strength
+                  magnitude (sign is applied separately, per edge).
+    hill_coeff_dist: dist-spec (see _sample_from_dist) for the per-edge
+                  Hill/cooperativity coefficient.
+    max_seed_attempts: number of random seed nodes to try when sampling a
+                  connected subgraph of size n_genes before giving up.
+    seed:         seeds all randomness in this function (subgraph sampling,
+                  K/Hill/sign sampling).
+
+  Returns:
+    output_path:  same as the input arg, for convenience.
+    mr_ids:       sorted list of inferred master-regulator gene ids (nodes
+                  with zero in-degree after DAG-ification) -- pass directly
+                  as make_synthetic_data6's `mr_gene_ids` (or leave that
+                  None there, since it infers the same ids from the file).
+    gene_id_to_symbol: dict mapping each generated gene id (0..n_genes-1) to
+                  the reference network's original gene symbol, so results
+                  can be related back to real genes (e.g. in a reference
+                  scRNA dataset).
+
+  Note: the reference network's directed edges are generally cyclic (e.g.
+  TRRUST has mutual-regulation pairs and longer feedback loops), but
+  SERGIO's layering algorithm requires an acyclic graph. Edges that violate
+  the DAG order chosen by the min-feedback-arc-set heuristic are dropped
+  entirely (not flipped), since flipping a literature-curated
+  activation/repression edge's direction isn't supported by evidence. As a
+  result, some nodes may lose all their edges; any such isolated node has
+  exactly one of its original (pre-DAG-ification) edges force-restored,
+  flipped if necessary to respect the DAG order (labeled 'ambiguous' sign in
+  that case), purely to satisfy SERGIO's requirement that every gene
+  participate in at least one edge.
+  """
+  assert n_genes >= 2, "n_genes must be >= 2"
+
+  rng = np.random.default_rng(seed)
+
+  edges = _parse_reference_grn_edges(
+      reference_grn_path, delimiter, regulator_col, target_col, mode_col,
+      frozenset(activation_labels), frozenset(repression_labels),
+  )
+  assert edges, f"no usable edges parsed from {reference_grn_path}"
+
+  node_set = _sample_connected_subgraph(edges, n_genes, rng, max_seed_attempts)
+
+  induced = [(reg, tgt, sign) for reg, tgt, sign in edges
+             if reg in node_set and tgt in node_set]
+  assert induced, (
+      f"sampled connected subgraph of {len(node_set)} nodes has no induced "
+      f"edges -- this should not happen for a connected sample"
+  )
+
+  order = _eades_dag_order(sorted(node_set), [(r, t) for r, t, _ in induced])
+  assert len(order) == n_genes
+  symbol_to_id = {sym: i for i, sym in enumerate(order)}
+
+  survivors = [(reg, tgt, sign) for reg, tgt, sign in induced
+               if symbol_to_id[reg] < symbol_to_id[tgt]]
+
+  # Repair isolated nodes (no surviving in- or out-edge): SERGIO requires
+  # every gene to participate in at least one edge.
+  touched = set()
+  for reg, tgt, _ in survivors:
+    touched.add(reg); touched.add(tgt)
+  isolated = [sym for sym in order if sym not in touched]
+  if isolated:
+    by_node: dict[str, list[tuple[str, str, str]]] = {}
+    for reg, tgt, sign in induced:
+      by_node.setdefault(reg, []).append((reg, tgt, sign))
+      by_node.setdefault(tgt, []).append((reg, tgt, sign))
+    for sym in isolated:
+      candidates = by_node.get(sym, [])
+      assert candidates, (
+          f"isolated node {sym!r} has no induced edges at all -- "
+          f"inconsistent with connected-subgraph sampling"
+      )
+      reg, tgt, sign = candidates[int(rng.integers(len(candidates)))]
+      if symbol_to_id[reg] < symbol_to_id[tgt]:
+        survivors.append((reg, tgt, sign))
+      else:
+        # symbol_to_id[tgt] < symbol_to_id[reg]: original direction violates
+        # the DAG order (that's why it was dropped, and why sym ended up
+        # isolated). Flip it to satisfy the order; causal direction is no
+        # longer supported by evidence, so mark it ambiguous. (Equality is
+        # impossible: self-loops were dropped during parsing.)
+        reg, tgt = tgt, reg
+        survivors.append((reg, tgt, 'ambiguous'))
+      touched.add(reg); touched.add(tgt)
+
+  missing = set(order) - touched
+  assert not missing, f"failed to connect isolated nodes: {missing}"
+
+  gene_id_to_symbol = {i: sym for i, sym in enumerate(order)}
+  targets_regs: dict[int, list[tuple[int, str]]] = {}
+  for reg, tgt, sign in survivors:
+    reg_id, tgt_id = symbol_to_id[reg], symbol_to_id[tgt]
+    targets_regs.setdefault(tgt_id, []).append((reg_id, sign))
+
+  mr_ids = sorted(i for i in range(n_genes) if i not in targets_regs)
+
+  rows = []
+  for tgt_id in sorted(targets_regs.keys()):
+    reg_list = targets_regs[tgt_id]
+    n_regs   = len(reg_list)
+    magnitudes  = _sample_from_dist(k_dist, n_regs, rng)
+    coop_states = _sample_from_dist(hill_coeff_dist, n_regs, rng)
+
+    reg_ids  = []
+    k_values = []
+    for (reg_id, sign), mag in zip(reg_list, magnitudes):
+      if sign == 'activation':
+        is_repressor = False
+      elif sign == 'repression':
+        is_repressor = True
+      else:
+        is_repressor = rng.random() < unknown_mode_repressor_prob
+      reg_ids.append(reg_id)
+      k_values.append(-abs(float(mag)) if is_repressor else abs(float(mag)))
+
+    rows.append([tgt_id, n_regs] + reg_ids + k_values + [float(c) for c in coop_states])
+
+  with open(output_path, 'w', newline='') as f:
+    writer = csv.writer(f)
+    for row in rows:
+      writer.writerow(row)
+
+  return output_path, mr_ids, gene_id_to_symbol
+
+
+def make_synthetic_data6(
+    mr_state:               torch.Tensor,
+    input_file_targets:     str,
+    n_cells:                int = 800,
+    mr_gene_ids:            list[int]|None = None,
+    shared_coop_state:      float = 2.0,
+    noise_params:           float|list = 1.0,
+    noise_type:             str   = 'dpd',
+    decays:                 float|list = 0.8,
+    sampling_state:         int   = 15,
+    dt:                     float = 0.01,
+    cluster_conc:           float = 20.0,
+    min_cells_per_cluster:  int   = 1,
+    add_outlier_genes:      bool  = True,
+    outlier_prob:           float = 0.01,
+    outlier_mean:           float = 0.8,
+    outlier_scale:          float = 1.0,
+    add_lib_size_effect:    bool  = True,
+    lib_size_mean:          float = 4.6,
+    lib_size_scale:         float = 0.4,
+    add_dropout:            bool  = True,
+    dropout_shape:          float = 6.5,
+    dropout_percentile:     float = 82.0,
+    convert_to_umi_counts:  bool  = True,
+    missing_rate:           float = 0.1,
+    seed:                   int|None = 42,
+    device:                 str|None = None,
+) -> tuple[torch.Tensor, np.ndarray]:
+  """
+  SERGIO-backed synthetic gene-expression data: sample cells from n_clusters
+  gene-regulatory-network (GRN) simulations, each driven by a single vector
+  of master-regulator (MR) basal production rates.
+
+  This is a thin wrapper around the SERGIO simulator
+  (https://github.com/PayamDiba/SERGIO, Dibaeinia & Sinha 2020) that:
+    1. treats each row of `mr_state` as the MR production-rate profile of one
+       SERGIO "bin" (cell type) -- i.e. n_clusters = mr_state.shape[0]
+       simulations sharing one caller-supplied, fixed GRN structure;
+    2. splits the requested `n_cells` unevenly-but-not-too-unevenly across
+       clusters via a Dirichlet draw (see `cluster_conc`);
+    3. runs SERGIO's technical-noise pipeline (outlier genes -> library size
+       -> dropout -> UMI counts), each stage independently toggleable;
+    4. log1p-transforms the result and applies this codebase's usual MCAR
+       `missing_rate` NaN masking (type 1 missing, as in
+       make_synthetic_data/2/4/5) on top of SERGIO's own dropout;
+    5. shuffles the output cells into random order (NOT grouped by cluster),
+       since callers typically split the returned cells into train/test/eval
+       groups by contiguous slicing.
+
+  Args:
+    mr_state:     (n_clusters, n_mrs) tensor of basal MR production rates.
+                  Used as-is (must be >= 0) -- unlike make_synthetic_data4/5,
+                  no latent->rate transform is applied here; the caller is
+                  responsible for supplying values in a sane range for
+                  SERGIO (its own demo data uses production rates in ~[1, 5]).
+    input_file_targets: path to a SERGIO-format GRN-structure CSV (see
+                  SERGIO's build_graph documentation) -- caller-supplied,
+                  fixed regulatory structure (independent of mr_state).
+    n_cells:      total number of output cells (across all clusters).
+    mr_gene_ids:  optional explicit ordering of master-regulator gene IDs
+                  matching mr_state's columns. If None, inferred from
+                  `input_file_targets` (regulators that never appear as a
+                  target) and sorted ascending.
+    shared_coop_state, noise_params, noise_type, decays, sampling_state, dt:
+                  passed straight through to SERGIO's sergio()/build_graph()
+                  (defaults match SERGIO's own steady-state demo).
+    cluster_conc: Dirichlet concentration controlling how evenly n_cells is
+                  split across clusters (higher => more even).
+    min_cells_per_cluster: minimum cells guaranteed per cluster.
+    add_outlier_genes/add_lib_size_effect/add_dropout/convert_to_umi_counts:
+                  toggle stages of SERGIO's technical-noise pipeline (applied
+                  in this fixed order, per SERGIO's documented usage).
+    outlier_prob/outlier_mean/outlier_scale: sim.outlier_effect() params.
+    lib_size_mean/lib_size_scale:            sim.lib_size_effect() params.
+    dropout_shape/dropout_percentile:        sim.dropout_indicator() params.
+    missing_rate: MCAR type-1 missing rate applied after SERGIO's own noise
+                  (NaN, consistent with every other make_synthetic_data*).
+    seed:         also seeds the *global* numpy RNG before invoking SERGIO,
+                  since SERGIO's own methods call `np.random.*` directly
+                  rather than accepting a Generator/seed.
+    device:       torch device for the returned tensor.
+
+  Returns:
+    X:              (n_cells, n_genes) float32 tensor, log1p-transformed,
+                    NaN at type-1-missing positions. Cell order is randomly
+                    shuffled (not grouped by cluster).
+    cluster_labels: (n_cells,) int64 numpy array; cluster_labels[i] gives the
+                    mr_state row (0-indexed) that generated cell i.
+
+  Note: requires the `SERGIO` package from
+  https://github.com/PayamDiba/SERGIO -- clone it and add the repo root to
+  PYTHONPATH. It is NOT pip-installable: the repo has no setup.py/pyproject
+  (so `import SERGIO` must resolve to a git checkout on PYTHONPATH, and the
+  class must be imported as `from SERGIO.sergio import sergio` since
+  SERGIO/__init__.py does not re-export it), and the `sergio-scSim` PyPI
+  package is a broken/unrelated distribution: despite its README describing
+  this same classic API, the code it actually ships (checked v1.9.1-1.9.3)
+  is an incompatible GRN/MR/Noise-class rewrite with a completely different
+  interface -- do not use it. It is not installed in this dev environment,
+  so this function can only be syntax-checked here, not executed. SERGIO
+  v1.0.0's build_graph() also uses the `np.int`/`np.float` numpy aliases
+  removed in numpy>=1.24; a narrow, local shim is applied around the SERGIO
+  calls below (and reverted immediately after) to work around this without
+  patching SERGIO itself.
+  """
+  try:
+    from SERGIO.sergio import sergio
+  except ImportError as e:
+    raise ImportError(
+        "make_synthetic_data6 requires the 'SERGIO' package from "
+        "https://github.com/PayamDiba/SERGIO. Clone it and add the repo "
+        "root to PYTHONPATH (it is not pip-installable, and the "
+        "'sergio-scSim' PyPI package ships an incompatible, unrelated "
+        "rewrite -- do not use it)."
+    ) from e
+
+  assert mr_state.ndim == 2, "mr_state must be (n_clusters, n_mrs)"
+  n_clusters, n_mrs = mr_state.shape
+  assert (mr_state >= 0).all(), (
+      "mr_state values are used directly as SERGIO basal production rates "
+      "and must be non-negative."
+  )
+
+  n_genes, mr_ids_inferred = _parse_sergio_targets_file(input_file_targets)
+  if mr_gene_ids is None:
+    mr_ids = mr_ids_inferred
+  else:
+    assert set(mr_gene_ids) == set(mr_ids_inferred), (
+        f"mr_gene_ids {sorted(mr_gene_ids)} does not match the master "
+        f"regulators inferred from {input_file_targets}: {mr_ids_inferred}"
+    )
+    mr_ids = mr_gene_ids
+  assert n_mrs == len(mr_ids), (
+      f"mr_state has {n_mrs} columns but the GRN has {len(mr_ids)} master "
+      f"regulators"
+  )
+
+  rng = np.random.default_rng(seed)
+  counts = _sample_cluster_sizes(
+      n_cells, n_clusters, cluster_conc, min_cells_per_cluster, rng)
+  number_sc = int(counts.max())
+
+  if seed is not None:
+    # SERGIO's own methods (simulate/dropout_indicator/convert_to_UMIcounts/
+    # outlier_effect/lib_size_effect/...) draw from the *global* numpy RNG
+    # rather than accepting a Generator, so this is required for
+    # reproducibility of the SERGIO-side randomness.
+    np.random.seed(seed)
+
+  # Narrow compatibility shim for SERGIO v1.0.0's use of the numpy np.int/
+  # np.float aliases (removed in numpy>=1.24). Scoped tightly around the
+  # SERGIO calls and reverted in `finally` below.
+  _np_int_bak   = getattr(np, 'int',   None)
+  _np_float_bak = getattr(np, 'float', None)
+  np.int, np.float = int, float
+
+  regs_path = _write_sergio_regs_file(mr_state, mr_ids)
+  try:
+    sim = sergio(
+        number_genes=n_genes,
+        number_bins=n_clusters,
+        number_sc=number_sc,
+        noise_params=noise_params,
+        noise_type=noise_type,
+        decays=decays,
+        dynamics=False,
+        sampling_state=sampling_state,
+        dt=dt,
+    )
+    sim.build_graph(input_file_targets, regs_path, shared_coop_state)
+    sim.simulate()
+    expr = sim.getExpressions()   # (n_clusters, n_genes, number_sc)
+
+    if add_outlier_genes:
+      expr = sim.outlier_effect(expr, outlier_prob, outlier_mean, outlier_scale)
+    if add_lib_size_effect:
+      _, expr = sim.lib_size_effect(expr, lib_size_mean, lib_size_scale)
+    if add_dropout:
+      binary_ind = sim.dropout_indicator(expr, dropout_shape, dropout_percentile)
+      expr = np.multiply(binary_ind, expr)
+    if convert_to_umi_counts:
+      expr = sim.convert_to_UMIcounts(expr)
+
+  finally:
+    os.remove(regs_path)
+    if _np_int_bak is None: del np.int
+    else:                   np.int = _np_int_bak
+    if _np_float_bak is None: del np.float
+    else:                     np.float = _np_float_bak
+
+  # Subsample counts[i] cells (without replacement) from each cluster's
+  # number_sc simulated pool, then shuffle so the output isn't grouped by
+  # cluster (callers typically slice train/test/eval contiguously).
+  cols   = []
+  labels = []
+  for i in range(n_clusters):
+    chosen = rng.choice(number_sc, size=int(counts[i]), replace=False)
+    cols.append(expr[i][:, chosen])                      # (n_genes, counts[i])
+    labels.append(np.full(int(counts[i]), i, dtype=np.int64))
+
+  X_np           = np.concatenate(cols, axis=1)    # (n_genes, n_cells)
+  cluster_labels = np.concatenate(labels, axis=0)  # (n_cells,)
+
+  perm           = rng.permutation(n_cells)
+  X_np           = X_np[:, perm]
+  cluster_labels = cluster_labels[perm]
+
+  X = torch.tensor(X_np.T, dtype=torch.float32, device=device)  # (n_cells, n_genes)
+  X = torch.log1p(X.clamp(min=0))
+
+  # MCAR dropout -> NaN (type-1 missing, applied after SERGIO's own noise)
+  generator = torch.Generator(device=device)
+  if seed is not None:
+    generator.manual_seed(seed)
+  dropout = torch.rand(X.shape, generator=generator, device=device) < missing_rate
+  X[dropout] = float('nan')
+
+  return X, cluster_labels
 

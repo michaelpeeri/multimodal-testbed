@@ -1372,3 +1372,272 @@ def make_synthetic_data6(
 
   return X, cluster_labels
 
+
+# --------------------------------------------------------------------------
+# Real-data reference loading & summary statistics, for calibrating
+# make_synthetic_data6's SERGIO-derived parameters against a real scRNA-seq
+# reference matrix.
+# --------------------------------------------------------------------------
+#
+# Typical usage:
+#   target_stats = compute_summary_stats(load_reference_h5ad("ref.h5ad"))
+#   X_sim, _     = make_synthetic_data6(..., missing_rate=0.0)
+#   sim_stats    = compute_summary_stats(X_sim)
+#   # caller compares target_stats vs sim_stats (e.g. weighted L2 over the
+#   # scalar entries) as a tuning objective for the SERGIO-side parameters.
+#
+# missing_rate is deliberately 0.0 above: make_synthetic_data6's MCAR NaN
+# mask is a separate, later-added imputation-task artifact (applied on top
+# of SERGIO's own dropout) with no counterpart in a real reference matrix,
+# so it should be left out when generating candidates to match against
+# real-data target stats, and only added afterward when producing actual
+# train/eval matrices.
+
+def load_reference_h5ad(
+    path:         str,
+    layer:        str|None = None,
+    n_top_genes:  int|None = None,
+    device:       str|None = None,
+) -> torch.Tensor:
+  """
+  Load a real scRNA-seq reference matrix from an .h5ad file and bring it to
+  the same (n_cells, n_genes) float32, log1p-transformed tensor format
+  produced by make_synthetic_data6 (minus its MCAR NaN mask -- a real
+  reference has no such artificial missingness; see the module-level note
+  above on how to compare fairly against make_synthetic_data6 output).
+
+  Args:
+    path:         path to an .h5ad file (AnnData format).
+    layer:        if given, read raw counts from adata.layers[layer]
+                  instead of adata.X. If None (default), adata.X is assumed
+                  to hold raw/UMI counts (not already normalized or
+                  log-transformed) -- matching make_synthetic_data6's own
+                  convert_to_UMIcounts -> log1p convention.
+    n_top_genes:  if given, keep only the `n_top_genes` genes with the
+                  highest mean raw-count expression (a simple,
+                  dependency-free stand-in for highly-variable-gene
+                  selection). Useful for keeping the reference at a
+                  comparable gene-count scale to a small SERGIO GRN. Gene
+                  *identity*/order is not otherwise aligned with any
+                  synthetic GRN -- compute_summary_stats compares
+                  aggregate distributions, not per-gene identity.
+    device:       torch device for the returned tensor.
+
+  Returns:
+    X: (n_cells, n_genes) float32 tensor, log1p-transformed, no NaNs.
+       Genes with zero total raw count across all cells are dropped first
+       (they carry no information and would produce degenerate
+       mean/variance statistics downstream).
+
+  Note: requires the `anndata` package (`pip install anndata`) -- not
+  installed in this dev environment, so this can only be syntax-checked
+  here, not executed (same situation as make_synthetic_data6's SERGIO
+  dependency).
+  """
+  try:
+    import anndata
+  except ImportError as e:
+    raise ImportError(
+        "load_reference_h5ad requires the 'anndata' package: "
+        "pip install anndata"
+    ) from e
+  import scipy.sparse
+
+  adata = anndata.read_h5ad(path)
+  raw = adata.layers[layer] if layer is not None else adata.X
+  if scipy.sparse.issparse(raw):
+    raw = raw.toarray()
+  X_np = np.asarray(raw, dtype=np.float64)
+  assert X_np.ndim == 2, f"expected a 2D matrix, got shape {X_np.shape}"
+
+  # Drop genes with zero total count across all cells: undefined
+  # variance/log-mean, and uninformative for the summary statistics below.
+  gene_totals = X_np.sum(axis=0)
+  X_np = X_np[:, gene_totals > 0]
+
+  if n_top_genes is not None and X_np.shape[1] > n_top_genes:
+    gene_means = X_np.mean(axis=0)
+    top_idx    = np.sort(np.argsort(gene_means)[::-1][:n_top_genes])
+    X_np       = X_np[:, top_idx]
+
+  X = torch.tensor(X_np, dtype=torch.float32, device=device)
+  X = torch.log1p(X.clamp(min=0))
+  return X
+
+
+def compute_summary_stats(
+    X:                 torch.Tensor,
+    n_pca_components:  int      = 10,
+    n_corr_genes:      int|None = 500,
+    percentiles:       tuple    = (5, 25, 50, 75, 95),
+    seed:              int|None = 0,
+) -> dict:
+  """
+  Compute a dict of distributional summary statistics describing a
+  (n_cells, n_genes) log1p-scale gene-expression matrix -- callable
+  identically on make_synthetic_data6's output (X only; ignore its
+  cluster_labels) and on load_reference_h5ad's output, so the two can be
+  compared as a tuning target/candidate pair. Uses NaN-aware reductions
+  throughout, so it is safe to call on MCAR-masked synthetic data too, but
+  for a fair comparison against a real reference the synthetic candidate
+  should be generated with missing_rate=0.0 (see this module's top-level
+  note) since the real reference has no NaNs to match against.
+
+  Args:
+    X:                 (n_cells, n_genes) tensor, log1p-scale, NaN at
+                       missing (unobserved) positions (or no NaNs at all).
+    n_pca_components:  number of leading PCA components to report the
+                       explained-variance ratio for (capped at
+                       min(n_cells, n_genes) - 1 internally).
+    n_corr_genes:      if n_genes exceeds this, a random subsample of this
+                       many genes is used for the pairwise gene-gene
+                       correlation statistics (for tractability). None
+                       disables subsampling (uses all genes).
+    percentiles:       percentiles reported for each *_p<pct> distribution
+                       summary entry.
+    seed:              seeds the gene subsampling for the correlation
+                       statistics (does not affect any other statistic).
+
+  Returns:
+    dict with (all values are Python floats or 1D numpy arrays):
+      n_cells, n_genes
+      gene_mean_{mean,std,p<pct>...}: distribution, across genes, of each
+        gene's mean (log1p-scale) expression.
+      gene_var_{mean,std,p<pct>...}:  same, for each gene's variance.
+      mean_var_log_slope, mean_var_log_corr: slope and Pearson correlation
+        of log(gene variance) regressed on log(gene mean) across genes
+        (the classic mean-variance/overdispersion relationship), computed
+        only over genes with strictly positive mean and variance.
+      log_lib_size_{mean,std,p<pct>...}: distribution, across cells, of
+        log1p(per-cell total raw count) -- directly comparable in scale to
+        SERGIO's own lib_size_mean/lib_size_scale parameters.
+      zero_frac: overall fraction of observed entries that are exactly 0.
+      dropout_curve_bin_edges: bin edges (over per-gene mean log1p
+        expression) used for the binned dropout curve below.
+      dropout_curve_zero_frac: mean per-gene zero-fraction within each bin
+        of dropout_curve_bin_edges (NaN for empty bins) -- a compact,
+        gene-count-independent summary of the zero-fraction/dropout curve,
+        comparable to SERGIO's dropout_shape/dropout_percentile knobs.
+      pca_explained_variance_ratio: (n_pca_components,) array.
+      gene_corr_abs_{mean,std,p50,p90}: distribution summary of |pairwise
+        gene-gene Pearson correlation| (upper triangle, off-diagonal),
+        computed on up to n_corr_genes genes.
+  """
+  assert X.dim() == 2, f"expected a 2D (n_cells, n_genes) tensor, got shape {tuple(X.shape)}"
+  n_cells, n_genes = X.shape
+  X_np = X.detach().to(torch.float64).cpu().numpy()
+  obs_mask = ~np.isnan(X_np)
+
+  stats: dict = {"n_cells": n_cells, "n_genes": n_genes}
+
+  def _dist_summary(prefix: str, values: np.ndarray) -> None:
+    finite = values[np.isfinite(values)]
+    stats[f"{prefix}_mean"] = float(np.mean(finite)) if finite.size else float('nan')
+    stats[f"{prefix}_std"]  = float(np.std(finite))  if finite.size else float('nan')
+    for p in percentiles:
+      stats[f"{prefix}_p{p}"] = (
+          float(np.percentile(finite, p)) if finite.size else float('nan')
+      )
+
+  # --- per-gene mean & variance distributions ---
+  with np.errstate(invalid='ignore'):
+    gene_mean = np.nanmean(np.where(obs_mask, X_np, np.nan), axis=0)
+    gene_var  = np.nanvar(np.where(obs_mask, X_np, np.nan), axis=0)
+  _dist_summary("gene_mean", gene_mean)
+  _dist_summary("gene_var", gene_var)
+
+  # --- mean-variance relationship (log-log regression across genes) ---
+  mv_mask = np.isfinite(gene_mean) & np.isfinite(gene_var) & (gene_mean > 0) & (gene_var > 0)
+  if mv_mask.sum() >= 2:
+    log_mean = np.log(gene_mean[mv_mask])
+    log_var  = np.log(gene_var[mv_mask])
+    slope, _ = np.polyfit(log_mean, log_var, 1)
+    corr     = float(np.corrcoef(log_mean, log_var)[0, 1])
+  else:
+    slope, corr = float('nan'), float('nan')
+  stats["mean_var_log_slope"] = float(slope)
+  stats["mean_var_log_corr"]  = corr
+
+  # --- per-cell library size (back out of log1p to raw-count scale) ---
+  raw = np.expm1(np.where(obs_mask, X_np, 0.0))
+  raw[~obs_mask] = 0.0
+  lib_size = raw.sum(axis=1)
+  _dist_summary("log_lib_size", np.log1p(lib_size))
+
+  # --- overall zero fraction (among observed entries) ---
+  n_obs = obs_mask.sum()
+  stats["zero_frac"] = (
+      float(np.sum((X_np == 0) & obs_mask) / n_obs) if n_obs > 0 else float('nan')
+  )
+
+  # --- binned dropout curve: per-gene zero-frac vs per-gene mean expression ---
+  gene_obs_count = obs_mask.sum(axis=0)
+  gene_zero_frac = np.divide(
+      np.sum((X_np == 0) & obs_mask, axis=0), np.maximum(gene_obs_count, 1),
+      out=np.full(n_genes, np.nan), where=gene_obs_count > 0,
+  )
+  valid_genes = np.isfinite(gene_mean) & np.isfinite(gene_zero_frac)
+  n_bins = min(10, int(valid_genes.sum()))
+  if n_bins >= 1:
+    bin_edges = np.quantile(gene_mean[valid_genes], np.linspace(0, 1, n_bins + 1))
+    bin_edges = np.unique(bin_edges)
+    n_bins    = len(bin_edges) - 1
+  if n_bins >= 1:
+    bin_idx = np.clip(np.digitize(gene_mean[valid_genes], bin_edges[1:-1], right=True), 0, n_bins - 1)
+    curve = np.full(n_bins, np.nan)
+    zf_valid = gene_zero_frac[valid_genes]
+    for b in range(n_bins):
+      sel = bin_idx == b
+      if sel.any():
+        curve[b] = float(np.mean(zf_valid[sel]))
+    stats["dropout_curve_bin_edges"]   = bin_edges
+    stats["dropout_curve_zero_frac"]   = curve
+  else:
+    stats["dropout_curve_bin_edges"] = np.array([])
+    stats["dropout_curve_zero_frac"] = np.array([])
+
+  # --- global structure: PCA explained-variance ratio, gene-gene corr ---
+  # NaNs filled with the per-gene mean for PCA/correlation only (SVD and
+  # corrcoef require fully-observed input); the nan-aware stats above are
+  # unaffected by this.
+  fill = np.where(np.isfinite(gene_mean), gene_mean, 0.0)
+  X_filled = np.where(obs_mask, X_np, fill[np.newaxis, :])
+
+  k = max(0, min(n_pca_components, n_cells - 1, n_genes - 1))
+  if k >= 1:
+    Xc = X_filled - X_filled.mean(axis=0, keepdims=True)
+    s = np.linalg.svd(Xc, full_matrices=False, compute_uv=False)
+    explained_var = s ** 2
+    total = explained_var.sum()
+    ratio = explained_var / total if total > 0 else np.zeros_like(explained_var)
+    stats["pca_explained_variance_ratio"] = ratio[:k]
+  else:
+    stats["pca_explained_variance_ratio"] = np.array([])
+
+  rng = np.random.default_rng(seed)
+  if n_corr_genes is not None and n_genes > n_corr_genes:
+    gene_idx = np.sort(rng.choice(n_genes, size=n_corr_genes, replace=False))
+  else:
+    gene_idx = np.arange(n_genes)
+  if len(gene_idx) >= 2:
+    sub = X_filled[:, gene_idx]
+    with np.errstate(invalid='ignore'):
+      corr_matrix = np.corrcoef(sub, rowvar=False)
+    iu = np.triu_indices_from(corr_matrix, k=1)
+    abs_corr = np.abs(corr_matrix[iu])
+    abs_corr = abs_corr[np.isfinite(abs_corr)]
+  else:
+    abs_corr = np.array([])
+  if abs_corr.size:
+    stats["gene_corr_abs_mean"] = float(np.mean(abs_corr))
+    stats["gene_corr_abs_std"]  = float(np.std(abs_corr))
+    stats["gene_corr_abs_p50"]  = float(np.percentile(abs_corr, 50))
+    stats["gene_corr_abs_p90"]  = float(np.percentile(abs_corr, 90))
+  else:
+    stats["gene_corr_abs_mean"] = float('nan')
+    stats["gene_corr_abs_std"]  = float('nan')
+    stats["gene_corr_abs_p50"]  = float('nan')
+    stats["gene_corr_abs_p90"]  = float('nan')
+
+  return stats
+

@@ -1,6 +1,7 @@
 import csv
 import math
 import os
+import re
 import tempfile
 import torch
 import torch.nn as nn
@@ -1393,11 +1394,108 @@ def make_synthetic_data6(
 # real-data target stats, and only added afterward when producing actual
 # train/eval matrices.
 
+# Thresholds shared by _check_value_scale's two directions ("raw_counts" in
+# load_reference_h5ad, "log1p_counts" in compute_summary_stats) -- see its
+# docstring for why these two particular signals (and their conjunction)
+# were chosen.
+_SCALE_CHECK_MAX_INTEGER_VALUE = 20.0
+_SCALE_CHECK_MIN_INTEGER_FRAC  = 0.9
+_SCALE_CHECK_SAMPLE_BUDGET     = 20_000
+
+
+def _check_value_scale(sample: np.ndarray, name: str, expect: str) -> None:
+  """
+  Smoke-test guarding against silently mixing up raw-count-scale and
+  log1p-scale data at either boundary of the make_synthetic_data6 <->
+  load_reference_h5ad <-> compute_summary_stats pipeline: either treating
+  already-normalized/log-transformed data as if it were raw counts (about
+  to be log1p'd a second time), or treating not-yet-log1p'd raw counts as
+  if they were already on the log1p scale compute_summary_stats expects.
+  Both would silently corrupt every downstream summary statistic without
+  erroring anywhere else. `sample` should be a 1D array of *nonzero*
+  values drawn from the candidate matrix, on whichever scale `expect`
+  names (i.e. pre-log1p for "raw_counts", post-log1p for "log1p_counts").
+
+  Args:
+    expect: "raw_counts" (used by load_reference_h5ad, checking the
+            pre-log1p source about to be transformed) or "log1p_counts"
+            (used by compute_summary_stats, checking its own input).
+
+  Two signals, checked jointly rather than independently, using the same
+  two thresholds in opposite directions:
+    1. any negative values -> never valid for either scale (both raw
+       counts and log1p(raw counts) are always non-negative) -- rules out
+       z-scored/scaled/PCA-space data.
+    2. "raw_counts": mostly non-integer-valued AND a small dynamic range
+       (max < 20) -> the classic log1p(raw-counts) signature: log1p
+       compresses realistic scRNA-seq counts into roughly [0, ~10], and
+       the result is essentially never exactly integer-valued. Flagged as
+       an error since expect="raw_counts" data should NOT look like this.
+       "log1p_counts": the mirror image -- mostly integer-valued AND a
+       *large* dynamic range (max >= 20) -> looks like raw counts that
+       were never log1p'd. Flagged as an error since expect="log1p_counts"
+       data should NOT look like this.
+  Signal 2 is deliberately a *conjunction*, not "non-integer"/"integer"
+  alone: the CELLxGENE schema explicitly permits non-UMI (e.g. Smart-
+  seq2/RSEM) "raw" matrices to contain fractional *estimated* read/
+  fragment counts, which are non-integer but still span a wide dynamic
+  range (housekeeping genes reach into the hundreds/thousands) -- so they
+  correctly pass the "raw_counts" check (non-integer alone isn't enough to
+  fail it), while genuinely log-transformed data (non-integer AND
+  compressed) fails it.
+  """
+  assert expect in ("raw_counts", "log1p_counts"), f"unknown expect {expect!r}"
+  if sample.size == 0:
+    return
+  frac_negative = float(np.mean(sample < 0))
+  if frac_negative > 0:
+    raise ValueError(
+        f"{name}: {frac_negative:.1%} of sampled values are negative -- "
+        "this does not look like raw counts or log1p(raw counts) (both "
+        "are always non-negative). It looks like already-scaled/centered "
+        "data (e.g. post scanpy.pp.scale or a PCA embedding)."
+    )
+  frac_integer = float(np.mean(np.abs(sample - np.round(sample)) <= 1e-4))
+  max_value    = float(np.max(sample))
+  if expect == "raw_counts":
+    looks_wrong = (frac_integer < _SCALE_CHECK_MIN_INTEGER_FRAC
+                   and max_value < _SCALE_CHECK_MAX_INTEGER_VALUE)
+    detail = (
+        f"only {frac_integer:.1%} of sampled nonzero values are "
+        f"integer-valued and the sampled max is {max_value:.3g} (< "
+        f"{_SCALE_CHECK_MAX_INTEGER_VALUE:g}) -- this looks like "
+        "already-normalized/log-transformed data, not raw UMI/read counts "
+        "(log1p-transformed scRNA-seq data is typically non-integer and "
+        "compressed into roughly this range). Pass a different `source` "
+        "(e.g. source='raw' if you used source='X', or vice versa)."
+    )
+  else:
+    looks_wrong = (frac_integer >= _SCALE_CHECK_MIN_INTEGER_FRAC
+                   and max_value >= _SCALE_CHECK_MAX_INTEGER_VALUE)
+    detail = (
+        f"{frac_integer:.1%} of sampled nonzero values are integer-valued "
+        f"and the sampled max is {max_value:.3g} (>= "
+        f"{_SCALE_CHECK_MAX_INTEGER_VALUE:g}) -- this looks like raw "
+        "counts that were never log1p-transformed, not log1p-scale data. "
+        "compute_summary_stats expects log1p(raw counts), matching "
+        "make_synthetic_data6's and load_reference_h5ad's output "
+        "convention. Pass validate_scale=False if you're confident this "
+        "is actually log1p-scale data and are hitting a false positive."
+    )
+  if looks_wrong:
+    raise ValueError(f"{name}: {detail}")
+
+
 def load_reference_h5ad(
-    path:         str,
-    layer:        str|None = None,
-    n_top_genes:  int|None = None,
-    device:       str|None = None,
+    path:                str,
+    source:              str      = "raw",
+    layer:               str|None = None,
+    n_top_genes:         int|None = None,
+    n_cells_subsample:   int|None = 50_000,
+    chunk_size:          int      = 5_000,
+    seed:                int|None = 0,
+    validate_raw_counts: bool     = True,
+    device:              str|None = None,
 ) -> torch.Tensor:
   """
   Load a real scRNA-seq reference matrix from an .h5ad file and bring it to
@@ -1406,34 +1504,104 @@ def load_reference_h5ad(
   reference has no such artificial missingness; see the module-level note
   above on how to compare fairly against make_synthetic_data6 output).
 
+  Per the CZ CELLxGENE Discover data schema (and common scanpy/AnnData
+  practice generally), a curated .h5ad frequently stores *normalized*,
+  log-transformed values in `adata.X` (e.g. because that's what was used
+  to compute a stored embedding) and the *raw* UMI/read counts separately
+  in `adata.raw.X` -- raw counts are only expected directly in `adata.X`
+  when no normalized layer was provided at all. Since this function needs
+  raw counts (it applies its own log1p, matching make_synthetic_data6's
+  convention), it defaults to `adata.raw.X` (see `source` below) rather
+  than `adata.X`, and independently sanity-checks the selected source's
+  scale (see `validate_raw_counts` below) to catch this class of mismatch
+  even for non-CxG files that don't follow the same convention.
+
+  Reads the file in AnnData's disk-backed mode and streams over row-chunks
+  rather than densifying the full (n_cells, n_genes) matrix, since a
+  real reference's sparse on-disk footprint can be many times smaller than
+  its dense in-memory footprint (e.g. a modest multi-GB sparse .h5ad can
+  balloon to 100+ GB dense). Two sequential passes are made over the data,
+  each reading every chunk exactly once (no random-access seeks):
+    1. an exact per-gene total-count pass, over *all* cells, using
+       sparse-native `.sum(axis=0)` per chunk (never densifies) -- used to
+       drop all-zero genes and pick `n_top_genes`, both computed exactly
+       over the whole dataset; also collects a bounded sample of nonzero
+       values (from a handful of chunks spread across the dataset) for the
+       validate_raw_counts scale check, at no extra I/O cost;
+    2. a row-subsampling pass that keeps only a random `n_cells_subsample`
+       cells (exact count, chosen upfront), densifying only the selected
+       rows x selected genes as each chunk streams past.
+  The returned matrix is therefore an exact-genes / subsampled-cells view
+  of the reference -- appropriate for compute_summary_stats, which
+  describes aggregate distributions (mean/variance/library-size/dropout/
+  PCA/correlation structure) that are stable under cell subsampling at
+  this scale, rather than exact per-cell values.
+
   Args:
     path:         path to an .h5ad file (AnnData format).
-    layer:        if given, read raw counts from adata.layers[layer]
-                  instead of adata.X. If None (default), adata.X is assumed
-                  to hold raw/UMI counts (not already normalized or
-                  log-transformed) -- matching make_synthetic_data6's own
-                  convert_to_UMIcounts -> log1p convention.
+    source:       which slot holds the raw counts to load -- one of:
+                    "raw":   adata.raw.X (default). Raises ValueError if
+                             adata.raw is None -- deliberately does NOT
+                             silently fall back to adata.X, since silently
+                             guessing the wrong slot is exactly the failure
+                             mode this function guards against. Also
+                             asserts adata.raw.n_obs == adata.n_obs (the
+                             schema-required cell alignment between the
+                             two).
+                    "X":     adata.X directly.
+                    "layer": adata.layers[layer] (layer must be given).
+                  Note: only adata.X is guaranteed to stay disk-backed
+                  (streamed) in every anndata version -- some versions
+                  eagerly load adata.raw / non-default layers into memory
+                  even under backed=True. The chunked extraction below is
+                  correct either way, just without the memory savings in
+                  that case.
+    layer:        the layer name to read from when source="layer".
     n_top_genes:  if given, keep only the `n_top_genes` genes with the
                   highest mean raw-count expression (a simple,
                   dependency-free stand-in for highly-variable-gene
-                  selection). Useful for keeping the reference at a
-                  comparable gene-count scale to a small SERGIO GRN. Gene
-                  *identity*/order is not otherwise aligned with any
-                  synthetic GRN -- compute_summary_stats compares
+                  selection), computed exactly over all cells in pass 1
+                  above (not subsampled). Useful for keeping the reference
+                  at a comparable gene-count scale to a small SERGIO GRN,
+                  and for bounding the memory of pass 2's densified
+                  blocks. Gene *identity*/order is not otherwise aligned
+                  with any synthetic GRN -- compute_summary_stats compares
                   aggregate distributions, not per-gene identity.
+    n_cells_subsample: number of cells to randomly keep (without
+                  replacement, uniform over all cells) via pass 2 above.
+                  None (or a value >= the dataset's cell count) disables
+                  subsampling and keeps every cell -- only recommended for
+                  datasets that are known to fit in memory.
+    chunk_size:   number of cells read per chunk in each streaming pass.
+                  Larger values reduce per-chunk overhead at the cost of a
+                  larger transient per-chunk buffer; the default is
+                  conservative and does not need tuning for typical
+                  reference sizes.
+    seed:         seeds the random cell subsample (pass 2) and the scale-
+                  check chunk sampling. Does not affect the exact,
+                  deterministic gene selection (pass 1).
+    validate_raw_counts: if True (default), sanity-check that the selected
+                  source's values actually look like raw counts (see
+                  _check_value_scale) and raise ValueError if not, before
+                  doing any further (more expensive) work. Only disable
+                  this if you've independently confirmed the selected
+                  source's scale and are hitting a false positive.
     device:       torch device for the returned tensor.
 
   Returns:
-    X: (n_cells, n_genes) float32 tensor, log1p-transformed, no NaNs.
-       Genes with zero total raw count across all cells are dropped first
-       (they carry no information and would produce degenerate
-       mean/variance statistics downstream).
+    X: (n_cells_kept, n_genes_kept) float32 tensor, log1p-transformed, no
+       NaNs, where n_cells_kept = min(n_cells_subsample, total cells) and
+       n_genes_kept = min(n_top_genes, genes with nonzero total count).
 
   Note: requires the `anndata` package (`pip install anndata`) -- not
   installed in this dev environment, so this can only be syntax-checked
   here, not executed (same situation as make_synthetic_data6's SERGIO
-  dependency).
+  dependency). The streaming/chunking/source-selection/scale-check logic
+  was separately validated against a pure numpy/scipy mock of anndata's
+  backed API (see dev notes) since anndata/h5py aren't available to test
+  against a real file here.
   """
+  assert source in ("raw", "X", "layer"), f"unknown source {source!r}"
   try:
     import anndata
   except ImportError as e:
@@ -1443,22 +1611,100 @@ def load_reference_h5ad(
     ) from e
   import scipy.sparse
 
-  adata = anndata.read_h5ad(path)
-  raw = adata.layers[layer] if layer is not None else adata.X
-  if scipy.sparse.issparse(raw):
-    raw = raw.toarray()
-  X_np = np.asarray(raw, dtype=np.float64)
-  assert X_np.ndim == 2, f"expected a 2D matrix, got shape {X_np.shape}"
+  adata = anndata.read_h5ad(path, backed='r')
+
+  if source == "raw":
+    if adata.raw is None:
+      raise ValueError(
+          "load_reference_h5ad(source='raw') requires adata.raw, but this "
+          "file has none. Pass source='X' if raw counts are stored "
+          "directly in adata.X (e.g. no separate normalized layer was "
+          "provided), or source='layer' with an explicit `layer=...` if "
+          "raw counts live in a named layer instead."
+      )
+    assert adata.raw.n_obs == adata.n_obs, (
+        f"adata.raw.n_obs ({adata.raw.n_obs}) != adata.n_obs "
+        f"({adata.n_obs}) -- expected raw and normalized matrices to stay "
+        "cell-aligned."
+    )
+    matrix = adata.raw.X
+  elif source == "X":
+    matrix = adata.X
+  else:
+    assert layer is not None, "source='layer' requires an explicit `layer` name"
+    matrix = adata.layers[layer]
+
+  assert len(matrix.shape) == 2, f"expected a 2D matrix, got shape {matrix.shape}"
+  n_cells, n_genes = matrix.shape
+
+  def _chunks():
+    for start in range(0, n_cells, chunk_size):
+      end = min(start + chunk_size, n_cells)
+      yield start, end, matrix[start:end]
+
+  n_total_chunks = max(1, math.ceil(n_cells / chunk_size))
+  sample_chunk_positions = set(
+      np.linspace(0, n_total_chunks - 1, min(5, n_total_chunks), dtype=int).tolist()
+  )
+  sample_rng     = np.random.default_rng(seed)
+  sample_budget  = _SCALE_CHECK_SAMPLE_BUDGET // max(1, len(sample_chunk_positions))
+  scale_samples  = []
+
+  # --- Pass 1: exact per-gene totals over ALL cells, streamed. Sparse
+  # chunks are reduced with sparse-native axis=0 sums -- never densified.
+  # Also opportunistically collects a bounded sample of nonzero values
+  # (from a handful of chunks spread across the dataset) for the
+  # validate_raw_counts scale check below, at no extra I/O cost.
+  gene_totals = np.zeros(n_genes, dtype=np.float64)
+  for chunk_i, (_, _, chunk) in enumerate(_chunks()):
+    if scipy.sparse.issparse(chunk):
+      gene_totals += np.asarray(chunk.sum(axis=0)).ravel()
+      chunk_values = chunk.data
+    else:
+      chunk = np.asarray(chunk)
+      gene_totals += chunk.sum(axis=0)
+      chunk_values = chunk[chunk != 0]
+    if validate_raw_counts and chunk_i in sample_chunk_positions and chunk_values.size:
+      take = min(chunk_values.size, sample_budget)
+      idx  = sample_rng.choice(chunk_values.size, size=take, replace=False)
+      scale_samples.append(np.asarray(chunk_values).ravel()[idx])
+
+  if validate_raw_counts:
+    _check_value_scale(
+        np.concatenate(scale_samples) if scale_samples else np.array([]),
+        name=f"{source} matrix in {path!r}", expect="raw_counts",
+    )
 
   # Drop genes with zero total count across all cells: undefined
   # variance/log-mean, and uninformative for the summary statistics below.
-  gene_totals = X_np.sum(axis=0)
-  X_np = X_np[:, gene_totals > 0]
+  keep_genes = np.flatnonzero(gene_totals > 0)
+  if n_top_genes is not None and keep_genes.size > n_top_genes:
+    gene_means_kept = gene_totals[keep_genes] / n_cells
+    top             = np.argsort(gene_means_kept)[::-1][:n_top_genes]
+    keep_genes      = np.sort(keep_genes[top])
 
-  if n_top_genes is not None and X_np.shape[1] > n_top_genes:
-    gene_means = X_np.mean(axis=0)
-    top_idx    = np.sort(np.argsort(gene_means)[::-1][:n_top_genes])
-    X_np       = X_np[:, top_idx]
+  # --- Choose which cells to keep (exact count, uniform without replacement). ---
+  rng = np.random.default_rng(seed)
+  if n_cells_subsample is not None and n_cells_subsample < n_cells:
+    keep_cells = np.sort(rng.choice(n_cells, size=n_cells_subsample, replace=False))
+  else:
+    keep_cells = np.arange(n_cells)
+
+  # --- Pass 2: sequential streamed extraction of only the selected rows x
+  # genes -- small relative to the full matrix, densified incrementally.
+  blocks = []
+  for start, end, chunk in _chunks():
+    lo, hi = np.searchsorted(keep_cells, [start, end])
+    if lo == hi:
+      continue
+    local_idx = keep_cells[lo:hi] - start
+    block     = chunk[:, keep_genes][local_idx]
+    if scipy.sparse.issparse(block):
+      block = block.toarray()
+    blocks.append(np.asarray(block, dtype=np.float32))
+
+  X_np = (np.concatenate(blocks, axis=0) if blocks
+          else np.zeros((0, keep_genes.size), dtype=np.float32))
 
   X = torch.tensor(X_np, dtype=torch.float32, device=device)
   X = torch.log1p(X.clamp(min=0))
@@ -1466,11 +1712,12 @@ def load_reference_h5ad(
 
 
 def compute_summary_stats(
-    X:                 torch.Tensor,
-    n_pca_components:  int      = 10,
-    n_corr_genes:      int|None = 500,
-    percentiles:       tuple    = (5, 25, 50, 75, 95),
-    seed:              int|None = 0,
+    X:                  torch.Tensor,
+    n_pca_components:   int      = 10,
+    n_structure_genes:  int|None = 500,
+    percentiles:        tuple    = (5, 25, 50, 75, 95),
+    seed:               int|None = 0,
+    validate_scale:     bool     = True,
 ) -> dict:
   """
   Compute a dict of distributional summary statistics describing a
@@ -1488,15 +1735,33 @@ def compute_summary_stats(
                        missing (unobserved) positions (or no NaNs at all).
     n_pca_components:  number of leading PCA components to report the
                        explained-variance ratio for (capped at
-                       min(n_cells, n_genes) - 1 internally).
-    n_corr_genes:      if n_genes exceeds this, a random subsample of this
-                       many genes is used for the pairwise gene-gene
-                       correlation statistics (for tractability). None
-                       disables subsampling (uses all genes).
+                       min(n_cells, n_structure_genes) - 1 internally).
+    n_structure_genes: if n_genes exceeds this, a random subsample of this
+                       many genes is used for *both* the PCA and the
+                       pairwise gene-gene correlation statistics below (the
+                       same subsample is shared by both, for tractability
+                       -- a full SVD or correlation matrix over a whole
+                       transcriptome's worth of genes is expensive/large).
+                       None disables subsampling (uses all genes for both).
+                       Does not affect gene_mean/gene_var/mean-variance/
+                       library-size/zero-frac/dropout-curve stats, which
+                       are always computed over every gene (cheap, O(n_genes)).
     percentiles:       percentiles reported for each *_p<pct> distribution
                        summary entry.
-    seed:              seeds the gene subsampling for the correlation
-                       statistics (does not affect any other statistic).
+    seed:              seeds the shared gene subsampling used for the PCA
+                       and correlation statistics, and the scale-check
+                       sampling below (does not affect any other statistic).
+    validate_scale:    if True (default), sanity-check that X's values
+                       actually look like log1p(raw counts) -- as opposed
+                       to e.g. accidentally-unlogged raw counts, already-
+                       scaled/z-scored data, or double-log1p'd data -- and
+                       raise ValueError if not (see _check_value_scale).
+                       This mirrors load_reference_h5ad's own
+                       validate_raw_counts guard, but checks the opposite
+                       end of the pipeline: this function's own input,
+                       regardless of which loader produced it. Only
+                       disable this if you've independently confirmed X's
+                       scale and are hitting a false positive.
 
   Returns:
     dict with (all values are Python floats or 1D numpy arrays):
@@ -1518,15 +1783,24 @@ def compute_summary_stats(
         of dropout_curve_bin_edges (NaN for empty bins) -- a compact,
         gene-count-independent summary of the zero-fraction/dropout curve,
         comparable to SERGIO's dropout_shape/dropout_percentile knobs.
-      pca_explained_variance_ratio: (n_pca_components,) array.
+      pca_explained_variance_ratio: (n_pca_components,) array, computed on
+        up to n_structure_genes genes.
       gene_corr_abs_{mean,std,p50,p90}: distribution summary of |pairwise
         gene-gene Pearson correlation| (upper triangle, off-diagonal),
-        computed on up to n_corr_genes genes.
+        computed on the same up-to-n_structure_genes genes as PCA above.
   """
   assert X.dim() == 2, f"expected a 2D (n_cells, n_genes) tensor, got shape {tuple(X.shape)}"
   n_cells, n_genes = X.shape
   X_np = X.detach().to(torch.float64).cpu().numpy()
   obs_mask = ~np.isnan(X_np)
+
+  if validate_scale:
+    nonzero = X_np[obs_mask & (X_np != 0)]
+    if nonzero.size > _SCALE_CHECK_SAMPLE_BUDGET:
+      idx = np.random.default_rng(seed).choice(
+          nonzero.size, size=_SCALE_CHECK_SAMPLE_BUDGET, replace=False)
+      nonzero = nonzero[idx]
+    _check_value_scale(nonzero, name="compute_summary_stats input X", expect="log1p_counts")
 
   stats: dict = {"n_cells": n_cells, "n_genes": n_genes}
 
@@ -1603,9 +1877,21 @@ def compute_summary_stats(
   fill = np.where(np.isfinite(gene_mean), gene_mean, 0.0)
   X_filled = np.where(obs_mask, X_np, fill[np.newaxis, :])
 
-  k = max(0, min(n_pca_components, n_cells - 1, n_genes - 1))
+  # Shared gene subsample for PCA + gene-gene correlation (both O(n_genes^2)-
+  # ish or worse, unlike the per-gene stats above) -- capped at
+  # n_structure_genes for tractability on a full transcriptome, and shared
+  # between the two so they describe the same gene subset.
+  rng = np.random.default_rng(seed)
+  if n_structure_genes is not None and n_genes > n_structure_genes:
+    gene_idx = np.sort(rng.choice(n_genes, size=n_structure_genes, replace=False))
+  else:
+    gene_idx = np.arange(n_genes)
+  X_struct = X_filled[:, gene_idx]
+  n_struct_genes = len(gene_idx)
+
+  k = max(0, min(n_pca_components, n_cells - 1, n_struct_genes - 1))
   if k >= 1:
-    Xc = X_filled - X_filled.mean(axis=0, keepdims=True)
+    Xc = X_struct - X_struct.mean(axis=0, keepdims=True)
     s = np.linalg.svd(Xc, full_matrices=False, compute_uv=False)
     explained_var = s ** 2
     total = explained_var.sum()
@@ -1614,15 +1900,9 @@ def compute_summary_stats(
   else:
     stats["pca_explained_variance_ratio"] = np.array([])
 
-  rng = np.random.default_rng(seed)
-  if n_corr_genes is not None and n_genes > n_corr_genes:
-    gene_idx = np.sort(rng.choice(n_genes, size=n_corr_genes, replace=False))
-  else:
-    gene_idx = np.arange(n_genes)
-  if len(gene_idx) >= 2:
-    sub = X_filled[:, gene_idx]
+  if n_struct_genes >= 2:
     with np.errstate(invalid='ignore'):
-      corr_matrix = np.corrcoef(sub, rowvar=False)
+      corr_matrix = np.corrcoef(X_struct, rowvar=False)
     iu = np.triu_indices_from(corr_matrix, k=1)
     abs_corr = np.abs(corr_matrix[iu])
     abs_corr = abs_corr[np.isfinite(abs_corr)]
@@ -1640,4 +1920,193 @@ def compute_summary_stats(
     stats["gene_corr_abs_p90"]  = float('nan')
 
   return stats
+
+
+def _percentile_profile(stats: dict, prefix: str) -> tuple[np.ndarray, np.ndarray]:
+  """Extract the `{prefix}_p<N>` distribution-summary entries written by
+  compute_summary_stats's `_dist_summary` helper (e.g. prefix="gene_mean"
+  picks up gene_mean_p5, gene_mean_p25, ...), sorted by percentile. Works
+  for whatever `percentiles` tuple the caller used when computing `stats`
+  -- not hardcoded to any particular set.
+
+  Returns (percentiles, values) as parallel 1D arrays (both empty if no
+  matching keys are present).
+  """
+  pat = re.compile(rf"^{re.escape(prefix)}_p(\d+(?:\.\d+)?)$")
+  pts = [(float(m.group(1)), stats[k]) for k in stats if (m := pat.match(k))]
+  pts.sort(key=lambda t: t[0])
+  if not pts:
+    return np.array([]), np.array([])
+  xs, ys = zip(*pts)
+  return np.array(xs, dtype=np.float64), np.array(ys, dtype=np.float64)
+
+
+def _grouped_bars(ax, items: list[tuple[str, dict]], keys: list[str],
+                   key_labels: list[str] | None = None) -> bool:
+  """Draw one group of bars per (label, stats_dict) in `items`, with one
+  bar per entry in `keys` within each group -- e.g. keys=["zero_frac"]
+  gives one plain bar per dict, keys=["gene_corr_abs_mean",
+  "gene_corr_abs_p50", "gene_corr_abs_p90"] gives 3 bars per dict.
+
+  Returns False (and leaves `ax` untouched beyond an explanatory message)
+  if none of `keys` is present with a finite value in any of `items`.
+  """
+  key_labels = key_labels or keys
+  values = np.array(
+      [[float(d.get(k, float('nan'))) for k in keys] for _, d in items],
+      dtype=np.float64,
+  )
+  if not np.isfinite(values).any():
+    ax.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax.transAxes)
+    return False
+
+  n_items, n_keys = values.shape
+  width = 0.8 / max(n_keys, 1)
+  x = np.arange(n_items)
+  for j in range(n_keys):
+    ax.bar(x + j * width - 0.4 + width / 2, values[:, j], width=width, label=key_labels[j])
+  ax.set_xticks(x)
+  ax.set_xticklabels([label for label, _ in items], rotation=20, ha="right")
+  if n_keys > 1:
+    ax.legend(fontsize=7)
+  return True
+
+
+def plot_summary_stats(
+    stats:   dict | list[dict] | dict[str, dict],
+    labels:  list[str] | None = None,
+    path:    str | None = None,
+    figsize: tuple = (16, 8),
+):
+  """
+  Build an 8-panel figure summarizing/comparing one or more
+  compute_summary_stats() dicts -- e.g. tune_synthetic_data.py's
+  `target_stats` (real reference) overlaid with one or more candidate
+  `candidate_stats` (synthetic), or several synthetic configs against
+  each other.
+
+  Args:
+    stats:  a single compute_summary_stats() dict, a list of such dicts,
+            or a {label: dict} mapping (mapping keys are used directly as
+            legend/x-axis labels, taking precedence over `labels`).
+    labels: legend/x-axis label per dict, used when `stats` is a single
+            dict or a list of dicts. Defaults to "stats" (single dict) or
+            "stats 0", "stats 1", ... (list). Ignored when `stats` is
+            itself a {label: dict} mapping.
+    path:   if given, the figure is saved here (dpi=120) and closed (like
+            sample_efficiency.py's `_plot`); otherwise the open Figure is
+            returned for the caller to show/save/close itself.
+    figsize: passed to plt.subplots.
+
+  Panels (2x4 grid), one line/bar-group per input dict in each:
+    1. gene_mean percentile profile
+    2. gene_var  percentile profile (log-y)
+    3. log_lib_size percentile profile
+    4. dropout curve (dropout_curve_zero_frac vs. binned per-gene mean
+       expression, i.e. the midpoints of dropout_curve_bin_edges)
+    5. pca_explained_variance_ratio vs. component index (log-y)
+    6. gene_corr_abs_{mean,p50,p90} grouped bars
+    7. zero_frac bar
+    8. mean_var_log_{slope,corr} grouped bars
+
+  Any panel whose required key(s)/arrays are absent or empty in *every*
+  input dict is left blank with a "no data" note rather than raising --
+  e.g. calling this on stats produced with n_pca_components=0.
+
+  Returns the Figure (already closed if `path` was given).
+  """
+  import matplotlib.pyplot as plt
+
+  if isinstance(stats, dict) and stats and all(isinstance(v, dict) for v in stats.values()):
+    items = list(stats.items())
+  elif isinstance(stats, dict):
+    items = [(labels[0] if labels else "stats", stats)]
+  else:
+    stats = list(stats)
+    labels = labels or [f"stats {i}" for i in range(len(stats))]
+    assert len(labels) == len(stats), (
+        f"got {len(labels)} labels for {len(stats)} stats dicts"
+    )
+    items = list(zip(labels, stats))
+  assert items, "plot_summary_stats: need at least one stats dict"
+
+  fig, axes = plt.subplots(2, 4, figsize=figsize)
+
+  # --- 1-3: percentile profiles ---
+  for ax, prefix, ylabel, logy in (
+      (axes[0, 0], "gene_mean",    "log1p expression", False),
+      (axes[0, 1], "gene_var",     "variance",          True),
+      (axes[0, 2], "log_lib_size", "log1p(lib size)",   False),
+  ):
+    any_data = False
+    for label, d in items:
+      xs, ys = _percentile_profile(d, prefix)
+      if xs.size:
+        ax.plot(xs, ys, marker="o", ms=4, label=label)
+        any_data = True
+    if any_data:
+      ax.set_xlabel("percentile")
+      ax.set_ylabel(ylabel)
+      if logy:
+        ax.set_yscale("log")
+      ax.legend(fontsize=7)
+    else:
+      ax.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax.transAxes)
+    ax.set_title(f"{prefix} percentile profile")
+
+  # --- 4: dropout curve ---
+  ax = axes[0, 3]
+  any_data = False
+  for label, d in items:
+    edges = np.asarray(d.get("dropout_curve_bin_edges", []), dtype=np.float64)
+    curve = np.asarray(d.get("dropout_curve_zero_frac", []), dtype=np.float64)
+    if edges.size >= 2 and curve.size:
+      mids = 0.5 * (edges[:-1] + edges[1:])
+      n = min(mids.size, curve.size)
+      ax.plot(mids[:n], curve[:n], marker="o", ms=4, label=label)
+      any_data = True
+  if any_data:
+    ax.set_xlabel("per-gene mean expression (binned)")
+    ax.set_ylabel("zero fraction")
+    ax.legend(fontsize=7)
+  else:
+    ax.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax.transAxes)
+  ax.set_title("dropout curve")
+
+  # --- 5: PCA explained-variance ratio ---
+  ax = axes[1, 0]
+  any_data = False
+  for label, d in items:
+    ratio = np.asarray(d.get("pca_explained_variance_ratio", []), dtype=np.float64)
+    if ratio.size:
+      ax.plot(np.arange(1, ratio.size + 1), ratio, marker="o", ms=4, label=label)
+      any_data = True
+  if any_data:
+    ax.set_xlabel("PCA component")
+    ax.set_ylabel("explained variance ratio")
+    ax.set_yscale("log")
+    ax.legend(fontsize=7)
+  else:
+    ax.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax.transAxes)
+  ax.set_title("pca_explained_variance_ratio")
+
+  # --- 6-8: grouped bars ---
+  _grouped_bars(axes[1, 1], items,
+                ["gene_corr_abs_mean", "gene_corr_abs_p50", "gene_corr_abs_p90"],
+                ["mean", "p50", "p90"])
+  axes[1, 1].set_title("gene_corr_abs")
+
+  _grouped_bars(axes[1, 2], items, ["zero_frac"])
+  axes[1, 2].set_title("zero_frac")
+
+  _grouped_bars(axes[1, 3], items,
+                ["mean_var_log_slope", "mean_var_log_corr"],
+                ["slope", "corr"])
+  axes[1, 3].set_title("mean_var_log_{slope,corr}")
+
+  fig.tight_layout()
+  if path is not None:
+    fig.savefig(path, dpi=120)
+    plt.close(fig)
+  return fig
 

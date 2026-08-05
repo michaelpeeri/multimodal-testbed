@@ -1,0 +1,39 @@
+{
+  "target_stats_path":   "/content/Drive/MyDrive/Colab Notebooks/1cb67ec8-c9e3-4d4a-ba23-a1a8ef3f8450.600.stats.mean.pickle",
+  "reference_grn_path":  "/content/Drive/MyDrive/Colab Notebooks/trrust_rawdata.human.tsv",
+
+  "n_clusters":         6,
+  "n_genes":          800,
+  "n_cells":          600,
+  "sampling_state":     5,
+  "shared_coop_state":  0,
+
+  "storage":      "sqlite:///synthetic_tuning_2026080.db",
+  "study_name":   "tune_synthetic_data6_20260804",
+  "output":       "tuned_synthetic_config.2026080.json",
+  "artifact_dir": "synthetic_checkpoints_2026080",
+  "n_trials":     30,
+  "sampler":      "tpe",
+  "pruner":       "none",
+
+  "search_space": {
+    "noise_params":        { "type": "float", "low": 0.2,   "high": 2.0,  "log": true  },
+    "decays":              { "type": "float", "low": 0.3,   "high": 1.5                },
+    "cluster_conc":        { "type": "float", "low": 2.0,   "high": 50.0, "log": true  },
+
+    "outlier_prob":        { "type": "float", "low": 0.001, "high": 0.1,  "log": true  },
+    "outlier_mean":        { "type": "float", "low": 0.2,   "high": 2.0                },
+    "outlier_scale":       { "type": "float", "low": 0.2,   "high": 2.0                },
+
+    "lib_size_mean":       { "type": "float", "low": 3.0,   "high": 10.0               },
+    "lib_size_scale":      { "type": "float", "low": 0.1,   "high": 1.0                },
+
+    "dropout_shape":       { "type": "float", "low": 1.0,   "high": 20.0               },
+    "dropout_percentile":  { "type": "float", "low": 40.0,  "high": 95.0               },
+
+    "grn_k_low":           { "type": "float", "low": 0.5,   "high": 3.0                },
+    "grn_k_span":          { "type": "float", "low": 0.5,   "high": 8.0                },
+    "hill_coeff":          { "type": "float", "low": 1.0,   "high": 3.0                },
+    "unknown_mode_repressor_prob": { "type": "float", "low": 0.0, "high": 1.0          }
+  }
+}

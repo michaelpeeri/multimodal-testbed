@@ -1381,7 +1381,8 @@ def make_synthetic_data6(
 # --------------------------------------------------------------------------
 #
 # Typical usage:
-#   target_stats = compute_summary_stats(load_reference_h5ad("ref.h5ad"))
+#   X_ref, _     = load_reference_h5ad("ref.h5ad")
+#   target_stats = compute_summary_stats(X_ref)
 #   X_sim, _     = make_synthetic_data6(..., missing_rate=0.0)
 #   sim_stats    = compute_summary_stats(X_sim)
 #   # caller compares target_stats vs sim_stats (e.g. weighted L2 over the
@@ -1491,12 +1492,14 @@ def load_reference_h5ad(
     source:              str      = "raw",
     layer:               str|None = None,
     n_top_genes:         int|None = None,
+    select_gene_symbols: list[str]|None = None,
+    feature_name_col:    str|None = "feature_name",
     n_cells_subsample:   int|None = 50_000,
     chunk_size:          int      = 5_000,
     seed:                int|None = 0,
     validate_raw_counts: bool     = True,
     device:              str|None = None,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, list[str]|None]:
   """
   Load a real scRNA-seq reference matrix from an .h5ad file and bring it to
   the same (n_cells, n_genes) float32, log1p-transformed tensor format
@@ -1566,7 +1569,43 @@ def load_reference_h5ad(
                   and for bounding the memory of pass 2's densified
                   blocks. Gene *identity*/order is not otherwise aligned
                   with any synthetic GRN -- compute_summary_stats compares
-                  aggregate distributions, not per-gene identity.
+                  aggregate distributions, not per-gene identity. Mutually
+                  exclusive with `select_gene_symbols` (which aligns by
+                  identity instead).
+    select_gene_symbols: if given, keep only genes whose `feature_name_col`
+                  value is in this list (e.g. the exact gene symbols used
+                  by a `generate_sergio_grn_from_reference`-built synthetic
+                  GRN, so the reference and synthetic sides describe the
+                  *same* genes rather than two differently-selected panels
+                  -- see that function's `gene_id_to_symbol` return value).
+                  Still subject to the same "drop all-zero-total-count
+                  genes" filter as the default path, and to
+                  `n_cells_subsample`'s gene-count-independent row
+                  subsampling. Symbols not found in `feature_name_col` (or
+                  found but all-zero) are silently dropped and reported via
+                  a warnings.warn() (not an error) -- check the returned
+                  `kept_gene_symbols` against your requested list if you
+                  need an exact accounting. If a requested symbol matches
+                  more than one row in `feature_name_col` (e.g. distinct
+                  Ensembl IDs sharing a symbol), all matching rows are kept
+                  as separate columns and a second warnings.warn() reports
+                  which symbol(s) are duplicated -- `kept_gene_symbols` will
+                  then contain repeated entries and be longer than the
+                  number of requested symbols; deduplicate the result
+                  yourself if you need exactly one column per symbol.
+                  Mutually exclusive with `n_top_genes`; requires
+                  `feature_name_col` to be set.
+    feature_name_col: name of the `adata.var` (or, when source="raw",
+                  `adata.raw.var`) column holding gene symbols -- "feature_name"
+                  matches the CZ CELLxGENE Discover schema (var.index is
+                  the Ensembl gene ID; var["feature_name"] is the human-
+                  readable HGNC-style symbol). Only used to populate this
+                  function's `kept_gene_symbols` return value and (when
+                  given) to resolve `select_gene_symbols`. Set to None to
+                  skip reading gene symbols entirely (e.g. for a reference
+                  file that doesn't follow the CxG schema and has no
+                  comparable column) -- `select_gene_symbols` then cannot
+                  be used, and `kept_gene_symbols` is returned as None.
     n_cells_subsample: number of cells to randomly keep (without
                   replacement, uniform over all cells) via pass 2 above.
                   None (or a value >= the dataset's cell count) disables
@@ -1589,9 +1628,16 @@ def load_reference_h5ad(
     device:       torch device for the returned tensor.
 
   Returns:
-    X: (n_cells_kept, n_genes_kept) float32 tensor, log1p-transformed, no
-       NaNs, where n_cells_kept = min(n_cells_subsample, total cells) and
-       n_genes_kept = min(n_top_genes, genes with nonzero total count).
+    (X, kept_gene_symbols):
+      X: (n_cells_kept, n_genes_kept) float32 tensor, log1p-transformed, no
+         NaNs, where n_cells_kept = min(n_cells_subsample, total cells) and
+         n_genes_kept = min(n_top_genes, genes with nonzero total count)
+         (or, with select_gene_symbols, the number of requested symbols
+         actually found with nonzero total count).
+      kept_gene_symbols: list[str] of length n_genes_kept, in the same
+         column order as X -- the `feature_name_col` value for each kept
+         gene -- or None if feature_name_col is None or that column isn't
+         present on this file's var/raw.var.
 
   Note: requires the `anndata` package (`pip install anndata`) -- not
   installed in this dev environment, so this can only be syntax-checked
@@ -1602,6 +1648,16 @@ def load_reference_h5ad(
   against a real file here.
   """
   assert source in ("raw", "X", "layer"), f"unknown source {source!r}"
+  if select_gene_symbols is not None and n_top_genes is not None:
+    raise ValueError(
+        "load_reference_h5ad: select_gene_symbols and n_top_genes are "
+        "mutually exclusive (two different gene-selection strategies)."
+    )
+  if select_gene_symbols is not None and feature_name_col is None:
+    raise ValueError(
+        "load_reference_h5ad: select_gene_symbols requires feature_name_col "
+        "to be set (it's used to resolve the requested symbols to columns)."
+    )
   try:
     import anndata
   except ImportError as e:
@@ -1628,14 +1684,28 @@ def load_reference_h5ad(
         "cell-aligned."
     )
     matrix = adata.raw.X
+    var_df = adata.raw.var
   elif source == "X":
     matrix = adata.X
+    var_df = adata.var
   else:
     assert layer is not None, "source='layer' requires an explicit `layer` name"
     matrix = adata.layers[layer]
+    var_df = adata.var  # layers share adata.var's gene set/order
 
   assert len(matrix.shape) == 2, f"expected a 2D matrix, got shape {matrix.shape}"
   n_cells, n_genes = matrix.shape
+
+  symbol_array = None
+  if feature_name_col is not None:
+    if feature_name_col in var_df.columns:
+      symbol_array = var_df[feature_name_col].to_numpy()
+    elif select_gene_symbols is not None:
+      raise ValueError(
+          f"load_reference_h5ad: feature_name_col={feature_name_col!r} not "
+          f"found in this file's var columns ({list(var_df.columns)}) -- "
+          "cannot resolve select_gene_symbols."
+      )
 
   def _chunks():
     for start in range(0, n_cells, chunk_size):
@@ -1677,11 +1747,46 @@ def load_reference_h5ad(
 
   # Drop genes with zero total count across all cells: undefined
   # variance/log-mean, and uninformative for the summary statistics below.
-  keep_genes = np.flatnonzero(gene_totals > 0)
-  if n_top_genes is not None and keep_genes.size > n_top_genes:
-    gene_means_kept = gene_totals[keep_genes] / n_cells
-    top             = np.argsort(gene_means_kept)[::-1][:n_top_genes]
-    keep_genes      = np.sort(keep_genes[top])
+  nonzero_genes = np.flatnonzero(gene_totals > 0)
+  if select_gene_symbols is not None:
+    requested    = set(select_gene_symbols)
+    matches      = np.flatnonzero(np.isin(symbol_array, list(requested)))
+    keep_genes   = np.intersect1d(nonzero_genes, matches)
+    kept_symbols = symbol_array[keep_genes]
+    n_found      = len(set(kept_symbols.tolist()))
+    n_missing    = len(requested) - n_found
+    if n_missing:
+      import warnings
+      warnings.warn(
+          f"load_reference_h5ad(select_gene_symbols=...): {n_missing} of "
+          f"{len(requested)} requested gene symbols were not found in "
+          f"{feature_name_col!r} (or had zero total count across all "
+          f"cells) and were dropped -- kept {n_found} genes.",
+          stacklevel=2,
+      )
+    dup_symbols, dup_counts = np.unique(kept_symbols, return_counts=True)
+    dup_symbols = dup_symbols[dup_counts > 1]
+    if dup_symbols.size:
+      import warnings
+      warnings.warn(
+          f"load_reference_h5ad(select_gene_symbols=...): {dup_symbols.size} "
+          f"requested gene symbol(s) matched more than one row in "
+          f"{feature_name_col!r} (e.g. distinct Ensembl IDs that share a "
+          "symbol) -- all matching rows were kept as separate columns, so "
+          "kept_gene_symbols contains repeated entries for: "
+          f"{sorted(dup_symbols.tolist())}. This breaks the usual 1:1 "
+          "symbol<->column assumption; if you need exactly one column per "
+          "requested symbol, deduplicate the returned (X, kept_gene_symbols) "
+          "yourself (e.g. keep only the highest-total-count row per "
+          "duplicated symbol).",
+          stacklevel=2,
+      )
+  else:
+    keep_genes = nonzero_genes
+    if n_top_genes is not None and keep_genes.size > n_top_genes:
+      gene_means_kept = gene_totals[keep_genes] / n_cells
+      top             = np.argsort(gene_means_kept)[::-1][:n_top_genes]
+      keep_genes      = np.sort(keep_genes[top])
 
   # --- Choose which cells to keep (exact count, uniform without replacement). ---
   rng = np.random.default_rng(seed)
@@ -1708,7 +1813,8 @@ def load_reference_h5ad(
 
   X = torch.tensor(X_np, dtype=torch.float32, device=device)
   X = torch.log1p(X.clamp(min=0))
-  return X
+  kept_gene_symbols = symbol_array[keep_genes].tolist() if symbol_array is not None else None
+  return X, kept_gene_symbols
 
 
 def compute_summary_stats(
@@ -1776,6 +1882,10 @@ def compute_summary_stats(
       log_lib_size_{mean,std,p<pct>...}: distribution, across cells, of
         log1p(per-cell total raw count) -- directly comparable in scale to
         SERGIO's own lib_size_mean/lib_size_scale parameters.
+      lib_size_zero_frac: fraction of cells whose total raw count is ~0
+        (i.e. every gene dropped out for that cell) -- a direct signal of
+        a degenerate/collapsed draw that log_lib_size's percentiles only
+        catch incidentally.
       zero_frac: overall fraction of observed entries that are exactly 0.
       dropout_curve_bin_edges: bin edges (over per-gene mean log1p
         expression) used for the binned dropout curve below.
@@ -1837,6 +1947,13 @@ def compute_summary_stats(
   raw[~obs_mask] = 0.0
   lib_size = raw.sum(axis=1)
   _dist_summary("log_lib_size", np.log1p(lib_size))
+  # Fraction of cells with ~0 total counts -- log_lib_size's percentiles
+  # only catch this incidentally (e.g. if p50 happens to land on 0); this
+  # is a direct, robust signal of a degenerate/collapsed simulation draw
+  # (most of the matrix wiped out by dropout for a chunk of cells) that a
+  # tuning harness can guard against explicitly (see tune_synthetic_data.py's
+  # max_lib_size_zero_frac).
+  stats["lib_size_zero_frac"] = float(np.mean(lib_size <= 0.5))
 
   # --- overall zero fraction (among observed entries) ---
   n_obs = obs_mask.sum()

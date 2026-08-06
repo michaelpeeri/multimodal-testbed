@@ -126,6 +126,34 @@ NaN whenever too few genes have positive mean & variance). Per-key weights
 default to 1.0 and can be overridden via config["weights"] (e.g. {"zero_frac":
 2.0} to emphasize matching the overall dropout rate).
 
+Hard guards against degenerate candidates
+--------------------------------------------
+compute_stats_distance's weighted MEAN averages ~29 individual stat keys,
+most of which (gene_mean_*/gene_var_*/log_lib_size_*'s mean/std/percentile
+entries) describe closely related aspects of the same few underlying
+quantities. This means a candidate can be catastrophically wrong on one or
+two structurally important stats (e.g. most cells losing their entire
+library to dropout, or the gene-gene correlation structure collapsing onto
+a single dominant axis) while still posting a competitive overall
+distance, because the many other well-matched terms dilute the damage in
+the average -- observed in practice tuning against this same target/search
+space (see markup_sessions notes). To guard against this, run_trial()
+additionally applies two hard pass/fail checks, independent of the
+weighted-mean distance, via _prune() (excludes the trial from
+best_value/best_trial entirely, unlike a merely-large distance term):
+  - candidate_stats["lib_size_zero_frac"] (fraction of cells with ~0 total
+    counts) must be <= config["max_lib_size_zero_frac"] (default 0.05).
+  - candidate_stats["pca_explained_variance_ratio"][0] (fraction of
+    variance in the leading PC) must be <=
+    config["max_pca_pc1_ratio_factor"] * target_stats
+    ["pca_explained_variance_ratio"][0] (default factor 1.3), i.e. the
+    candidate's dominant-axis concentration can't exceed the reference's
+    own by more than 30%.
+Both are tagged via trial.user_attrs["prune_reason"] ("degenerate_
+lib_size_zero_frac"/"degenerate_pca_pc1_dominance") for post-hoc analysis,
+same convention as grn_generation_failed/simulation_failed/non_finite_
+distance.
+
 Problem/JSON config schema
 ----------------------------
 Required keys: "reference_grn_path", "search_space", and either
@@ -149,21 +177,49 @@ See synthetic_tuning_config.example.json for a full example. Notable keys
                             (see that function's docstring) -- e.g.:
 
                                 import pickle
-                                from synthetic_data import load_reference_h5ad, compute_summary_stats
+                                import numpy as np
+                                from synthetic_data import (
+                                    generate_sergio_grn_from_reference,
+                                    load_reference_h5ad,
+                                    compute_summary_stats,
+                                )
+
+                                # Align the reference's gene panel by *identity* with the
+                                # synthetic GRN's genes (rather than an independent
+                                # top-n_top_genes-by-expression selection) -- both sides
+                                # then describe the same genes, not just the same gene
+                                # count. grn_seed is fixed, so this subgraph (and the
+                                # resulting select_gene_symbols) is stable across an
+                                # entire tuning study -- a one-time step.
+                                _, _, gene_id_to_symbol = generate_sergio_grn_from_reference(
+                                    reference_grn_path, n_genes=800,
+                                    output_path="/tmp/grn_for_target_stats.csv", seed=42,
+                                )
+                                select_gene_symbols = list(gene_id_to_symbol.values())
+
                                 stats_list = [
                                     compute_summary_stats(
-                                        load_reference_h5ad(path, ..., seed=i)
+                                        load_reference_h5ad(
+                                            path, select_gene_symbols=select_gene_symbols, seed=i,
+                                        )[0]
                                     )
                                     for i in range(20)
                                 ]
-                                # average scalar entries across runs; keep
-                                # array entries (e.g. from a fixed-seed run)
-                                # or average those elementwise too, as long
-                                # as shapes agree across all 20.
-                                avg_stats = {
-                                    k: (sum(s[k] for s in stats_list) / len(stats_list))
-                                    for k in stats_list[0]
-                                }
+                                # Average across runs. Array-valued entries (e.g.
+                                # dropout_curve_zero_frac) can come back jagged across
+                                # samples (different numbers of non-empty mean-expression
+                                # bins per draw) -- truncate to the shortest length across
+                                # samples before averaging elementwise; scalar entries are
+                                # a plain mean.
+                                avg_stats = {}
+                                for k in stats_list[0]:
+                                    if isinstance(stats_list[0][k], np.ndarray):
+                                        min_len = min(len(s[k]) for s in stats_list)
+                                        avg_stats[k] = np.mean(
+                                            np.array([s[k][:min_len] for s in stats_list]), axis=0,
+                                        )
+                                    else:
+                                        avg_stats[k] = np.mean([s[k] for s in stats_list])
                                 with open("target_stats.pkl", "wb") as f:
                                     pickle.dump(avg_stats, f)
     reference_h5ad_path   : str, required unless target_stats_path is set --
@@ -204,6 +260,14 @@ See synthetic_tuning_config.example.json for a full example. Notable keys
                             function's docstring), applied identically to the
                             reference and every candidate.
     weights/distance_eps   : compute_stats_distance's config (see above).
+    max_lib_size_zero_frac : float, default 0.05 -- hard guard (see "Hard
+                            guards against degenerate candidates" below):
+                            a trial is pruned if candidate_stats
+                            ["lib_size_zero_frac"] exceeds this.
+    max_pca_pc1_ratio_factor : float, default 1.3 -- hard guard: a trial is
+                            pruned if candidate_stats
+                            ["pca_explained_variance_ratio"][0] exceeds
+                            this factor times target_stats's own PC1 ratio.
     storage                : str, default "sqlite:///synthetic_tuning.db" --
                             same sqlite-resumability pattern as tuning.py;
                             run this script from multiple processes against
@@ -394,6 +458,17 @@ _CONFIG_DEFAULTS = {
     # compute_stats_distance config
     "weights":      {},
     "distance_eps": 1e-6,
+
+    # Hard guards against degenerate/collapsed candidates -- checked in
+    # run_trial() right after compute_summary_stats(), independent of (and
+    # in addition to) compute_stats_distance()'s soft weighted terms. A
+    # trial that violates either is pruned via _prune() (excluded from
+    # best_value/best_trial entirely, tagged with a specific prune_reason),
+    # rather than merely incurring one more term in an averaged distance
+    # that a handful of well-matching terms elsewhere can dilute away (see
+    # module docstring's "Hard guards" note).
+    "max_lib_size_zero_frac":   0.05,  # candidate's lib_size_zero_frac must be <= this
+    "max_pca_pc1_ratio_factor": 1.3,   # candidate PC1 ratio must be <= this * target PC1 ratio
 
     # Optuna
     "storage":      "sqlite:///synthetic_tuning.db",
@@ -640,6 +715,28 @@ def run_trial(trial: optuna.Trial, config: dict, target_stats: dict) -> float:
         seed=config["stats_seed"],
     )
 
+    # --- hard guards against degenerate/collapsed candidates -- see
+    # module docstring's "Hard guards against degenerate candidates" ---
+    lib_size_zero_frac = candidate_stats.get("lib_size_zero_frac", float("nan"))
+    if math.isfinite(lib_size_zero_frac) and lib_size_zero_frac > config["max_lib_size_zero_frac"]:
+        _prune(
+            trial, "degenerate_lib_size_zero_frac",
+            f"lib_size_zero_frac={lib_size_zero_frac:.4f} > "
+            f"max_lib_size_zero_frac={config['max_lib_size_zero_frac']}",
+        )
+
+    cand_pca = candidate_stats.get("pca_explained_variance_ratio", np.array([]))
+    target_pca = target_stats.get("pca_explained_variance_ratio", np.array([]))
+    if len(cand_pca) and len(target_pca):
+        max_pc1 = float(target_pca[0]) * config["max_pca_pc1_ratio_factor"]
+        if float(cand_pca[0]) > max_pc1:
+            _prune(
+                trial, "degenerate_pca_pc1_dominance",
+                f"pc1_ratio={float(cand_pca[0]):.4f} > "
+                f"max_allowed={max_pc1:.4f} (target={float(target_pca[0]):.4f}, "
+                f"factor={config['max_pca_pc1_ratio_factor']})",
+            )
+
     distance, breakdown = compute_stats_distance(
         target_stats, candidate_stats, weights=config.get("weights"), eps=config["distance_eps"],
     )
@@ -754,7 +851,7 @@ def run(config_path: str) -> optuna.Study:
             target_stats = pickle.load(f)
     else:
         print(f"Loading reference from {config['reference_h5ad_path']!r} ...")
-        target_X = load_reference_h5ad(
+        target_X, _ = load_reference_h5ad(
             config["reference_h5ad_path"],
             layer=config["reference_layer"],
             n_top_genes=config["reference_n_top_genes"],

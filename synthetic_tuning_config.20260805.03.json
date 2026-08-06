@@ -8,13 +8,14 @@
   "sampling_state":     5,
   "shared_coop_state":  0,
 
-  "storage":      "sqlite:///synthetic_tuning_20260805.db",
-  "study_name":   "tune_synthetic_data6_20260805",
-  "output":       "/content/Drive/MyDrive/Colab Notebooks/tuned_synthetic_config.20260805.json",
-  "artifact_dir": "/content/Drive/MyDrive/Colab Notebooks/synthetic_checkpoints_20260805",
-  "n_trials":     30,
+  "storage":      "sqlite:///synthetic_tuning_20260805_02.db",
+  "study_name":   "tune_synthetic_data6_20260805_02",
+  "output":       "/content/Drive/MyDrive/Colab Notebooks/tuned_synthetic_config.20260805_02.json",
+  "artifact_dir": "/content/Drive/MyDrive/Colab Notebooks/synthetic_checkpoints_20260805_02",
+  "n_trials":     100,
   "sampler":      "tpe",
   "pruner":       "none",
+  "sim_seed":     2,
 
   "weights": {
     "log_lib_size_mean": 3.0, "log_lib_size_std": 3.0,

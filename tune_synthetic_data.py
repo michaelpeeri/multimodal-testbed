@@ -971,12 +971,13 @@ def regenerate_best(study_or_params, config: dict, final_missing_rate: float | N
         seed=config["grn_seed"],
     )
 
-    mr_state_np = _sample_mr_state(
-        config["n_clusters"], len(mr_ids),
-        config["mr_rate_low"], config["mr_rate_high"],
-        seed=config["sim_seed"],
-    )
-    mr_state = torch.tensor(mr_state_np, dtype=torch.float32, device=device)
+    # Test replacing the i.i.d mr_state vectors with orthogonal vectors, shifted to the MR activator range (~1-5)
+    offset = 0.3
+    scale  = 6.5
+    random_matrix = torch.randn(len(mr_ids), config["n_clusters"])
+    Q, R = torch.linalg.qr(random_matrix)
+    mr_state = ((Q.T + offset) * scale).clip(min=0.0)
+    mr_state_np = mr_state.cpu().detach().numpy()
 
     missing_rate = config["final_missing_rate"] if final_missing_rate is None else final_missing_rate
     sim_seed = config["sim_seed"] if seed is None else seed

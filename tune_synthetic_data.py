@@ -100,6 +100,27 @@ own defaults -- see _SIM_KWARG_DEFAULTS/_GRN_KWARG_DEFAULTS below):
                             (hill_coeff_dist=('constant', hill_coeff))
     "unknown_mode_repressor_prob" : P(repressor) for sign-ambiguous edges
                             in the reference GRN
+    "coherency_bias"      : generate_sergio_grn_from_reference's
+                            coherency_bias -- biases sign-ambiguous edges
+                            toward agreeing with their target's "winning"
+                            master regulator (0.0 = today's unbiased coin
+                            flip, matches that function's own default)
+    "canalization_strength": generate_sergio_grn_from_reference's
+                            canalization_strength -- winner-take-all K-
+                            magnitude reweighting toward/away from the
+                            target's winning master regulator (0.0 =
+                            today's iid magnitude, matches that function's
+                            own default)
+    "balancing_strength"  : generate_sergio_grn_from_reference's
+                            balancing_strength -- fairness penalty
+                            preventing one master regulator's "winning
+                            territory" from entrenching (0.0 = pure greedy
+                            argmax, matches that function's own default)
+    "path_decay"          : generate_sergio_grn_from_reference's
+                            path_decay -- per-hop attenuation of
+                            propagated master-regulator signal strength
+                            (only affects output when coherency_bias > 0
+                            or canalization_strength > 0)
 
 Each search_space entry is {"type": "float"|"int"|"categorical", ...}, the
 same spec format as tuning.py's suggest_from_spec.
@@ -119,6 +140,18 @@ not distributional targets to match), and for each:
     quantile-of-gene-mean deciles, so comparing them index-wise is
     meaningful even though the underlying bin_edges values differ between
     target and candidate).
+Note on pca_explained_variance_ratio vs. pca_tail_participation_ratio: the
+former matches PC1 (index 0) alongside every other leading PC equally,
+which is the wrong target when what you actually care about is how much
+variation is spread across PC2+ rather than how dominant PC1 itself is
+(PC1 is often driven by structure -- e.g. between-cluster mean shifts --
+that's orthogonal to the GRN-topology knobs being tuned). In that case,
+set weights["pca_explained_variance_ratio"] = 0.0 and weight
+pca_tail_participation_ratio (synthetic_data.compute_summary_stats'
+"effective number of components" among PC2..N, see
+synthetic_data.pca_participation_ratio) instead -- it's a plain scalar
+entry so it flows through the same relative-squared-error/weighting
+mechanism as everything else above, with no special-casing needed here.
 Each key's term is combined into a single weighted MEAN (not sum) across
 all included keys, so the result stays comparable across trials even if a
 different subset of keys ends up skipped (e.g. mean_var_log_slope/corr are
@@ -252,7 +285,35 @@ See synthetic_tuning_config.example.json for a full example. Notable keys
                             (defaults match TRRUST's rawdata TSV format).
     grn_tmp_dir            : str|None, default: system temp dir -- where
                             each trial's regenerated GRN CSV is written
-                            (removed again after that trial's simulation).
+                            (removed again after that trial's simulation,
+                            unless grn_archive_dir is also set -- see below).
+    grn_archive_dir        : str|None, default None (disabled) -- if set,
+                            every trial's GRN CSV (kept, not deleted) and a
+                            JSON diagnostics dict (from
+                            generate_sergio_grn_from_reference's
+                            `diagnostics` parameter -- winner_mr/vote_margin/
+                            n_ambiguous_flipped/n_aligned_edges per target
+                            gene, mr_load, n_distinct_winners,
+                            top1_winner_share) are written to
+                            {grn_archive_dir}/trial{N}.grn.csv and
+                            {grn_archive_dir}/trial{N}.diagnostics.json, for
+                            later offline analysis of how coherency_bias/
+                            canalization_strength/balancing_strength
+                            actually behaved across the search (e.g. "does
+                            top1_winner_share correlate with lower distance/
+                            better pca_explained_variance_ratio spread?").
+                            A handful of cheap scalar summaries derived from
+                            the same diagnostics dict (n_distinct_winners,
+                            top1_winner_share, frac_ambiguous_flipped,
+                            mean_canalization_alignment_frac) are ALSO always
+                            recorded as trial.user_attrs regardless of this
+                            setting (queryable straight from the Optuna
+                            study/dashboard, no archive directory needed) --
+                            see run_trial(). Disk cost per trial is small
+                            (the GRN CSV is the same handful-of-thousand-
+                            edges file already written for simulation; the
+                            diagnostics JSON is a few arrays of length
+                            n_genes), but not zero, hence opt-in.
     stats_n_pca_components/stats_n_structure_genes/stats_percentiles/stats_seed :
                             forwarded to compute_summary_stats (n_structure_genes
                             controls the shared gene subsample used for both
@@ -321,6 +382,32 @@ hyperparameters):
          #    'gene_reads_train': X[:n_train], 'gene_reads_test': X[n_train:]}
          # to feed the tuned synthetic generator directly into VAE tuning.
 
+Plotting GRN-coherency diagnostics
+-------------------------------------
+plot_grn_diagnostics(config_path_or_dict) builds a multi-panel figure
+summarizing the coherency_bias/canalization_strength/balancing_strength
+mechanism's behavior across a finished (or in-progress) study, combining:
+  - the study's own trials (loaded via optuna.load_study(config["storage"],
+    config["study_name"])) for the cheap always-logged per-trial scalars
+    (n_distinct_winners/top1_winner_share/frac_ambiguous_flipped/
+    mean_canalization_alignment_frac/candidate_pca_explained_variance_ratio/
+    trial.value) vs. each trial's own resolved coherency/canalization/
+    balancing_strength/path_decay params -- these are available for EVERY
+    completed trial regardless of grn_archive_dir;
+  - optionally, config["grn_archive_dir"]'s per-trial
+    trial{N}.diagnostics.json files (if that directory exists and has any)
+    for a finer-grained look at one or a few individual trials' winner_mr/
+    vote_margin/mr_load distributions (see generate_sergio_grn_from_
+    reference's own `diagnostics` param docstring for field meanings) --
+    skipped gracefully (panel left blank) if grn_archive_dir wasn't set or
+    is empty::
+
+        import tune_synthetic_data as tsd
+        fig = tsd.plot_grn_diagnostics("synthetic_tuning_config.20260810.json")
+        fig.savefig("grn_diagnostics.png", dpi=120)  # or pass path= directly
+
+See that function's own docstring for the full panel list.
+
 Dependencies note
 -------------------
 Like synthetic_data.py's own make_synthetic_data6/load_reference_h5ad, this
@@ -334,6 +421,8 @@ import json
 import math
 import os
 import pickle
+import re
+import shutil
 import tempfile
 import time
 from pathlib import Path
@@ -378,6 +467,10 @@ _GRN_KWARG_DEFAULTS = {
     "grn_k_span":                  4.0,
     "hill_coeff":                  2.0,
     "unknown_mode_repressor_prob": 0.5,
+    "coherency_bias":              0.0,
+    "canalization_strength":       0.0,
+    "balancing_strength":          0.0,
+    "path_decay":                  0.9,
 }
 
 TUNABLE_KEYS = frozenset(_SIM_KWARG_DEFAULTS) | frozenset(_GRN_KWARG_DEFAULTS)
@@ -430,6 +523,7 @@ _CONFIG_DEFAULTS = {
     "grn_repression_labels": ["Repression"],
     "grn_max_seed_attempts": 20,
     "grn_tmp_dir":           None,  # default: system temp dir
+    "grn_archive_dir":       None,  # default: don't archive (see module docstring)
 
     # if set, skip load_reference_h5ad + compute_summary_stats entirely and
     # load target_stats directly from this pickle file (see run()'s
@@ -560,12 +654,21 @@ def _split_resolved(resolved: dict):
     {**_SIM_KWARG_DEFAULTS, **_GRN_KWARG_DEFAULTS, **best_params} when
     replaying a finished trial) into make_synthetic_data6's sim_kwargs and
     generate_sergio_grn_from_reference's k_dist/hill_coeff_dist/
-    unknown_mode_repressor_prob."""
+    unknown_mode_repressor_prob/grn_coherency_kwargs (the coherency_bias/
+    canalization_strength/balancing_strength/path_decay quadruple, passed
+    through as a dict of kwargs so this function's return signature
+    doesn't grow every time a new such knob is added)."""
     sim_kwargs = {k: resolved[k] for k in _SIM_KWARG_DEFAULTS}
     grn_k_dist = ("uniform", resolved["grn_k_low"], resolved["grn_k_low"] + resolved["grn_k_span"])
     hill_coeff_dist = ("constant", resolved["hill_coeff"])
     unknown_mode_repressor_prob = resolved["unknown_mode_repressor_prob"]
-    return sim_kwargs, grn_k_dist, hill_coeff_dist, unknown_mode_repressor_prob
+    grn_coherency_kwargs = {
+        "coherency_bias":        resolved["coherency_bias"],
+        "canalization_strength": resolved["canalization_strength"],
+        "balancing_strength":    resolved["balancing_strength"],
+        "path_decay":            resolved["path_decay"],
+    }
+    return sim_kwargs, grn_k_dist, hill_coeff_dist, unknown_mode_repressor_prob, grn_coherency_kwargs
 
 
 def _sample_mr_state(n_clusters: int, n_mrs: int, low: float, high: float, seed: int | None) -> np.ndarray:
@@ -648,12 +751,13 @@ def run_trial(trial: optuna.Trial, config: dict, target_stats: dict) -> float:
     for the full pipeline description."""
     resolved = suggest_sim_cfg(trial, config["search_space"])
     trial.set_user_attr("resolved_params", {k: float(v) for k, v in resolved.items()})
-    sim_kwargs, grn_k_dist, hill_coeff_dist, unknown_mode_repressor_prob = _split_resolved(resolved)
+    sim_kwargs, grn_k_dist, hill_coeff_dist, unknown_mode_repressor_prob, grn_coherency_kwargs = _split_resolved(resolved)
 
     grn_tmp_dir = config["grn_tmp_dir"] or tempfile.gettempdir()
     Path(grn_tmp_dir).mkdir(parents=True, exist_ok=True)
     grn_path = os.path.join(grn_tmp_dir, f"sergio_grn_trial{trial.number}_{os.getpid()}.csv")
 
+    grn_diagnostics: dict = {}
     try:
         _, mr_ids, gene_id_to_symbol = generate_sergio_grn_from_reference(
             reference_grn_path=config["reference_grn_path"],
@@ -670,9 +774,36 @@ def run_trial(trial: optuna.Trial, config: dict, target_stats: dict) -> float:
             hill_coeff_dist=hill_coeff_dist,
             max_seed_attempts=config["grn_max_seed_attempts"],
             seed=config["grn_seed"],
+            diagnostics=grn_diagnostics,
+            **grn_coherency_kwargs,
         )
     except Exception as e:
         _prune(trial, "grn_generation_failed", str(e))
+
+    # Cheap scalar summaries of the coherency_bias/canalization_strength/
+    # balancing_strength mechanism's behavior on this trial -- always
+    # recorded (queryable straight from the Optuna study/dashboard),
+    # regardless of whether grn_archive_dir is set. See module docstring's
+    # "grn_archive_dir" entry.
+    trial.set_user_attr("n_distinct_winners", grn_diagnostics["n_distinct_winners"])
+    trial.set_user_attr("top1_winner_share", grn_diagnostics["top1_winner_share"])
+    n_ambiguous_total = sum(grn_diagnostics["n_ambiguous"])
+    trial.set_user_attr(
+        "frac_ambiguous_flipped",
+        (sum(grn_diagnostics["n_ambiguous_flipped"]) / n_ambiguous_total) if n_ambiguous_total else float("nan"),
+    )
+    n_regs_total = sum(grn_diagnostics["n_regs"])
+    trial.set_user_attr(
+        "mean_canalization_alignment_frac",
+        (sum(grn_diagnostics["n_aligned_edges"]) / n_regs_total) if n_regs_total else float("nan"),
+    )
+
+    if config["grn_archive_dir"]:
+        archive_dir = Path(config["grn_archive_dir"])
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(grn_path, archive_dir / f"trial{trial.number}.grn.csv")
+        with open(archive_dir / f"trial{trial.number}.diagnostics.json", "w") as f:
+            json.dump(grn_diagnostics, f)
 
     try:
         mr_state_np = _sample_mr_state(
@@ -714,6 +845,10 @@ def run_trial(trial: optuna.Trial, config: dict, target_stats: dict) -> float:
         percentiles=tuple(config["stats_percentiles"]),
         seed=config["stats_seed"],
     )
+    trial.set_user_attr(
+        "candidate_pca_tail_participation_ratio",
+        candidate_stats.get("pca_tail_participation_ratio", float("nan")),
+    )
 
     # --- hard guards against degenerate/collapsed candidates -- see
     # module docstring's "Hard guards against degenerate candidates" ---
@@ -727,6 +862,12 @@ def run_trial(trial: optuna.Trial, config: dict, target_stats: dict) -> float:
 
     cand_pca = candidate_stats.get("pca_explained_variance_ratio", np.array([]))
     target_pca = target_stats.get("pca_explained_variance_ratio", np.array([]))
+    # Full per-PC explained-variance-ratio vector -- not just the top-5
+    # worst compute_stats_distance terms (which only shows the biggest
+    # gaps, not the actual shape) -- since PC-by-PC spread (not just PC1
+    # dominance) is the whole point of the coherency/canalization/
+    # balancing mechanism; see AGENTS.md's Known Issues entry.
+    trial.set_user_attr("candidate_pca_explained_variance_ratio", [float(v) for v in cand_pca])
     if len(cand_pca) and len(target_pca):
         max_pc1 = float(target_pca[0]) * config["max_pca_pc1_ratio_factor"]
         if float(cand_pca[0]) > max_pc1:
@@ -871,8 +1012,17 @@ def run(config_path: str) -> optuna.Study:
         f"reference: n_cells={target_stats['n_cells']}  n_genes={target_stats['n_genes']}  "
         f"gene_mean_mean={target_stats['gene_mean_mean']:.4f}  "
         f"log_lib_size_mean={target_stats['log_lib_size_mean']:.4f}  "
-        f"zero_frac={target_stats['zero_frac']:.4f}"
+        f"zero_frac={target_stats['zero_frac']:.4f}  "
+        f"pca_tail_participation_ratio={target_stats.get('pca_tail_participation_ratio', float('nan')):.4f}"
     )
+    if "pca_tail_participation_ratio" not in target_stats:
+        print(
+            "  NOTE: target_stats has no 'pca_tail_participation_ratio' key -- it was "
+            "computed with an older compute_summary_stats() and needs to be "
+            "regenerated for weights['pca_tail_participation_ratio'] to have any "
+            "effect (that term will simply be skipped otherwise; see "
+            "compute_stats_distance's docstring)."
+        )
 
     study = optuna.create_study(
         study_name=config["study_name"],
@@ -928,7 +1078,8 @@ def run(config_path: str) -> optuna.Study:
 
 
 def regenerate_best(study_or_params, config: dict, final_missing_rate: float | None = None,
-                     seed: int | None = None, output_path: str | None = None):
+                     seed: int | None = None, output_path: str | None = None,
+                     diagnostics: dict | None = None):
     """Re-run GRN generation + make_synthetic_data6 from a finished study's
     best_params (or an explicit flat params dict, e.g. loaded from
     config["output"]'s "best_params") -- see module docstring's "Accessing
@@ -936,6 +1087,14 @@ def regenerate_best(study_or_params, config: dict, final_missing_rate: float | N
     missing_rate defaults to config["final_missing_rate"] (not 0.0), since
     the point here is to materialize an actual usable dataset rather than
     a fair-comparison candidate.
+
+    diagnostics: optional dict, forwarded to generate_sergio_grn_from_
+                 reference's own `diagnostics` parameter (populated in-
+                 place; see that function's docstring for its contents) --
+                 e.g. to inspect the winner_mr/vote_margin/mr_load/etc.
+                 behavior of whichever coherency_bias/canalization_
+                 strength/balancing_strength params ended up in the
+                 winning trial.
 
     Returns (X, cluster_labels, mr_state, grn_path, mr_ids, gene_id_to_symbol).
     grn_path points at a regenerated GRN CSV (output_path if given, else a
@@ -948,7 +1107,7 @@ def regenerate_best(study_or_params, config: dict, final_missing_rate: float | N
         params = study_or_params
 
     resolved = {**_SIM_KWARG_DEFAULTS, **_GRN_KWARG_DEFAULTS, **params}
-    sim_kwargs, grn_k_dist, hill_coeff_dist, unknown_mode_repressor_prob = _split_resolved(resolved)
+    sim_kwargs, grn_k_dist, hill_coeff_dist, unknown_mode_repressor_prob, grn_coherency_kwargs = _split_resolved(resolved)
 
     grn_tmp_dir = config["grn_tmp_dir"] or tempfile.gettempdir()
     Path(grn_tmp_dir).mkdir(parents=True, exist_ok=True)
@@ -969,6 +1128,8 @@ def regenerate_best(study_or_params, config: dict, final_missing_rate: float | N
         hill_coeff_dist=hill_coeff_dist,
         max_seed_attempts=config["grn_max_seed_attempts"],
         seed=config["grn_seed"],
+        diagnostics=diagnostics,
+        **grn_coherency_kwargs,
     )
 
     # Test replacing the i.i.d mr_state vectors with orthogonal vectors, shifted to the MR activator range (~1-5)
@@ -1003,6 +1164,230 @@ def regenerate_best(study_or_params, config: dict, final_missing_rate: float | N
     )
 
     return X, cluster_labels, mr_state_np, grn_path, mr_ids, gene_id_to_symbol
+
+
+def plot_grn_diagnostics(config: str | dict, path: str | None = None, figsize: tuple = (16, 8)):
+    """
+    Build an 8-panel figure summarizing the coherency_bias/
+    canalization_strength/balancing_strength/path_decay mechanism's
+    behavior across a finished (or in-progress) tuning study -- see module
+    docstring's "Plotting GRN-coherency diagnostics" for a usage example.
+
+    Args:
+      config: either a path to a JSON tuning config (loaded via
+              load_config) or an already-loaded config dict (e.g. from
+              load_config directly, or run()'s own `config` object).
+      path:   if given, the figure is saved here (dpi=120) and closed (same
+              convention as synthetic_data.py's plot_summary_stats/
+              sample_efficiency.py's _plot); otherwise the open Figure is
+              returned for the caller to show/save/close itself.
+      figsize: passed to plt.subplots.
+
+    Data sources:
+      - config["storage"]/config["study_name"] (via optuna.load_study) for
+        every COMPLETE trial's cheap always-logged user_attrs
+        (n_distinct_winners/top1_winner_share/frac_ambiguous_flipped/
+        mean_canalization_alignment_frac/candidate_pca_explained_variance_ratio)
+        plus that trial's own resolved coherency_bias/canalization_strength/
+        balancing_strength (from user_attrs["resolved_params"]) and
+        trial.value (the tuning distance) -- available for every completed
+        trial regardless of whether grn_archive_dir was ever set.
+      - config["grn_archive_dir"]'s trial{N}.diagnostics.json files (only
+        used for panels 7-8 below), if that directory exists and contains
+        at least one such file for a COMPLETE trial -- the archived file
+        for whichever COMPLETE trial has the lowest study-wide distance is
+        preferred (falling back to whichever archived COMPLETE trial has
+        the lowest distance among just the archived ones, if the true
+        overall best trial wasn't archived).
+      - config["target_stats_path"], if set, purely for panel 6's reference
+        PCA overlay (skipped, not an error, if unset/unreadable -- this
+        function never attempts the expensive load_reference_h5ad path).
+
+    Panels (2x4 grid):
+      1. tuning distance (trial.value) vs. top1_winner_share, one point per
+         completed trial -- is spreading out winners actually associated
+         with a better (lower) distance, or unrelated/harmful?
+      2. n_distinct_winners vs. balancing_strength -- does the fairness
+         penalty actually spread out winners as balancing_strength grows?
+      3. top1_winner_share vs. balancing_strength -- same question, in
+         terms of the largest single MR's share rather than the count of
+         distinct winners.
+      4. frac_ambiguous_flipped vs. coherency_bias -- does coherency_bias
+         actually sway more ambiguous-edge sign draws as it increases?
+      5. mean_canalization_alignment_frac vs. canalization_strength -- for
+         reference/sanity only (this fraction is a property of the fixed
+         GRN topology's alignment under winner-take-all, not something
+         canalization_strength itself changes -- see generate_sergio_grn_
+         from_reference's docstring: canalization_strength only reweights
+         magnitudes, it doesn't change which edges are "aligned"); a
+         roughly flat scatter here is expected and fine.
+      6. candidate_pca_explained_variance_ratio for the single best
+         (lowest-distance) completed trial vs. the reference target's own
+         ratio (if target_stats_path is set and readable) -- the actual
+         PCA-spread outcome this whole mechanism is meant to move,
+         log-y.
+      7. mr_load bar chart for whichever trial panels 7-8 use (see "Data
+         sources" above) -- per-master-regulator accumulated |strength|
+         "load", sorted descending, showing winner-concentration directly.
+      8. vote_margin histogram for that same trial -- winner-vs-runner-up
+         vote-margin distribution across that trial's target genes (see
+         generate_sergio_grn_from_reference's `diagnostics` docstring).
+
+    Any panel lacking the data it needs (e.g. no completed trials, no
+    target_stats_path, no grn_archive_dir) is left blank with a "no data"
+    note rather than raising.
+
+    Returns the Figure (already closed if `path` was given).
+    """
+    import matplotlib.pyplot as plt
+
+    if isinstance(config, str):
+        config = load_config(config)
+
+    study = optuna.load_study(study_name=config["study_name"], storage=config["storage"])
+    trials = [t for t in study.get_trials(deepcopy=False) if t.state == optuna.trial.TrialState.COMPLETE]
+
+    def _no_data(ax, title):
+        ax.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax.transAxes)
+        ax.set_title(title)
+
+    fig, axes = plt.subplots(2, 4, figsize=figsize)
+
+    if not trials:
+        for ax in axes.flat:
+            _no_data(ax, "")
+        fig.tight_layout()
+        if path is not None:
+            fig.savefig(path, dpi=120)
+            plt.close(fig)
+        return fig
+
+    distances          = np.array([t.value for t in trials], dtype=np.float64)
+    top1_winner_share  = np.array([t.user_attrs.get("top1_winner_share", float("nan")) for t in trials])
+    n_distinct_winners = np.array([t.user_attrs.get("n_distinct_winners", float("nan")) for t in trials])
+    frac_flipped       = np.array([t.user_attrs.get("frac_ambiguous_flipped", float("nan")) for t in trials])
+    mean_align_frac    = np.array([t.user_attrs.get("mean_canalization_alignment_frac", float("nan")) for t in trials])
+    resolved_list       = [t.user_attrs.get("resolved_params", {}) for t in trials]
+    coherency_bias      = np.array([r.get("coherency_bias", float("nan")) for r in resolved_list])
+    canalization_strength = np.array([r.get("canalization_strength", float("nan")) for r in resolved_list])
+    balancing_strength  = np.array([r.get("balancing_strength", float("nan")) for r in resolved_list])
+
+    def _scatter(ax, x, y, xlabel, ylabel, title):
+        valid = np.isfinite(x) & np.isfinite(y)
+        if valid.any():
+            ax.scatter(x[valid], y[valid], s=15)
+            ax.set_xlabel(xlabel)
+            ax.set_ylabel(ylabel)
+        else:
+            ax.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax.transAxes)
+        ax.set_title(title)
+
+    # --- 1: distance vs. top1_winner_share ---
+    _scatter(axes[0, 0], top1_winner_share, distances,
+             "top1_winner_share", "distance (trial.value)", "distance vs. top1_winner_share")
+
+    # --- 2: n_distinct_winners vs. balancing_strength ---
+    _scatter(axes[0, 1], balancing_strength, n_distinct_winners,
+             "balancing_strength", "n_distinct_winners", "n_distinct_winners vs. balancing_strength")
+
+    # --- 3: top1_winner_share vs. balancing_strength ---
+    _scatter(axes[0, 2], balancing_strength, top1_winner_share,
+             "balancing_strength", "top1_winner_share", "top1_winner_share vs. balancing_strength")
+
+    # --- 4: frac_ambiguous_flipped vs. coherency_bias ---
+    _scatter(axes[0, 3], coherency_bias, frac_flipped,
+             "coherency_bias", "frac_ambiguous_flipped", "frac_ambiguous_flipped vs. coherency_bias")
+
+    # --- 5: mean_canalization_alignment_frac vs. canalization_strength ---
+    _scatter(axes[1, 0], canalization_strength, mean_align_frac,
+             "canalization_strength", "mean_canalization_alignment_frac",
+             "mean_canalization_alignment_frac vs.\ncanalization_strength")
+
+    # --- 6: best trial's candidate PCA vs. reference target PCA ---
+    ax = axes[1, 1]
+    finite_distances = np.where(np.isfinite(distances), distances, np.inf)
+    best_idx = int(np.argmin(finite_distances)) if np.isfinite(finite_distances).any() else None
+    any_data = False
+    if best_idx is not None:
+        best_trial = trials[best_idx]
+        cand_pca = np.asarray(best_trial.user_attrs.get("candidate_pca_explained_variance_ratio", []), dtype=np.float64)
+        if cand_pca.size:
+            ax.plot(np.arange(1, cand_pca.size + 1), cand_pca, marker="o", ms=4,
+                    label=f"best trial (#{best_trial.number})")
+            any_data = True
+    if config.get("target_stats_path"):
+        try:
+            with open(config["target_stats_path"], "rb") as f:
+                target_stats = pickle.load(f)
+            target_pca = np.asarray(target_stats.get("pca_explained_variance_ratio", []), dtype=np.float64)
+            if target_pca.size:
+                ax.plot(np.arange(1, target_pca.size + 1), target_pca, marker="s", ms=4, label="target")
+                any_data = True
+        except Exception:
+            pass
+    if any_data:
+        ax.set_xlabel("PCA component")
+        ax.set_ylabel("explained variance ratio")
+        ax.set_yscale("log")
+        ax.legend(fontsize=7)
+    else:
+        _no_data(ax, "")
+    ax.set_title("best trial candidate vs. target PCA")
+
+    # --- 7-8: single-trial detail panels from grn_archive_dir, if available ---
+    archived_diag = None
+    archived_trial_number = None
+    if config.get("grn_archive_dir") and os.path.isdir(config["grn_archive_dir"]):
+        archive_dir = Path(config["grn_archive_dir"])
+        completed_by_number = {t.number: t for t in trials}
+        archived_numbers = []
+        for fname in os.listdir(archive_dir):
+            m = re.match(r"trial(\d+)\.diagnostics\.json$", fname)
+            if m and int(m.group(1)) in completed_by_number:
+                archived_numbers.append(int(m.group(1)))
+        if archived_numbers:
+            # prefer the overall best trial if it was archived, else the
+            # best-distance trial among just the archived ones
+            if best_idx is not None and trials[best_idx].number in archived_numbers:
+                archived_trial_number = trials[best_idx].number
+            else:
+                archived_trial_number = min(
+                    archived_numbers, key=lambda n: completed_by_number[n].value,
+                )
+            with open(archive_dir / f"trial{archived_trial_number}.diagnostics.json") as f:
+                archived_diag = json.load(f)
+
+    # --- 7: mr_load bar chart ---
+    ax = axes[1, 2]
+    if archived_diag is not None and archived_diag.get("mr_load"):
+        loads = sorted(archived_diag["mr_load"].values(), reverse=True)
+        ax.bar(range(len(loads)), loads)
+        ax.set_xlabel(f"master regulator rank (trial #{archived_trial_number})")
+        ax.set_ylabel("mr_load")
+    else:
+        _no_data(ax, "")
+    ax.set_title("mr_load (sorted)")
+
+    # --- 8: vote_margin histogram ---
+    ax = axes[1, 3]
+    if archived_diag is not None and archived_diag.get("vote_margin"):
+        margins = np.asarray(archived_diag["vote_margin"], dtype=np.float64)
+        margins = margins[np.isfinite(margins)]
+        if margins.size:
+            ax.hist(margins, bins=30)
+            ax.set_xlabel(f"vote_margin (trial #{archived_trial_number})")
+            ax.set_ylabel("count")
+        else:
+            _no_data(ax, "")
+    else:
+        _no_data(ax, "")
+    ax.set_title("vote_margin distribution")
+
+    fig.tight_layout()
+    if path is not None:
+        fig.savefig(path, dpi=120)
+        plt.close(fig)
+    return fig
 
 
 def main(argv=None) -> optuna.Study:

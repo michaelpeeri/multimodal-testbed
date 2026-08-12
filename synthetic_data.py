@@ -984,8 +984,13 @@ def generate_sergio_grn_from_reference(
     unknown_mode_repressor_prob:   float      = 0.5,
     k_dist:                        tuple      = ('uniform', 1.0, 5.0),
     hill_coeff_dist:               tuple      = ('constant', 2.0),
+    coherency_bias:                float      = 0.0,
+    canalization_strength:         float      = 0.0,
+    balancing_strength:            float      = 0.0,
+    path_decay:                    float      = 0.9,
     max_seed_attempts:             int        = 20,
     seed:                          int|None   = 42,
+    diagnostics:                   dict|None  = None,
 ) -> tuple[str, list[int], dict[int, str]]:
   """
   Generate a SERGIO-format `input_file_targets` GRN-structure CSV (consumed
@@ -1030,10 +1035,151 @@ def generate_sergio_grn_from_reference(
                   magnitude (sign is applied separately, per edge).
     hill_coeff_dist: dist-spec (see _sample_from_dist) for the per-edge
                   Hill/cooperativity coefficient.
+    coherency_bias: in [0, 1]. Biases sign-ambiguous edges' repressor/
+                  activator draw toward agreeing with the "sign" (relative
+                  to this target's winning master regulator, see below) of
+                  the regulator carrying that edge, instead of the plain
+                  i.i.d. unknown_mode_repressor_prob coin flip.
+                  0.0 (default) reproduces the unbiased draw exactly (same
+                  rng.random() call, same call order, byte-identical
+                  output to omitting this parameter entirely); 1.0 always
+                  aligns (deterministically, no rng.random() consumed).
+                  Literal Activation/Repression edges are NEVER flipped by
+                  this or any other new parameter below -- only sign-
+                  ambiguous edges are affected, since flipping a
+                  literature-curated edge's direction isn't supported by
+                  evidence (same principle as unknown_mode_repressor_prob
+                  above).
+    canalization_strength: in [0, 1]. Reweights every edge's sampled K
+                  magnitude by (1 + canalization_strength) if that edge's
+                  regulator's dominant master-regulator (and its
+                  contribution's sign) matches this target's winning
+                  master regulator/sign, else by (1 - canalization_strength)
+                  (weight clamped to >= 0.05). Applies to ALL edges
+                  (literal-sign and ambiguous alike), since K-magnitude was
+                  always a free/synthetic quantity regardless of the
+                  edge's literature-derived sign. 0.0 (default) leaves
+                  every magnitude's weight at exactly 1.0 (no-op,
+                  byte-identical to omitting this parameter).
+    balancing_strength: in [0, inf). Non-negative fairness penalty applied
+                  when picking each target's "winning" master regulator
+                  (see below): winner = argmax_mr(vote[mr] -
+                  balancing_strength * mr_load[mr]), where mr_load[mr]
+                  accumulates as mr "wins" targets. Prevents whichever
+                  master regulator already has the largest topological
+                  fan-out from entrenching further (which would only
+                  concentrate more variance into a single PCA component,
+                  the opposite of this mechanism's purpose). 0.0 (default)
+                  is a pure unbalanced argmax (still deterministic -- has
+                  no effect on output when coherency_bias=
+                  canalization_strength=0.0, since the winner is then
+                  unused).
+    path_decay:   in (0, 1]. Per-hop attenuation applied when propagating a
+                  gene's "dominant master regulator" signal strength
+                  forward to its own downstream targets, modeling the
+                  intuition that a master regulator's influence weakens
+                  (in terms of how reliably its sign propagates) with
+                  topological distance. Has no effect on output unless
+                  coherency_bias > 0 or canalization_strength > 0.
+
+    Together, coherency_bias/canalization_strength/balancing_strength/
+    path_decay implement an opt-in "coherent feed-forward loop" /
+    canalizing-function bias (see Alon, "An Introduction to Systems
+    Biology": coherent vs. incoherent feed-forward loops; Kauffman 1969:
+    canalizing Boolean functions) on top of the otherwise-i.i.d. per-edge
+    parameter sampling: each target gene picks a single "winning" master
+    regulator (by fairness-adjusted vote among its regulators' own
+    dominant master regulators -- a hard, propagated winner-take-all
+    assignment, not a soft blend across multiple master regulators), and
+    edges that agree with that winner get biased sign (if ambiguous) and
+    boosted magnitude, while disagreeing edges get shrunk magnitude. This
+    is a single left-to-right pass merged into the main loop below
+    (requires no separate path-enumeration/BFS step), exploiting the fact
+    that `survivors` only contains edges with reg_id < tgt_id (see below),
+    so every regulator's own winning-master-regulator assignment is always
+    already computed by the time a target that depends on it is reached.
+    All four parameters default to values that reproduce today's
+    unbiased/i.i.d. behavior exactly.
     max_seed_attempts: number of random seed nodes to try when sampling a
                   connected subgraph of size n_genes before giving up.
     seed:         seeds all randomness in this function (subgraph sampling,
                   K/Hill/sign sampling).
+    diagnostics:  optional dict; if given, populated in-place (this
+                  function's own return value/signature is unaffected --
+                  pass a fresh {} and read it back afterward) with
+                  per-target-gene and summary information about the
+                  coherency_bias/canalization_strength/balancing_strength
+                  mechanism's behavior, for offline analysis (e.g. "did
+                  balancing_strength actually spread out which master
+                  regulators win, or is one MR still entrenching most
+                  targets?"). Zero-cost when None (the default) -- no
+                  extra computation is performed, only bookkeeping of
+                  values already computed for the main algorithm. Adds
+                  the following keys (all NaN/empty-safe even if every
+                  coherency/canalization/balancing param is 0.0, i.e. this
+                  is meaningful to inspect even for "unbiased" runs):
+                    "tgt_ids":            (n_targets,) list, sorted target
+                                          gene ids, parallel to every other
+                                          per-target array below.
+                    "winner_mr":          (n_targets,) list, this target's
+                                          winning master regulator id.
+                    "vote_margin":        (n_targets,) list, winner's vote
+                                          minus runner-up's vote (BEFORE
+                                          the balancing_strength penalty is
+                                          applied) -- large margin means
+                                          the "natural" (unbalanced) winner
+                                          was clear-cut; near-zero means
+                                          balancing_strength (if nonzero)
+                                          had a real say in the outcome, or
+                                          the contest was close regardless.
+                                          NaN if the target has only one
+                                          distinct voting MR (no contest).
+                    "n_regs":             (n_targets,) list, number of
+                                          regulators for this target.
+                    "n_ambiguous":        (n_targets,) list, number of
+                                          sign-ambiguous edges among this
+                                          target's regulators.
+                    "n_ambiguous_flipped": (n_targets,) list, of those
+                                          ambiguous edges, how many drew a
+                                          sign DIFFERENT from what a plain
+                                          unknown_mode_repressor_prob coin
+                                          flip's expectation would have
+                                          been biased toward (i.e. how many
+                                          were actually swayed by
+                                          coherency_bias -- 0 whenever
+                                          coherency_bias == 0.0, since then
+                                          p_repressor is never altered).
+                    "n_aligned_edges":    (n_targets,) list, number of this
+                                          target's edges whose (dominant
+                                          MR, sign) matches (winner_mr,
+                                          this target's own net sign) --
+                                          the same "aligned" condition
+                                          canalization_strength rewards.
+                    "propagated_strength": (n_targets,) list, the signed
+                                          strength stored in mr_profile for
+                                          this target (path_decay-scaled
+                                          mean of aligned incoming
+                                          strengths; 0.0 if no aligned
+                                          edges).
+                    "mr_load":            dict[mr_id, float], final
+                                          accumulated |strength| "load" per
+                                          master regulator (same dict the
+                                          algorithm itself uses for the
+                                          balancing penalty).
+                    "n_distinct_winners": int, number of distinct master
+                                          regulators that won at least one
+                                          target (out of len(mr_ids)
+                                          possible) -- a direct, single-
+                                          number summary of winner-take-all
+                                          concentration vs. spread.
+                    "top1_winner_share":  float in [0, 1], the single
+                                          largest number of targets won by
+                                          any one master regulator, divided
+                                          by the total number of targets --
+                                          1.0 means total entrenchment by
+                                          one MR, low values mean winning
+                                          is spread out. NaN if there are
+                                          no targets (n_genes == len(mr_ids)).
 
   Returns:
     output_path:  same as the input arg, for convenience.
@@ -1125,6 +1271,27 @@ def generate_sergio_grn_from_reference(
 
   mr_ids = sorted(i for i in range(n_genes) if i not in targets_regs)
 
+  # mr_profile[gene_id] = (dominant_mr_id, signed_strength): each master
+  # regulator is its own dominant MR with unit strength; every other gene
+  # gets this assigned when it's processed as a target below (always
+  # possible -- see mr_profile[reg_id] access below -- since `survivors`
+  # only contains edges with reg_id < tgt_id, so every regulator of a
+  # target has necessarily already been processed, either as an MR seed or
+  # as an earlier target, by the time that target is reached in
+  # sorted(targets_regs.keys()) order).
+  mr_profile: dict[int, tuple[int, float]] = {mr: (mr, 1.0) for mr in mr_ids}
+  mr_load:    dict[int, float]             = {mr: 0.0 for mr in mr_ids}
+
+  if diagnostics is not None:
+    diag_tgt_ids:              list[int]   = []
+    diag_winner_mr:             list[int]   = []
+    diag_vote_margin:           list[float] = []
+    diag_n_regs:                list[int]   = []
+    diag_n_ambiguous:           list[int]   = []
+    diag_n_ambiguous_flipped:   list[int]   = []
+    diag_n_aligned_edges:       list[int]   = []
+    diag_propagated_strength:   list[float] = []
+
   rows = []
   for tgt_id in sorted(targets_regs.keys()):
     reg_list = targets_regs[tgt_id]
@@ -1132,17 +1299,74 @@ def generate_sergio_grn_from_reference(
     magnitudes  = _sample_from_dist(k_dist, n_regs, rng)
     coop_states = _sample_from_dist(hill_coeff_dist, n_regs, rng)
 
+    reg_profiles = [mr_profile[reg_id] for reg_id, _ in reg_list]
+
+    votes: dict[int, float] = {}
+    for dom_mr, strength in reg_profiles:
+      votes[dom_mr] = votes.get(dom_mr, 0.0) + abs(strength)
+    winner_mr = max(votes, key=lambda mr: votes[mr] - balancing_strength * mr_load[mr])
+
+    if diagnostics is not None:
+      sorted_votes = sorted(votes.values(), reverse=True)
+      vote_margin = (sorted_votes[0] - sorted_votes[1]) if len(sorted_votes) >= 2 else float('nan')
+      n_ambiguous = sum(1 for _, sign in reg_list if sign not in ('activation', 'repression'))
+      n_ambiguous_flipped = 0
+
     reg_ids  = []
     k_values = []
-    for (reg_id, sign), mag in zip(reg_list, magnitudes):
+    edge_signs: list[int] = []
+    for (reg_id, sign), mag, (dom_mr, dom_strength) in zip(reg_list, magnitudes, reg_profiles):
       if sign == 'activation':
         is_repressor = False
       elif sign == 'repression':
         is_repressor = True
       else:
-        is_repressor = rng.random() < unknown_mode_repressor_prob
+        p_repressor = unknown_mode_repressor_prob
+        if coherency_bias > 0.0 and dom_mr == winner_mr:
+          # bias toward whatever sign makes this edge AGREE with the
+          # regulator's own net effect on the winning MR (dom_strength's
+          # sign): a repressor edge flips the propagated sign, so a
+          # negative dom_strength (regulator is net-repressed by its own
+          # winning MR) wants a repressor edge here to end up net-positive
+          # (two sign flips), and vice versa.
+          want_repressor = dom_strength < 0.0
+          p_repressor = (1.0 - coherency_bias) * unknown_mode_repressor_prob \
+                      + coherency_bias * float(want_repressor)
+        draw = rng.random()
+        is_repressor = draw < p_repressor
+        if diagnostics is not None and (draw < p_repressor) != (draw < unknown_mode_repressor_prob):
+          # counts this draw as "flipped" only if coherency_bias's altered
+          # p_repressor actually changed the outcome relative to what the
+          # plain unbiased unknown_mode_repressor_prob coin flip would have
+          # given for this SAME draw -- always 0 when coherency_bias == 0.0
+          # (p_repressor == unknown_mode_repressor_prob exactly, so the two
+          # comparisons can never disagree).
+          n_ambiguous_flipped += 1
+      edge_sign = -1 if is_repressor else 1
+      edge_signs.append(edge_sign)
       reg_ids.append(reg_id)
-      k_values.append(-abs(float(mag)) if is_repressor else abs(float(mag)))
+
+      weight = 1.0
+      if canalization_strength > 0.0:
+        aligned = (dom_mr == winner_mr) and (np.sign(dom_strength) == edge_sign or dom_strength == 0.0)
+        weight = max(1.0 + canalization_strength, 0.05) if aligned else max(1.0 - canalization_strength, 0.05)
+      k_values.append(edge_sign * abs(float(mag)) * weight)
+
+    aligned_vals = [dom_strength * es for (dom_mr, dom_strength), es in zip(reg_profiles, edge_signs)
+                     if dom_mr == winner_mr]
+    strength = path_decay * (sum(aligned_vals) / len(aligned_vals)) if aligned_vals else 0.0
+    mr_profile[tgt_id] = (winner_mr, strength)
+    mr_load[winner_mr] = mr_load.get(winner_mr, 0.0) + abs(strength)
+
+    if diagnostics is not None:
+      diag_tgt_ids.append(tgt_id)
+      diag_winner_mr.append(winner_mr)
+      diag_vote_margin.append(vote_margin)
+      diag_n_regs.append(n_regs)
+      diag_n_ambiguous.append(n_ambiguous)
+      diag_n_ambiguous_flipped.append(n_ambiguous_flipped)
+      diag_n_aligned_edges.append(len(aligned_vals))
+      diag_propagated_strength.append(strength)
 
     rows.append([tgt_id, n_regs] + reg_ids + k_values + [float(c) for c in coop_states])
 
@@ -1150,6 +1374,25 @@ def generate_sergio_grn_from_reference(
     writer = csv.writer(f)
     for row in rows:
       writer.writerow(row)
+
+  if diagnostics is not None:
+    n_targets = len(diag_tgt_ids)
+    winner_counts: dict[int, int] = {}
+    for mr in diag_winner_mr:
+      winner_counts[mr] = winner_counts.get(mr, 0) + 1
+    diagnostics.update({
+        "tgt_ids":              diag_tgt_ids,
+        "winner_mr":            diag_winner_mr,
+        "vote_margin":          diag_vote_margin,
+        "n_regs":               diag_n_regs,
+        "n_ambiguous":          diag_n_ambiguous,
+        "n_ambiguous_flipped":  diag_n_ambiguous_flipped,
+        "n_aligned_edges":      diag_n_aligned_edges,
+        "propagated_strength":  diag_propagated_strength,
+        "mr_load":              dict(mr_load),
+        "n_distinct_winners":   len(winner_counts),
+        "top1_winner_share":    (max(winner_counts.values()) / n_targets) if n_targets else float('nan'),
+    })
 
   return output_path, mr_ids, gene_id_to_symbol
 
@@ -1817,6 +2060,28 @@ def load_reference_h5ad(
   return X, kept_gene_symbols
 
 
+def pca_participation_ratio(ratio: np.ndarray, skip_leading: int = 1) -> float:
+  """Participation ratio ("effective number of components") of a PCA
+  explained-variance-ratio vector, excluding the first `skip_leading`
+  entries (default 1, i.e. PC1/index 0).
+
+  Defined as (sum(tail))**2 / sum(tail**2), where tail = ratio[skip_leading:]
+  -- scale-invariant (unaffected by how much of the total variance PC1 or
+  any other excluded leading component captured), so it purely measures
+  how evenly variance is spread across the remaining components: 1.0 if
+  all of the tail's variance sits in a single component, up to
+  len(tail) if it's spread perfectly evenly across all of them.
+
+  Returns NaN if fewer than 2 finite, positive tail entries remain (no
+  meaningful "spread" to measure -- e.g. n_pca_components < skip_leading + 2).
+  """
+  tail = np.asarray(ratio, dtype=np.float64)[skip_leading:]
+  tail = tail[np.isfinite(tail)]
+  if tail.size < 2 or not np.any(tail > 0):
+    return float('nan')
+  return float((tail.sum() ** 2) / np.sum(tail ** 2))
+
+
 def compute_summary_stats(
     X:                  torch.Tensor,
     n_pca_components:   int      = 10,
@@ -1895,6 +2160,12 @@ def compute_summary_stats(
         comparable to SERGIO's dropout_shape/dropout_percentile knobs.
       pca_explained_variance_ratio: (n_pca_components,) array, computed on
         up to n_structure_genes genes.
+      pca_tail_participation_ratio: scalar "effective number of components"
+        among PC2..PC<n_pca_components> (PC1/index 0 excluded -- see
+        pca_participation_ratio), i.e. how evenly variance is spread
+        across the non-dominant leading PCs rather than how much PC1
+        itself dominates. NaN if fewer than 2 non-PC1 components are
+        available (n_pca_components < 3).
       gene_corr_abs_{mean,std,p50,p90}: distribution summary of |pairwise
         gene-gene Pearson correlation| (upper triangle, off-diagonal),
         computed on the same up-to-n_structure_genes genes as PCA above.
@@ -2016,6 +2287,7 @@ def compute_summary_stats(
     stats["pca_explained_variance_ratio"] = ratio[:k]
   else:
     stats["pca_explained_variance_ratio"] = np.array([])
+  stats["pca_tail_participation_ratio"] = pca_participation_ratio(stats["pca_explained_variance_ratio"])
 
   if n_struct_genes >= 2:
     with np.errstate(invalid='ignore'):

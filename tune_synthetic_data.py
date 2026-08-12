@@ -128,11 +128,12 @@ same spec format as tuning.py's suggest_from_spec.
 The distance metric
 ---------------------
 compute_stats_distance(target_stats, candidate_stats, weights=None,
-eps=1e-6) iterates over every key present in both stats dicts (excluding
-"n_cells"/"n_genes"/"dropout_curve_bin_edges" -- structural/x-axis entries,
-not distributional targets to match), and for each:
+eps=1e-6, eps_frac=0.05) iterates over every key present in both stats
+dicts (excluding "n_cells"/"n_genes"/"dropout_curve_bin_edges" --
+structural/x-axis entries, not distributional targets to match), and for
+each:
   - scalar entries: relative squared error ((cand - target) / (|target| +
-    eps)) ** 2;
+    key_eps)) ** 2;
   - array entries (dropout_curve_zero_frac, pca_explained_variance_ratio):
     mean relative squared error, elementwise over the overlapping length
     (NaNs and length mismatches are skipped per-element/per-key, not
@@ -140,6 +141,19 @@ not distributional targets to match), and for each:
     quantile-of-gene-mean deciles, so comparing them index-wise is
     meaningful even though the underlying bin_edges values differ between
     target and candidate).
+key_eps (not just the raw `eps`) guards against near-zero targets: real
+reference data legitimately has some target stats at exactly 0.0 (e.g.
+gene_mean_p5/gene_var_p5/lib_size_zero_frac are all 0.0 for at least one
+real reference sample seen so far), and a bare fixed `eps` makes the plain
+relative-error formula numerically explosive for any such key (any small
+nonzero candidate value there produces a term of order (candidate/eps)**2,
+easily 10^5-10^6 -- confirmed in practice to silently dominate the whole
+distance and corrupt trial selection across multiple 20260811.* tuning
+studies). key_eps is instead `max(eps, eps_frac * scale)`, where `scale` is
+that key's own distributional-family's largest |target value| (see
+_stat_family/compute_stats_distance's own docstring) for scalar keys, or
+the array's own max(|target|) for array keys -- set eps_frac=0.0 to recover
+the original fixed-eps-only behavior.
 Note on pca_explained_variance_ratio vs. pca_tail_participation_ratio: the
 former matches PC1 (index 0) alongside every other leading PC equally,
 which is the wrong target when what you actually care about is how much
@@ -152,12 +166,25 @@ pca_tail_participation_ratio (synthetic_data.compute_summary_stats'
 synthetic_data.pca_participation_ratio) instead -- it's a plain scalar
 entry so it flows through the same relative-squared-error/weighting
 mechanism as everything else above, with no special-casing needed here.
+IMPORTANT: whichever of pca_tail_participation_ratio/pca_explained_variance_ratio
+you weight this way, target_stats must have been computed with the *same*
+n_pca_components as candidates are (config["stats_n_pca_components"]) --
+pca_tail_participation_ratio's value depends on how many tail PCs went into
+it, so comparing a target computed at one depth against candidates computed
+at another silently compares two different quantities (see run()'s startup
+validation, which now checks this explicitly).
 Each key's term is combined into a single weighted MEAN (not sum) across
 all included keys, so the result stays comparable across trials even if a
 different subset of keys ends up skipped (e.g. mean_var_log_slope/corr are
 NaN whenever too few genes have positive mean & variance). Per-key weights
 default to 1.0 and can be overridden via config["weights"] (e.g. {"zero_frac":
-2.0} to emphasize matching the overall dropout rate).
+2.0} to emphasize matching the overall dropout rate) -- IMPORTANT: this
+default applies to *every* key compute_summary_stats() returns, including
+ones you never think about, e.g. leaving the whole gene_mean_*/gene_var_*/
+mean_var_log_* family (16 keys) out of config["weights"] doesn't exclude
+them, it silently scores them at weight 1.0 each (confirmed in practice to
+end up ~25% of the total objective, unintentionally, across the
+20260811.* studies) -- explicitly set any key you don't want scored to 0.0.
 
 Hard guards against degenerate candidates
 --------------------------------------------
@@ -230,11 +257,23 @@ See synthetic_tuning_config.example.json for a full example. Notable keys
                                 )
                                 select_gene_symbols = list(gene_id_to_symbol.values())
 
+                                # n_pca_components here MUST match this config's own
+                                # "stats_n_pca_components" (20 by default as of the
+                                # coherency/canalization studies -- see that key's own
+                                # entry below) -- pca_tail_participation_ratio's value
+                                # depends on how many tail PCs it was computed over, so
+                                # a target computed at a different depth than candidates
+                                # silently compares two different quantities (this bit
+                                # everyone in the 20260811.* studies: the recipe below
+                                # previously omitted n_pca_components, silently defaulting
+                                # to 10 while those studies' candidates used 20 -- run()'s
+                                # startup check now catches this explicitly, see below).
                                 stats_list = [
                                     compute_summary_stats(
                                         load_reference_h5ad(
                                             path, select_gene_symbols=select_gene_symbols, seed=i,
-                                        )[0]
+                                        )[0],
+                                        n_pca_components=20,
                                     )
                                     for i in range(20)
                                 ]
@@ -320,7 +359,8 @@ See synthetic_tuning_config.example.json for a full example. Notable keys
                             PCA and gene-gene correlation -- see that
                             function's docstring), applied identically to the
                             reference and every candidate.
-    weights/distance_eps   : compute_stats_distance's config (see above).
+    weights/distance_eps/distance_eps_frac/distance_eps_abs_floor : compute_
+                            stats_distance's config (see above).
     max_lib_size_zero_frac : float, default 0.05 -- hard guard (see "Hard
                             guards against degenerate candidates" below):
                             a trial is pruned if candidate_stats
@@ -550,8 +590,10 @@ _CONFIG_DEFAULTS = {
     "stats_seed":             0,
 
     # compute_stats_distance config
-    "weights":      {},
-    "distance_eps": 1e-6,
+    "weights":             {},
+    "distance_eps":          1e-6,
+    "distance_eps_frac":     0.05,
+    "distance_eps_abs_floor": 0.02,
 
     # Hard guards against degenerate/collapsed candidates -- checked in
     # run_trial() right after compute_summary_stats(), independent of (and
@@ -685,17 +727,76 @@ def _sample_mr_state(n_clusters: int, n_mrs: int, low: float, high: float, seed:
     return rng.uniform(low, high, size=(n_clusters, n_mrs))
 
 
+_STAT_FAMILY_SUFFIX_RE = re.compile(r"_(mean|std|p\d+)$")
+
+
+def _stat_family(key: str) -> str:
+    """Groups a compute_summary_stats() scalar key into its distributional
+    "family" by stripping a trailing _mean/_std/_p<N> suffix -- e.g.
+    "gene_mean_p5" and "gene_mean_std" both map to "gene_mean" -- used only
+    to give compute_stats_distance's relative-error epsilon a family-
+    appropriate scale (see there), nothing else. Keys with no such suffix
+    (zero_frac, pca_tail_participation_ratio, mean_var_log_slope, ...) are
+    their own single-member family."""
+    m = _STAT_FAMILY_SUFFIX_RE.search(key)
+    return key[:m.start()] if m else key
+
+
 def compute_stats_distance(target_stats: dict, candidate_stats: dict,
-                            weights: dict | None = None, eps: float = 1e-6) -> tuple[float, dict]:
+                            weights: dict | None = None, eps: float = 1e-6,
+                            eps_frac: float = 0.05, eps_abs_floor: float = 0.02) -> tuple[float, dict]:
     """Weighted-mean relative squared error between two compute_summary_stats()
     dicts (see module docstring's "The distance metric"). Returns
     (distance, breakdown) where breakdown = {"terms": {key: term, ...},
     "skipped": [key, ...]} for diagnostics -- keys are skipped (not errors)
     when absent from either dict, non-finite, or (for array keys) of zero
-    overlapping length."""
+    overlapping length.
+
+    Near-zero targets: the plain relative-error formula ((cand - target) /
+    (|target| + eps)) ** 2 is numerically explosive whenever `target` itself
+    is ~0 and `eps` is a tiny fixed constant (the original default) --
+    e.g. gene_mean_p5/gene_var_p5/lib_size_zero_frac are legitimately exactly
+    0.0 for real sparse single-cell reference data, so *any* small nonzero
+    candidate value there (near-inevitable) produces a term of order
+    (candidate / eps) ** 2, easily 10^5-10^6 -- enough to swamp every other
+    term and make the resulting "best" trial selection meaningless (observed
+    in practice across several 20260811.* tuning studies). To guard against
+    this without any key-specific special-casing, the effective epsilon for
+    each scalar key is floored at `eps_frac` times that key's distributional
+    "family" scale (see _stat_family) -- i.e. the largest |target value|
+    among all of target_stats' *_mean/_std/_p<N> siblings of that key (e.g.
+    gene_mean_p5's family also contains gene_mean_mean/std/p25/p50/p75/p95,
+    so its floor reflects however large that family's own values are
+    elsewhere, rather than the single (possibly-0) entry being scored).
+    This alone doesn't help *single-member* families whose own value is
+    itself ~0 (e.g. lib_size_zero_frac has no *_mean/_std/_p<N> siblings at
+    all, so its "family scale" is just its own ~0 value) -- `eps_abs_floor`
+    is a second, flat floor underneath that (also applied to array keys,
+    from their own values) for exactly that residual case: comparing two
+    fractions/ratios that are both plausibly ~0 is inherently more like an
+    absolute- than a relative-error question (there's no other scale to be
+    relative *to*), so a small fixed floor (default 0.02, i.e. ~2 percentage
+    points for a fraction-like stat) stands in. Sizable target values are
+    unaffected either way (eps_frac * family_scale or |target| itself both
+    dwarf 0.02 there). Set eps_frac=eps_abs_floor=0.0 to recover the
+    original fixed-eps-only behavior.
+    """
     weights = weights or {}
     terms: dict[str, float] = {}
     skipped: list[str] = []
+
+    family_scale: dict[str, float] = {}
+    for key, value in target_stats.items():
+        if key in _EXCLUDED_STATS_KEYS or isinstance(value, np.ndarray):
+            continue
+        try:
+            v = abs(float(value))
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(v):
+            continue
+        fam = _stat_family(key)
+        family_scale[fam] = max(family_scale.get(fam, 0.0), v)
 
     for key, target_value in target_stats.items():
         if key in _EXCLUDED_STATS_KEYS:
@@ -717,14 +818,16 @@ def compute_stats_distance(target_stats: dict, candidate_stats: dict,
             if not valid.any():
                 skipped.append(key)
                 continue
-            rel_sq = ((c[valid] - t[valid]) / (np.abs(t[valid]) + eps)) ** 2
+            key_eps = max(eps, eps_frac * float(np.max(np.abs(t[valid]))), eps_abs_floor)
+            rel_sq = ((c[valid] - t[valid]) / (np.abs(t[valid]) + key_eps)) ** 2
             terms[key] = float(np.mean(rel_sq))
         else:
             t, c = float(target_value), float(candidate_value)
             if not (math.isfinite(t) and math.isfinite(c)):
                 skipped.append(key)
                 continue
-            terms[key] = float(((c - t) / (abs(t) + eps)) ** 2)
+            key_eps = max(eps, eps_frac * family_scale.get(_stat_family(key), 0.0), eps_abs_floor)
+            terms[key] = float(((c - t) / (abs(t) + key_eps)) ** 2)
 
     if not terms:
         return float("inf"), {"terms": terms, "skipped": skipped}
@@ -880,6 +983,8 @@ def run_trial(trial: optuna.Trial, config: dict, target_stats: dict) -> float:
 
     distance, breakdown = compute_stats_distance(
         target_stats, candidate_stats, weights=config.get("weights"), eps=config["distance_eps"],
+        eps_frac=config.get("distance_eps_frac", 0.05),
+        eps_abs_floor=config.get("distance_eps_abs_floor", 0.02),
     )
     trial.set_user_attr("skipped_stats_keys", breakdown["skipped"])
     if not math.isfinite(distance):
@@ -901,24 +1006,43 @@ def _save_if_best_artifact(config: dict, trial: optuna.Trial, distance: float,
                             X_sim: torch.Tensor, cluster_labels: np.ndarray,
                             mr_state_np: np.ndarray, mr_ids: list, gene_id_to_symbol: dict,
                             resolved: dict, candidate_stats: dict) -> None:
-    """If *distance* improves on whatever is currently recorded in
-    {artifact_dir}/best.pt (or that file doesn't exist yet), overwrite it
-    with this trial's full synthetic dataset/metadata. Reads the previous
-    best straight back from disk (not from Optuna's in-memory study state),
-    same resume-safety rationale as tuning.py's _save_if_best_checkpoint."""
+    """If *distance* improves on the best distance among this trial's own
+    study's completed trials so far, overwrite {artifact_dir}/best.pt with
+    this trial's full synthetic dataset/metadata.
+
+    Queries trial.study's own completed-trial values (already durable in
+    config["storage"]) directly, rather than reading {artifact_dir}/best.pt
+    back from disk to learn the previous best -- the original approach
+    (mirroring tuning.py's _save_if_best_checkpoint's resume-safety
+    rationale). That disk round-trip turned out to be silently broken in
+    practice: torch.load(path) raised on every call in all 8
+    20260811.* studies (plausibly PyTorch >=2.6 defaulting to
+    weights_only=True, which rejects the plain numpy arrays this artifact
+    stores, unless explicitly allow-listed), was swallowed by the bare
+    `except Exception: prev = float("inf")`, and so every trial unconditionally
+    overwrote the previous one -- confirmed post-hoc: every one of those 8
+    studies' best.pt held its *last* trial rather than its true
+    minimum-distance trial (per-study minimum distances were 2-800000x
+    lower than what got saved). Tradeoff versus the disk-read-back approach:
+    if artifact_dir is wiped/ephemeral across a resumed study while storage
+    persists, this now correctly keeps refusing to overwrite until a new
+    trial beats the study's historical best, rather than treating the
+    missing file as license to reset -- use a fresh study_name (or a fresh
+    storage db) if you actually want an unconstrained fresh artifact
+    baseline in that scenario.
+    """
     distance = float(distance)
     if not math.isfinite(distance):
         return
 
-    path = Path(config["artifact_dir"]) / "best.pt"
-    if path.exists():
-        try:
-            prev = torch.load(path, map_location="cpu").get("distance", float("inf"))
-        except Exception:
-            prev = float("inf")
-        if distance >= prev:
-            return
+    prev_completed_values = [
+        t.value for t in trial.study.get_trials(deepcopy=False, states=(optuna.trial.TrialState.COMPLETE,))
+        if t.value is not None and math.isfinite(t.value)
+    ]
+    if prev_completed_values and distance >= min(prev_completed_values):
+        return
 
+    path = Path(config["artifact_dir"]) / "best.pt"
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save({
         "distance":          distance,
@@ -1023,6 +1147,37 @@ def run(config_path: str) -> optuna.Study:
             "effect (that term will simply be skipped otherwise; see "
             "compute_stats_distance's docstring)."
         )
+    else:
+        # pca_tail_participation_ratio's value depends on how many tail PCs it
+        # was computed over -- comparing a target computed at one
+        # n_pca_components depth against candidates computed at another
+        # (this config's stats_n_pca_components) silently compares two
+        # different quantities. Confirmed to have actually happened across
+        # every one of the 20260811.* studies (target regenerated with the
+        # (then-undocumented) default n_pca_components=10 while
+        # stats_n_pca_components=20 -- candidates' tail spread was being
+        # compared against a target ~2x shallower than intended, and since
+        # participation ratio's plausible range scales with tail length,
+        # this systematically penalized candidates for achieving *more*
+        # PC2+ spread than that undersized target, the opposite of this
+        # mechanism's actual goal). len(pca_explained_variance_ratio) - 1 ==
+        # the number of tail PCs pca_tail_participation_ratio was computed
+        # over (see synthetic_data.pca_participation_ratio's skip_leading=1
+        # default), so it should equal stats_n_pca_components - 1.
+        target_n_pca = len(target_stats.get("pca_explained_variance_ratio", []))
+        if target_n_pca and target_n_pca != config["stats_n_pca_components"]:
+            print(
+                f"  *** WARNING: target_stats' pca_explained_variance_ratio has length "
+                f"{target_n_pca} (computed over {max(target_n_pca - 1, 0)} tail PCs) but "
+                f"this config's stats_n_pca_components={config['stats_n_pca_components']} "
+                f"(candidates will be computed over {config['stats_n_pca_components'] - 1} "
+                f"tail PCs) -- pca_tail_participation_ratio target/candidate are NOT "
+                f"apples-to-apples until target_stats_path is regenerated with "
+                f"n_pca_components={config['stats_n_pca_components']} (see "
+                f"target_stats_path's own docstring for the regeneration recipe). "
+                f"weights.get('pca_tail_participation_ratio') will otherwise silently "
+                f"score against the wrong scale. ***"
+            )
 
     study = optuna.create_study(
         study_name=config["study_name"],

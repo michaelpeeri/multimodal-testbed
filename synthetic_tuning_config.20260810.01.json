@@ -1,0 +1,63 @@
+{
+  "target_stats_path":   "/content/Drive/MyDrive/Colab Notebooks/1cb67ec8-c9e3-4d4a-ba23-a1a8ef3f8450.GRNseed42.stats.mean.pickle",
+  "reference_grn_path":  "/content/Drive/MyDrive/Colab Notebooks/trrust_rawdata.human.tsv",
+
+  "n_clusters":         6,
+  "n_genes":          800,
+  "n_cells":          600,
+  "sampling_state":     5,
+  "shared_coop_state":  0,
+
+  "storage":      "sqlite:///synthetic_tuning_20260810.01.db",
+  "study_name":   "tune_synthetic_data6_20260810.01",
+  "output":       "/content/Drive/MyDrive/Colab Notebooks/tuned_synthetic_config.20260810.01.json",
+  "artifact_dir": "/content/Drive/MyDrive/Colab Notebooks/synthetic_checkpoints_20260810.01",
+  "n_trials":     30,
+  "sampler":      "tpe",
+  "pruner":       "none",
+  "sim_seed":     1,
+
+  "max_lib_size_zero_frac":   0.05,
+  "max_pca_pc1_ratio_factor": 1.3,
+
+  "weights": {
+    "log_lib_size_mean":  3.0, "log_lib_size_std":  3.0,
+    "log_lib_size_p5":    3.0, "log_lib_size_p25":  3.0, "log_lib_size_p50": 3.0,
+    "log_lib_size_p75":   3.0, "log_lib_size_p95":  3.0,
+
+    "gene_corr_abs_mean": 3.0, "gene_corr_abs_std": 3.0,
+    "gene_corr_abs_p50":  3.0, "gene_corr_abs_p90": 3.0,
+
+    "pca_explained_variance_ratio": 6.0,
+
+    "zero_frac":               3.0,
+    "dropout_curve_zero_frac": 3.0,
+    "lib_size_zero_frac":      3.0
+  },
+
+  "search_space": {
+    "noise_params":        { "type": "float", "low": 0.2,   "high": 2.0,  "log": true  },
+    "decays":              { "type": "float", "low": 0.3,   "high": 1.5                },
+    "cluster_conc":        { "type": "float", "low": 2.0,   "high": 50.0, "log": true  },
+
+    "outlier_prob":        { "type": "float", "low": 0.001, "high": 0.1,  "log": true  },
+    "outlier_mean":        { "type": "float", "low": 0.2,   "high": 2.0                },
+    "outlier_scale":       { "type": "float", "low": 0.2,   "high": 3.0                },
+
+    "lib_size_mean":       { "type": "float", "low": 3.0,   "high": 15.0               },
+    "lib_size_scale":      { "type": "float", "low": 0.1,   "high": 2.0                },
+
+    "dropout_shape":       { "type": "float", "low": 1.0,   "high": 20.0               },
+    "dropout_percentile":  { "type": "float", "low": 40.0,  "high": 99.0               },
+
+    "grn_k_low":           { "type": "float", "low": 0.5,   "high": 2.0                },
+    "grn_k_span":          { "type": "float", "low": 0.2,   "high": 10.0               },
+    "hill_coeff":          { "type": "float", "low": 1.0,   "high": 3.0                },
+    "unknown_mode_repressor_prob": { "type": "float", "low": 0.0, "high": 1.0          },
+
+    "coherency_bias":        { "type": "float", "low": 0.0, "high": 1.0 },
+    "canalization_strength": { "type": "float", "low": 0.0, "high": 1.0 },
+    "balancing_strength":    { "type": "float", "low": 0.0, "high": 5.0 },
+    "path_decay":            { "type": "float", "low": 0.5, "high": 1.0 }
+  }
+}

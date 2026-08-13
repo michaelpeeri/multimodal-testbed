@@ -730,6 +730,33 @@ def _sample_mr_state(n_clusters: int, n_mrs: int, low: float, high: float, seed:
 _STAT_FAMILY_SUFFIX_RE = re.compile(r"_(mean|std|p\d+)$")
 
 
+def _add_pca_pc2_9_key(stats: dict) -> None:
+    """Derives "pca_pc2_9_explained_variance_ratio" (PC2..PC9, 8 values) as
+    a plain slice of the already-present "pca_explained_variance_ratio"
+    array -- mutates `stats` in place, a no-op if that key is absent or too
+    short. No synthetic_data.py change or target_stats_path regeneration
+    needed, since this is just a view onto data compute_summary_stats()
+    already returns.
+
+    Why this exists: pca_tail_participation_ratio (see synthetic_data.
+    pca_participation_ratio) is a scale-invariant "how evenly spread is the
+    tail" measure -- by construction it cannot tell two differently-*shaped*
+    tails apart as long as they're similarly "even". Empirically (all 8
+    `synthetic_tuning_20260812.*` studies' best trials, see AGENTS.md),
+    candidates were scoring at-or-above the target's own participation
+    ratio while their actual PC3-PC9 explained-variance-ratio ran at only
+    ~45-60% of the target's, compensated for by an *excess* (~95-116%) in
+    the PC16-PC20 far tail -- i.e. a flatter-than-target tail shape can
+    "pass" the scalar participation-ratio check without the early/mid tail
+    (PC2-9), which is the more visually/analytically salient part of a PCA
+    scree plot, ever actually matching. This key lets compute_stats_distance
+    score that magnitude directly, orthogonal to the tail-evenness question
+    pca_tail_participation_ratio asks."""
+    pca = stats.get("pca_explained_variance_ratio")
+    if pca is not None and len(pca) >= 9:
+        stats["pca_pc2_9_explained_variance_ratio"] = np.asarray(pca[1:9], dtype=np.float64)
+
+
 def _stat_family(key: str) -> str:
     """Groups a compute_summary_stats() scalar key into its distributional
     "family" by stripping a trailing _mean/_std/_p<N> suffix -- e.g.
@@ -948,6 +975,7 @@ def run_trial(trial: optuna.Trial, config: dict, target_stats: dict) -> float:
         percentiles=tuple(config["stats_percentiles"]),
         seed=config["stats_seed"],
     )
+    _add_pca_pc2_9_key(candidate_stats)
     trial.set_user_attr(
         "candidate_pca_tail_participation_ratio",
         candidate_stats.get("pca_tail_participation_ratio", float("nan")),
@@ -1132,6 +1160,7 @@ def run(config_path: str) -> optuna.Study:
             percentiles=tuple(config["stats_percentiles"]),
             seed=config["stats_seed"],
         )
+    _add_pca_pc2_9_key(target_stats)
     print(
         f"reference: n_cells={target_stats['n_cells']}  n_genes={target_stats['n_genes']}  "
         f"gene_mean_mean={target_stats['gene_mean_mean']:.4f}  "

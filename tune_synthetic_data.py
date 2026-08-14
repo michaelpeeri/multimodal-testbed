@@ -327,20 +327,30 @@ See synthetic_tuning_config.example.json for a full example. Notable keys
                             (removed again after that trial's simulation,
                             unless grn_archive_dir is also set -- see below).
     grn_archive_dir        : str|None, default None (disabled) -- if set,
-                            every trial's GRN CSV (kept, not deleted) and a
+                            every trial's GRN CSV (kept, not deleted), a
                             JSON diagnostics dict (from
                             generate_sergio_grn_from_reference's
                             `diagnostics` parameter -- winner_mr/vote_margin/
                             n_ambiguous_flipped/n_aligned_edges per target
                             gene, mr_load, n_distinct_winners,
-                            top1_winner_share) are written to
-                            {grn_archive_dir}/trial{N}.grn.csv and
-                            {grn_archive_dir}/trial{N}.diagnostics.json, for
-                            later offline analysis of how coherency_bias/
-                            canalization_strength/balancing_strength
-                            actually behaved across the search (e.g. "does
-                            top1_winner_share correlate with lower distance/
-                            better pca_explained_variance_ratio spread?").
+                            top1_winner_share), and a JSON dump of that
+                            trial's full compute_summary_stats() candidate_stats
+                            dict (see _jsonify_stats) are written to
+                            {grn_archive_dir}/trial{N}.grn.csv,
+                            {grn_archive_dir}/trial{N}.diagnostics.json, and
+                            {grn_archive_dir}/trial{N}.candidate_stats.json
+                            respectively, for later offline analysis of how
+                            coherency_bias/canalization_strength/
+                            balancing_strength actually behaved across the
+                            search (e.g. "does top1_winner_share correlate
+                            with lower distance/better
+                            pca_explained_variance_ratio spread?") and, via
+                            candidate_stats.json, which search-space params
+                            actually drive any given stats key (e.g.
+                            gene_var_mean/std, log_lib_size_std) at full
+                            trial-count statistical power -- best.pt only
+                            ever holds one (the best) trial's candidate_stats
+                            per study.
                             A handful of cheap scalar summaries derived from
                             the same diagnostics dict (n_distinct_winners,
                             top1_winner_share, frac_ambiguous_flipped,
@@ -757,6 +767,30 @@ def _add_pca_pc2_9_key(stats: dict) -> None:
         stats["pca_pc2_9_explained_variance_ratio"] = np.asarray(pca[1:9], dtype=np.float64)
 
 
+def _jsonify_stats(stats: dict) -> dict:
+    """Convert a compute_summary_stats()-style dict (a mix of plain floats/
+    ints and numpy arrays/scalars, e.g. pca_explained_variance_ratio,
+    dropout_curve_zero_frac, np.float64 summary values) into plain
+    JSON-serializable Python types. Used solely to archive full per-trial
+    candidate_stats to grn_archive_dir (see run_trial) -- read back with
+    plain json.load; arrays round-trip as lists, so re-wrap with
+    np.asarray(...) if doing array math on them later. Unlike the always-
+    computed cheap scalar user_attrs (n_distinct_winners, top_distance_terms,
+    ...), this gives full-resolution per-trial access to every stats key
+    (e.g. gene_var_mean/std, gene_corr_abs_*, log_lib_size_std) for post-hoc
+    correlation analysis against search-space params at full trial count,
+    rather than only the n=1 best trial's candidate_stats saved in best.pt."""
+    out = {}
+    for k, v in stats.items():
+        if isinstance(v, np.ndarray):
+            out[k] = v.tolist()
+        elif isinstance(v, (np.floating, np.integer)):
+            out[k] = v.item()
+        else:
+            out[k] = v
+    return out
+
+
 def _stat_family(key: str) -> str:
     """Groups a compute_summary_stats() scalar key into its distributional
     "family" by stripping a trailing _mean/_std/_p<N> suffix -- e.g.
@@ -981,6 +1015,12 @@ def run_trial(trial: optuna.Trial, config: dict, target_stats: dict) -> float:
         candidate_stats.get("pca_tail_participation_ratio", float("nan")),
     )
 
+    if config["grn_archive_dir"]:
+        archive_dir = Path(config["grn_archive_dir"])
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        with open(archive_dir / f"trial{trial.number}.candidate_stats.json", "w") as f:
+            json.dump(_jsonify_stats(candidate_stats), f)
+
     # --- hard guards against degenerate/collapsed candidates -- see
     # module docstring's "Hard guards against degenerate candidates" ---
     lib_size_zero_frac = candidate_stats.get("lib_size_zero_frac", float("nan"))
@@ -1019,7 +1059,21 @@ def run_trial(trial: optuna.Trial, config: dict, target_stats: dict) -> float:
         _prune(trial, "non_finite_distance")
 
     trial.set_user_attr("n_mrs", len(mr_ids))
-    worst = sorted(breakdown["terms"].items(), key=lambda kv: kv[1], reverse=True)[:5]
+    # Ranked by *weighted* contribution (weight * raw term), not raw term
+    # value -- sorting by raw value alone (the original behavior) surfaces
+    # whichever keys have the largest unweighted relative error regardless
+    # of their configured weight, which in practice meant this almost always
+    # showed the deliberately zero-weighted gene_mean_p*/gene_var_p*/
+    # mean_var_log_* family (confirmed the #1 raw term in ~65% of trials
+    # across the 20260813.* studies -- see AGENTS.md's Known Issues) rather
+    # than what's actually driving `distance`. Recompute from breakdown["terms"]
+    # directly (not this field) if you need the raw, unweighted values too.
+    stats_weights = config.get("weights") or {}
+    worst = sorted(
+        breakdown["terms"].items(),
+        key=lambda kv: stats_weights.get(kv[0], 1.0) * kv[1],
+        reverse=True,
+    )[:5]
     trial.set_user_attr("top_distance_terms", {k: float(v) for k, v in worst})
 
     _save_if_best_artifact(

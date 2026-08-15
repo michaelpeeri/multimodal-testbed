@@ -496,4 +496,204 @@ Single-file PyTorch research script (`vae-test.py`). No tests, no package struct
     - **User action required before running**: these `.20260814.*` studies
       themselves (needs torch/SERGIO, unavailable in this sandbox) -- not
       yet run or analyzed as of this session.
+- The `synthetic_tuning_20260814.0{0-7}` studies (8 seeds,
+  `synthetic_tuning_config.20260814.0{0-7}.json`, 250 trials each) were run
+  and analyzed (`.db`s + `checkpoints/best.pt` + `grn_diags/`, including the
+  new per-trial `candidate_stats.json` archives, copied in from the user's
+  machine). Findings:
+  - **Major, confirmed PCA-structure win**, attributable to `n_clusters`
+    6->15 (`.20260813`) plus the `pca_pc2_9_explained_variance_ratio` term
+    (`.20260813`): averaged over the 8 best trials, candidate PC1 now
+    reaches ~101% of target (vs. the ~54% gap that originally motivated the
+    whole coherency/canalization effort), and PC3-PC9 reach ~74-94% of
+    target (vs. ~45-60% in `.20260812`). True-best `distance` per study is
+    now **0.022-0.054** (vs. `.20260813`'s 0.032-0.068).
+  - **New dominant gap**: `gene_var_mean`/`gene_mean_mean` (candidates
+    average only ~18%/~40% of target magnitude across the 8 best trials) is
+    now the single largest weighted `distance` contributor in **8/8**
+    studies (previously masked by the larger PCA gap). `gene_var_std`
+    (~41%), `gene_corr_abs_std`/`p90` (~73%/~80%), and `log_lib_size_std`
+    (~81%) are smaller but consistent secondary undershoots.
+  - **Confirmed real (not unexplored-space) structural ceiling on
+    `lib_size_scale`**: this config's upper-bound widening `2.0` -> `3.5`
+    (specifically to test this) was never actually explored by TPE --
+    **100% of the 250 trials with `lib_size_scale > 2.0`** (and 80% of
+    those in `[1.5, 2.0]`) were hard-pruned via the `max_lib_size_zero_frac`
+    guard (`degenerate_lib_size_zero_frac`), before ever reaching the soft,
+    weighted objective. Since `lib_size_scale` is also the single strongest
+    driver of `gene_var_std`/`gene_corr_abs_std`/`log_lib_size_std`
+    (Spearman rho 0.65-0.92 pooled across 1750 completed trials), this hard
+    guard -- not a lack of trial budget -- is what's currently capping those
+    stats. `max_lib_size_zero_frac` raised `0.05` -> `0.10` in
+    `.20260815.*` (below) to test this directly.
+  - **Is there a real tradeoff between PCA structure and gene_mean/var/
+    dropout stats, or just an over-weighted objective?** Investigated in
+    depth (user question) and confirmed it's a **real, fairly hard,
+    knob-independent tradeoff, not primarily a weight-balance artifact**:
+    a joint rank-regression of `pca_pc2_9_explained_variance_ratio`-ratio-
+    to-target (`pc29_ratio`) and `gene_mean_mean`/`gene_var_mean`-ratio-to-
+    target on all 18 search-space knobs shows several knobs with *flipped
+    signs* (`lib_size_mean`: -0.34 on `pc29_ratio` vs. +0.73/+0.68 on
+    gene_mean/var ratio; `lib_size_scale`: -0.25 vs. +0.26/+0.42;
+    `outlier_prob`/`outlier_scale`: positive on `pc29_ratio`, negative on
+    gene_mean/var ratio). Binning all 1750 completed trials into deciles of
+    `pc29_ratio` shows a clean monotonic inverse relationship across the
+    *entire* range (decile 0 `pc29_ratio=0.35` -> `gene_var_ratio=0.44`;
+    decile 9 `pc29_ratio=1.18` -> `gene_var_ratio=0.13`), and **zero of the
+    1750 trials** achieve both `pc29_ratio>=0.9` and `gene_var_ratio>=0.5`
+    simultaneously (best PCA-matching trials cap out at `gene_var_ratio`
+    ~=0.41; best gene_var-matching trials cap out at `pc29_ratio`~=0.66).
+    Critically, this negative correlation barely weakens when statistically
+    controlling for the knobs above (partial rank-corr rho=-0.55, vs. -0.50
+    raw) or when restricting to a narrow `lib_size_mean` band (rho=-0.66,
+    n=619) -- so it isn't merely "TPE happened to pick confounded
+    combinations," it's close to a real Pareto frontier in the parameter
+    space actually explored. However, `canalization_strength`/`decays` move
+    `pc29_ratio` with much less cost to gene_mean/var than the knobs above,
+    and all of the implicated knobs (`lib_size_mean/scale`, `outlier_prob/
+    scale`) are *post-hoc technical-noise* stages applied after SERGIO's
+    biological simulation -- so this may reflect an upstream biological-
+    magnitude ceiling (the fixed `mr_rate_low/high=[1,5]` MR production-rate
+    range, never varied in any study to date) forcing technical-noise knobs
+    to compensate, rather than an unfixable property of the simulator. See
+    the `.20260815.pilot_mr{5,6,8}.*` pilot studies below, which test this
+    directly.
+  - `canalization_strength`'s effect on the actual mechanism/outcome is
+    now on firmer footing than prior rounds: a rank-based multiple
+    regression of `distance` on all 18 knobs jointly shows a real,
+    significant, independent effect (partial coef -0.111, p<0.001) --
+    higher canalization -> lower distance, net of everything else -- a
+    materially more confident result than `.20260813`'s marginal-only
+    correlations (still second-order next to `outlier_prob/scale`/
+    `dropout_shape`/`lib_size_scale/mean`, each |coef| 0.12-0.32).
+    `coherency_bias` shows a small but significant *adverse* net effect
+    (+0.076, p=0.002) once other knobs are controlled for -- worth
+    watching, not yet acted on. Also, `.20260813`'s flagged anti-
+    correlation between `canalization_strength` and its own `mean_
+    canalization_alignment_frac` diagnostic (rho=-0.24, "worth a closer
+    look") has now flipped to a real *positive* correlation (marginal
+    rho=+0.177, p=9e-14; still +0.088, p=2e-4 after partialling out
+    `balancing_strength`/`coherency_bias`/`path_decay`) -- likely a side
+    effect of the `n_clusters` 6->15 change, and a reassuring sign the
+    mechanism's internal mechanics are behaving more sensibly, not less,
+    as the surrounding config has evolved.
+  - `.20260813`'s hypothesis attributing study 6's poor performance partly
+    to a low `noise_params` value in its best trial does not hold up under
+    this session's much larger pooled sample (n=1750 vs. the n=8 used
+    before): `noise_params` is not a significant net predictor of either
+    `distance` or `gene_var_mean` once other knobs are controlled for --
+    that specific hypothesis should be considered retracted.
+  - Resulting changes (this session): new `synthetic_tuning_config.
+    20260815.0{0-7}.json` (`max_lib_size_zero_frac` `0.05` -> `0.10`;
+    `n_trials`/`timeout` both `null`, see the interrupt/resume changes
+    below; `mr_rate_high` deliberately left unbumped at `5.0` pending the
+    pilot below) and nine new pilot configs `synthetic_tuning_config.
+    20260815.pilot_mr{5,6,8}.0{0,1,2}.json` (3 seeds x `mr_rate_high` in
+    {5.0 (baseline), 6.0, 8.0}, `n_trials=80`, `max_lib_size_zero_frac` left
+    at the `.20260814` baseline `0.05` to isolate `mr_rate_high` as the only
+    variable under test). Also added to `tune_synthetic_data.py`:
+    - `_install_graceful_stop_handler(study)`: installs SIGINT/SIGTERM
+      handlers that call `Study.stop()` (lets the in-flight trial finish
+      normally, then falls through to `run()`'s usual post-loop summary-
+      writing) on the first signal, and raise `KeyboardInterrupt` directly
+      on a second signal for an immediate exit. Wired into `run()` around
+      the `study.optimize()` call. Motivated by: (1) a raw, unhandled
+      Ctrl+C mid-trial wastes whatever fraction of that trial's multi-
+      minute SERGIO run was in flight, and (2) it skips `run()`'s summary-
+      writing code entirely (only reached if `study.optimize()` returns
+      normally) even though the study's own storage/`best.pt` are already
+      safely persisted regardless. Verified with a real (non-stub) Optuna
+      study in `/tmp/opencode/tuning_venv` using a fake objective and
+      `os.kill(os.getpid(), signal.SIGINT)` to simulate an external
+      interrupt mid-trial: (a) a single SIGINT lets the in-flight trial
+      complete normally and stops the loop right after it, no trials lost;
+      (b) resuming the same study object (or, separately, a fresh Python
+      process against the same sqlite storage) for more trials afterward
+      correctly continues from the existing trial count; (c) a second
+      SIGINT forces an immediate `KeyboardInterrupt` (that one trial marked
+      FAIL, as expected); (d) `n_trials=None` (unbounded) runs until
+      stopped by a signal, not just until an arbitrary large count.
+    - `config["n_trials"]`/`config["timeout"]` may now be `null` (Python
+      `None`) for an unbounded run (`study.optimize(n_trials=None,
+      timeout=None)`, stopped only via the above signals) -- validated in
+      `load_config` (must be `null` or a positive int/number). Intended
+      workflow (documented in the module docstring's new "Interrupting/
+      resuming a run" section and in `run()`'s own docstring): launch each
+      seed's process with an unbounded config and let it run for as long as
+      you want, rather than being bound to a fixed `n_trials` that some
+      seeds exhaust much sooner than others (per `.20260813`/`.20260814`,
+      several seeds still improved meaningfully in their final 20% of a
+      fixed trial budget) -- then SIGINT/SIGTERM individual processes once
+      satisfied with their progress. Caveat documented alongside this:
+      `build_sampler()` constructs a fresh `TPESampler(seed=0)` on every
+      `run()` call, so a study stopped/resumed multiple times will suggest
+      a slightly different trial sequence than one uninterrupted run of the
+      same eventual trial count (both valid, history-informed TPE behavior,
+      just not bit-for-bit identical).
+    - **User action required**: run the `.20260815.pilot_mr{5,6,8}.*` pilot
+      studies first (needs torch/SERGIO, unavailable in this sandbox) and
+      compare their `gene_mean_ratio`/`gene_var_ratio`/`pc29_ratio` before
+      deciding whether to bump `mr_rate_high` in the full `.20260815.0{0-7}`
+      sweep (currently left at the unbumped default) and launching it.
+- The `synthetic_tuning_20260815_pilot_mr{5,6,8}.0{0,1,2}` pilot studies (9
+  studies: 3 seeds x `mr_rate_high` in {5.0 baseline, 6.0, 8.0}, 80 trials
+  each, `max_lib_size_zero_frac` left at the `.20260814` baseline 0.05 to
+  isolate this one variable) were run and analyzed (`.db`s +
+  `checkpoints/best.pt` copied in from the user's machine). Sanity-checked:
+  each study's `best.pt`'s `mr_state` correctly spans `[1, mr_rate_high]` as
+  configured, and recomputed `compute_stats_distance` reproduces every
+  stored `distance` exactly. Findings:
+  - **`mr_rate_high=8.0` confirmed as a real, fairly clean win**: averaged
+    over 3 seeds, `gene_mean_mean`/`gene_var_mean` ratio-to-target nearly
+    doubled (0.377->0.690, 0.152->0.278 vs. the `mr_rate_high=5.0`
+    baseline) with **no measurable cost** to `pca_pc2_9_explained_variance_
+    ratio` match (flat ~0.64-0.67 across all three `mr_rate_high` values
+    tested). Notably, `mr_rate_high=8`'s per-seed values are tightly
+    clustered (`gene_mean_ratio` 0.68-0.70, `gene_var_ratio` 0.267-0.287)
+    versus the noisier, more seed-dependent `mr_rate_high=5`/`6` groups
+    (e.g. `gene_mean_ratio` 0.32-0.44 / 0.31-0.69) -- a reliable effect,
+    not a lucky seed. Best-trial `lib_size_scale` also fell monotonically
+    (0.83->0.75->0.62) as `mr_rate_high` rose 5->6->8, consistent with TPE
+    substituting away from the lib_size_scale/lib_size_mean knobs shown
+    (`.20260814` entry above) to be in real tension with PCA structure,
+    rather than this being an independent additional effect. Caveat: only
+    3 seeds/pilot value -- a real, consistent-looking effect, but not a
+    large-sample confirmatory result. Resulting change: `mr_rate_high`
+    bumped `5.0` -> `8.0` in the full `synthetic_tuning_config.
+    20260815.0{0-7}.json` sweep configs (`max_lib_size_zero_frac` there
+    remains at `0.10` per the `.20260814` entry above -- both changes now
+    combined in that sweep).
+  - **New, more consequential finding while sanity-checking the pilot**:
+    `n_mrs` (a direct readout of GRN topology) varied substantially and
+    unsystematically across **all 9** pilot studies (43-100) despite every
+    one of them sharing the same fixed `grn_seed=42` -- and checking back,
+    the original `synthetic_tuning_20260814.0{0-7}` studies show the exact
+    same issue (`n_mrs` 40-104 across the 8 nominally-same-topology
+    seeds). This is the pre-existing, already-documented-but-not-yet-fixed
+    `_sample_connected_subgraph` non-determinism bug (see this file's
+    earlier Known Issues entry: plain Python `set` iteration order depends
+    on the interpreter's per-process-randomized `PYTHONHASHSEED`) --
+    confirmed here, for the first time, to have actually manifested across
+    every real multi-seed study batch run so far (each seed/pilot-arm runs
+    in its own OS process), not just in the original 3x-repro isolated
+    test. Practical impact: every "per-seed" comparison made in this
+    project to date (including `.20260814`'s "study 6 was the worst seed"
+    observation, and this pilot's own mr5/mr6/mr8 groups) has had GRN
+    topology as an uncontrolled extra confound alongside the intended
+    `sim_seed` variation -- though the `mr_rate_high=8` finding above held
+    up despite it, which if anything strengthens confidence in that result.
+    Resulting change: `tune_synthetic_data.py`'s `run()` now calls a new
+    `_warn_if_pythonhashseed_unset()` at startup, printing a loud warning
+    if `PYTHONHASHSEED` isn't set in the current process's environment
+    (can only warn/remind, not enforce or fix retroactively -- the hash
+    seed is fixed at interpreter startup, before this module's code ever
+    runs, so it cannot be corrected for from inside `run()`; every sibling
+    process for a given round must be launched with an identical
+    `PYTHONHASHSEED=<value>` environment variable set *before* invoking
+    python). Documented alongside `grn_seed` in the module docstring's
+    "Fixed vs tunable parameters" section too. **User action required**:
+    launch each of the 8 `.20260815.0{0-7}` sweep processes with a shared
+    `PYTHONHASHSEED` value (e.g. `PYTHONHASHSEED=0`) for `grn_seed=42` to
+    actually produce identical topology across all 8 this time, unlike
+    every prior multi-seed batch.
 

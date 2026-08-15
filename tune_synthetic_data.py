@@ -63,7 +63,14 @@ from top-level config keys -- they are not part of search_space. So are:
     RNG draws -- subgraph sampling, isolated-node repair -- all happen
     before the K/Hill-coefficient RNG draws in that function's single RNG
     stream, so fixing the seed while varying k_dist/hill_coeff_dist/
-    unknown_mode_repressor_prob cannot perturb the topology.)
+    unknown_mode_repressor_prob cannot perturb the topology.) This only
+    holds *within* one process, though -- across separate processes (e.g.
+    running several seeds in parallel, see "Usage" above), the same
+    grn_seed can still yield a *different* topology because
+    _sample_connected_subgraph's node/edge bookkeeping uses plain Python
+    sets whose iteration order depends on the interpreter's (by default
+    per-process-randomized) string-hash seed -- see AGENTS.md's Known
+    Issues, and run()'s startup PYTHONHASHSEED check/warning.
   - sim_seed: fixes make_synthetic_data6's own randomness (cluster-size
     split, cell subsampling/shuffling, MCAR mask -- unused here since
     missing_rate=0.0 during tuning) and mr_state's sampling seed, so every
@@ -458,6 +465,23 @@ mechanism's behavior across a finished (or in-progress) study, combining:
 
 See that function's own docstring for the full panel list.
 
+Interrupting/resuming a run
+------------------------------
+Send SIGINT (Ctrl+C) or SIGTERM once to stop a run gracefully: the
+in-flight trial finishes normally (scored and persisted like any other
+trial), then this exits the same way it would after exhausting config
+["n_trials"]/config["timeout"] -- summary included. Send either signal
+again to force an immediate exit instead (that one trial is marked FAIL;
+everything before it is unaffected either way). Re-running against the
+same config["storage"]/config["study_name"] afterwards (or after a plain
+completed run) resumes correctly and picks up where it left off. Set
+config["n_trials"] to null (and config["timeout"] to null too, for no
+wall-clock cap either) for an unbounded run driven purely by one of the
+above signals -- handy for running several concurrent per-seed studies
+each for as long as you want, rather than all being bound to one fixed
+trial count that some seeds will exhaust sooner than others. See run()'s
+own docstring for the full rationale/caveats.
+
 Dependencies note
 -------------------
 Like synthetic_data.py's own make_synthetic_data6/load_reference_h5ad, this
@@ -473,6 +497,7 @@ import os
 import pickle
 import re
 import shutil
+import signal
 import tempfile
 import time
 from pathlib import Path
@@ -620,6 +645,12 @@ _CONFIG_DEFAULTS = {
     "storage":      "sqlite:///synthetic_tuning.db",
     "study_name":   "tune_synthetic_data6",
     "n_trials":     30,
+    # Wall-clock cap in seconds, passed straight through to study.optimize()'s
+    # own timeout= argument -- None (default) means no wall-clock cap. Set
+    # both n_trials and timeout to null/None for an unbounded run, stopped
+    # only via SIGINT/SIGTERM (see _install_graceful_stop_handler / run()'s
+    # "Interrupting/resuming a run" docstring section below).
+    "timeout":      None,
     "sampler":      "tpe",
     "pruner":       "none",
     "output":       "tuned_synthetic_config.json",
@@ -675,6 +706,11 @@ def load_config(path: str) -> dict:
         raise ValueError(f"Unsupported sampler {config['sampler']!r}. Supported: {list(_SAMPLERS)}")
     if config["pruner"] not in _PRUNERS:
         raise ValueError(f"Unsupported pruner {config['pruner']!r}. Supported: {list(_PRUNERS)}")
+
+    if config["n_trials"] is not None and (not isinstance(config["n_trials"], int) or config["n_trials"] <= 0):
+        raise ValueError(f"config['n_trials'] must be null (unbounded) or a positive int, got {config['n_trials']!r}")
+    if config["timeout"] is not None and (not isinstance(config["timeout"], (int, float)) or config["timeout"] <= 0):
+        raise ValueError(f"config['timeout'] must be null (no cap) or a positive number of seconds, got {config['timeout']!r}")
 
     return config
 
@@ -1172,12 +1208,152 @@ def build_pruner(name: str):
     return _PRUNERS[name]()
 
 
+def _warn_if_pythonhashseed_unset() -> None:
+    """Print a loud warning if PYTHONHASHSEED isn't set to a fixed value.
+
+    generate_sergio_grn_from_reference's GRN-topology sampling
+    (_sample_connected_subgraph) has a pre-existing, documented (see
+    AGENTS.md's Known Issues), not-yet-fixed non-determinism bug: it
+    iterates plain Python `set`s whose order depends on the interpreter's
+    string-hash seed, which is randomized per-process by default. Since
+    this harness is meant to be run as several independent OS processes
+    (one per seed, see module docstring) that are each supposed to share
+    the *same* GRN topology via a common config["grn_seed"] -- varying only
+    config["sim_seed"] between them -- an unset (randomized) PYTHONHASHSEED
+    silently breaks that assumption: confirmed post-hoc across both the
+    synthetic_tuning_20260814.0{0-7} and synthetic_tuning_20260815_pilot_*
+    studies, whose n_mrs (a direct readout of GRN topology) varied
+    substantially (40-104) across nominally-same-grn_seed processes purely
+    from this effect, adding uncontrolled noise to every cross-seed
+    comparison made from that data.
+
+    This function can only check *this* process's own PYTHONHASHSEED (it
+    cannot enforce -- or even see -- what value any other concurrently-
+    launched sibling process used, since the hash seed is fixed at
+    interpreter startup, before this module's code ever runs) -- so it's a
+    reminder, not a guarantee: launch every sibling process (e.g. across
+    the 8 seeds of one tuning round) with the identical
+    `PYTHONHASHSEED=<some fixed value>` environment variable set *before*
+    invoking python, e.g.::
+
+        PYTHONHASHSEED=0 python tune_synthetic_data.py --config synthetic_tuning_config.20260815.00.json
+        PYTHONHASHSEED=0 python tune_synthetic_data.py --config synthetic_tuning_config.20260815.01.json
+        ...
+
+    for config["grn_seed"] to actually produce identical topology across
+    all of them, as intended.
+    """
+    value = os.environ.get("PYTHONHASHSEED")
+    if value is None:
+        tqdm.write(
+            "\n*** WARNING: PYTHONHASHSEED is not set -- generate_sergio_grn_from_reference's "
+            "GRN-topology sampling has a known non-determinism bug tied to the (by default "
+            "randomized-per-process) string-hash seed (see AGENTS.md's Known Issues). If you're "
+            "running several sibling processes (e.g. one per seed) that are meant to share the "
+            "same GRN topology via a common config['grn_seed'], they will NOT actually get the "
+            "same topology unless every one of them is launched with an identical "
+            "PYTHONHASHSEED=<fixed value> environment variable set before the python interpreter "
+            "starts (setting it from within this script is too late). This process will proceed "
+            "regardless -- this is a reminder, not a hard requirement. ***\n"
+        )
+    else:
+        tqdm.write(f"PYTHONHASHSEED={value!r} (fixed) -- make sure every sibling process uses the same value.")
+
+
+def _install_graceful_stop_handler(study: optuna.Study):
+    """Install SIGINT/SIGTERM handlers that ask *study* to stop gracefully
+    (via Study.stop()) rather than letting a raw KeyboardInterrupt propagate
+    out of whichever trial happens to be running.
+
+    Study.stop() only sets a flag checked *between* trials -- the
+    currently-running trial (potentially minutes into a SERGIO simulation)
+    finishes normally, is scored and persisted as usual, and only then does
+    study.optimize()'s loop exit, falling through to run()'s usual post-loop
+    summary-writing code. This avoids both wasting whatever fraction of the
+    in-flight trial's compute had already run, and silently skipping the
+    tuned_synthetic_config.json summary (which only gets written after
+    study.optimize() returns normally -- a raw KeyboardInterrupt propagating
+    out of run() would skip it, even though the study's own storage/best.pt
+    are already safely persisted regardless -- see run()'s own
+    "Interrupting/resuming a run" docstring section for the full rationale).
+
+    A second SIGINT/SIGTERM (e.g. an impatient repeated Ctrl+C) forces an
+    immediate KeyboardInterrupt instead of waiting for the current trial to
+    finish -- same safety properties as an unhandled Ctrl+C today (that one
+    trial is marked FAIL, everything before it is untouched), just opt-in
+    for when you don't want to wait out a slow trial.
+
+    If a signal arrives *outside* study.optimize()'s call (e.g. while still
+    loading target_stats, or after it has already returned) -- Study.stop()
+    would raise RuntimeError ("supposed to be invoked inside an objective
+    function or a callback") -- so this checks study._thread_local.
+    in_optimize_loop first and just raises KeyboardInterrupt directly in
+    that case, matching plain default behavior.
+
+    Returns (prev_sigint_handler, prev_sigterm_handler) -- restore with
+    signal.signal(signal.SIGINT, prev_sigint_handler) etc. (run() does this
+    in a finally: block) so this is safe to call from a library context too,
+    not just a standalone script.
+    """
+    signal_count = {"n": 0}
+
+    def _handler(signum, frame):
+        signal_count["n"] += 1
+        signame = signal.Signals(signum).name
+        if signal_count["n"] == 1 and getattr(study._thread_local, "in_optimize_loop", False):
+            tqdm.write(
+                f"\n=== received {signame} -- finishing the in-flight trial, then stopping "
+                f"gracefully (send {signame} again to force an immediate exit instead) ==="
+            )
+            study.stop()
+            return
+        tqdm.write(f"\n=== received {signame} -- forcing an immediate exit ===")
+        raise KeyboardInterrupt(f"forced exit on {signame}")
+
+    prev_sigint = signal.signal(signal.SIGINT, _handler)
+    prev_sigterm = signal.signal(signal.SIGTERM, _handler)
+    return prev_sigint, prev_sigterm
+
+
 def run(config_path: str) -> optuna.Study:
     """Plain entry point, safe to call directly from a notebook cell:
 
         import tune_synthetic_data
         study = tune_synthetic_data.run("synthetic_tuning_config.json")
         best = study.best_trial
+
+    Interrupting/resuming a run
+    ----------------------------
+    Sending SIGINT (Ctrl+C) or SIGTERM once asks the study to stop
+    gracefully: the in-flight trial finishes normally (scored and persisted
+    like any other trial), then this function proceeds through its usual
+    post-loop summary-writing exactly as if config["n_trials"]/config
+    ["timeout"] had been reached naturally. Sending either signal again
+    forces an immediate exit instead (same data-safety properties as an
+    unhandled Ctrl+C: the in-flight trial is marked FAIL, everything before
+    it is untouched). Either way, config["storage"] already durably records
+    every *completed* trial as it finishes (not batched at the end) and
+    _save_if_best_artifact keeps config["artifact_dir"]/best.pt in sync with
+    the true best completed trial so far -- so no tuning progress is ever
+    lost to an interruption, graceful or not.
+
+    Set config["n_trials"] to null (and, if you also want no wall-clock
+    cap, config["timeout"] to null too) for an unbounded run that only ever
+    stops via one of the above signals -- e.g. to let several concurrent
+    per-seed studies (one process each, see module docstring) each run for
+    as long as you want rather than being bound to a fixed trial count that
+    some seeds will exhaust much sooner than others. Simply re-invoking
+    run() again against the same config["storage"]/config["study_name"]
+    (whether after a graceful stop, a forced exit, or a completed fixed-
+    n_trials run) resumes correctly -- optuna.create_study(...,
+    load_if_exists=True) below reconnects to every historical trial already
+    in storage, and the TPE sampler rebuilds its surrogate model from that
+    full history on every call (it keeps no state of its own between
+    invocations). One caveat: build_sampler() constructs a fresh
+    TPESampler(seed=0) on every run() call, so a study stopped and resumed
+    several times will suggest a slightly different trial sequence than one
+    uninterrupted run of the same eventual trial count -- both are valid,
+    history-informed TPE behavior, just not bit-for-bit identical.
 
     Persisted in config["storage"] under config["study_name"], so it can be
     reloaded/resumed later via optuna.load_study() even without calling
@@ -1187,6 +1363,7 @@ def run(config_path: str) -> optuna.Study:
     see module docstring's "output" key description.
     """
     config = load_config(config_path)
+    _warn_if_pythonhashseed_unset()
 
     # See tuning.py's identical rationale: relies on trial_summary_callback
     # instead of Optuna's noisy default per-trial logging.
@@ -1272,17 +1449,26 @@ def run(config_path: str) -> optuna.Study:
     )
 
     target_desc = config["target_stats_path"] or config["reference_h5ad_path"]
-    print(
-        f"\n=== Tuning synthetic_data6 against {target_desc!r} "
-        f"({config['n_trials']} trials) ==="
+    budget_desc = (
+        f"{config['n_trials']} trials" if config["n_trials"] is not None
+        else (f"unbounded, timeout={config['timeout']}s" if config["timeout"] is not None
+              else "unbounded -- stop via SIGINT/SIGTERM")
     )
+    print(f"\n=== Tuning synthetic_data6 against {target_desc!r} ({budget_desc}) ===")
+
+    prev_sigint, prev_sigterm = _install_graceful_stop_handler(study)
     start = time.monotonic()
-    study.optimize(
-        lambda trial: run_trial(trial, config, target_stats),
-        n_trials=config["n_trials"],
-        show_progress_bar=True,
-        callbacks=[trial_summary_callback],
-    )
+    try:
+        study.optimize(
+            lambda trial: run_trial(trial, config, target_stats),
+            n_trials=config["n_trials"],
+            timeout=config["timeout"],
+            show_progress_bar=True,
+            callbacks=[trial_summary_callback],
+        )
+    finally:
+        signal.signal(signal.SIGINT, prev_sigint)
+        signal.signal(signal.SIGTERM, prev_sigterm)
     elapsed = time.monotonic() - start
     print(
         f"=== done in {elapsed / 60:.1f}m -- "

@@ -34,7 +34,7 @@
     "gene_corr_abs_p50": 3.0,
     "gene_corr_abs_p90": 3.0,
     "pca_explained_variance_ratio": 0.0,
-    "pca_tail_participation_ratio": 6.0,
+    "pca_tail_participation_ratio": 0.0,
     "pca_pc2_9_explained_variance_ratio": 0.0,
     "zero_frac": 3.0,
     "dropout_curve_zero_frac": 3.0,

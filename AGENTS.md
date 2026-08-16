@@ -989,6 +989,24 @@ Single-file PyTorch research script (`vae-test.py`). No tests, no package struct
     level (pooled per-trial medians, not just the 8 best trials),
     `gene_mean_mean`/`gene_var_mean` ratio-to-target improved from
     0.493/0.216 (`.20260815`) to 0.736/0.304 (`.20260816`).
+    **Correction (added in the `.20260817` analysis session, see that
+    entry below for full detail): this specific "joint-optimum region"**
+    ***claim is methodologically flawed*** **and should not be relied on.**
+    `ratio>=threshold` permits arbitrary overshoot (a candidate at 3x
+    target still counts as ">=0.9"), and the 14 qualifying trials turn out
+    to be early-TPE-startup outlier draws that rank near-worst (~774/918)
+    on overall weighted `distance` -- i.e. this metric was measuring
+    "somewhere past the target in both directions", not "a good
+    simultaneous match". Re-measured with a proper two-sided |ratio-1|
+    deviation-from-target criterion, only 6/918 trials match *both* stats
+    within +/-20%, all rank similarly poorly overall, and the two
+    deviations are actually weakly *positively* correlated (rho~+0.27,
+    not negative) -- i.e. no hard trade-off (the standardized-PCA fix's
+    real achievement, still valid), but also no free-lunch joint-optimum
+    region to exploit (this specific claim, retracted). The `rho=+0.062`
+    raw-ratio decoupling finding itself is unaffected by this correction
+    (ratio-vs-ratio correlation, not the threshold-count claim) and still
+    stands.
   - **New wrinkle, not previously flagged: the standardized PCA family's
     other half doesn't share this decoupling, and actively fights the half
     that does.** `pca_standardized_tail_participation_ratio` -- weighted
@@ -1062,5 +1080,122 @@ Single-file PyTorch research script (`vae-test.py`). No tests, no package struct
     tail-participation-ratio term lets TPE actually reach the low-tension
     joint-optimum region the `.20260816` pooled data shows now exists,
     rather than the wash seen at the best-trial level this round.
+- The `synthetic_tuning_20260817.0{0-7}` studies (8 seeds,
+  `synthetic_tuning_config.20260817.0{0-7}.json` --
+  `pca_standardized_tail_participation_ratio` weight `6.0`->`0.0`, everything
+  else unchanged from `.20260816.*`, 80-97 completed trials each) were run
+  and analyzed (`.db`s + `checkpoints/best.pt` + `grn_diags/`, including
+  per-trial `candidate_stats.json`, copied in from the user's machine).
+  Sanity checks all clean (same pattern as every prior round): every
+  `best.pt`'s `trial_number`/`distance` matches its `.db`'s true argmin
+  exactly. Findings:
+  - **The hoped-for "unlock" of `gene_mean_mean`/`gene_var_mean` did not
+    materialize, but the PCA term itself did improve as expected.**
+    Recomputing weighted `top_distance_terms` breakdowns for all 8
+    `best.pt`s under the `.20260817` weights:
+    `pca_standardized_pc2_9_explained_variance_ratio` is the #1 weighted
+    contributor in only 3/8 studies now (down from 5/8 under `.20260816`'s
+    weights, where it competed with the now-zeroed tail term) -- and its
+    own best-trial match improved (mean ratio-to-target 0.515->0.579
+    across the 8 best trials). But `gene_var_mean_ratio`/
+    `gene_mean_mean_ratio` at the best-trial level did *not* improve --
+    flat-to-slightly-worse (0.231->0.214 / 0.586->0.535 mean across best
+    trials), and aggregate true-best `distance` is flat (mean
+    0.0587->0.0592 across the 8 seeds, well within ordinary per-seed
+    noise either way). `gene_var_mean`/`gene_var_std`/`gene_corr_abs_std`/
+    `gene_corr_abs_p90` are now the dominant weighted-`distance` drivers in
+    5/8 studies' best trials (previously masked by PCA-term dominance).
+  - Pooled per-trial analysis (825 completed trials, all 8 studies)
+    independently reconfirms the `.20260816` decoupling finding on fresh
+    data: `pca_standardized_pc2_9_explained_variance_ratio`-ratio vs.
+    `gene_var_mean_ratio` rho=+0.084 (p=0.015, still near-zero) vs. the raw
+    family's rho=-0.754 -- consistent with `.20260816`'s +0.062. No
+    regression in the core finding.
+  - `lib_size_scale`'s pruning ceiling is unchanged by any of this
+    session's PCA-term work: max *completed* value 1.758 (search space
+    allows up to 3.5), pruned trials cluster at mean 2.09 -- identical
+    pattern to every round since `.20260814`/`.20260815`.
+  - **Canalization L1-renormalization fix (introduced alongside the
+    standardized-PCA family, see the entry above this round's siblings)
+    verified at full-pipeline scale, not just the standalone reference-GRN
+    check.** Pooling all completed trials with archived `candidate_stats`
+    and joining against each trial's own `canalization_strength` param, a
+    rank-regression of `gene_var_mean_ratio` on all 18 search-space knobs
+    jointly shows `canalization_strength`'s own partial coefficient
+    shrinking from +0.036 (`.20260814`, pre-fix, n=1750) / +0.060
+    (`.20260815`, pre-fix, n=2137) to +0.008 (`.20260816`, post-fix, n=786)
+    / -0.006 (`.20260817`, post-fix, n=699) -- i.e. the fix measurably
+    removed `canalization_strength`'s small independent coupling to gene
+    magnitude in the real pipeline, not just in the isolated reference-GRN
+    test. However this effect was *always* second-order: `lib_size_mean`/
+    `lib_size_scale` (partial coef +0.5 to +0.8) and `outlier_scale`/
+    `outlier_prob` (-0.15 to -0.32) dominate this regression by an order of
+    magnitude in all four rounds, pre- and post-fix alike -- the fix is
+    real and correctly targeted, but was never going to be the lever that
+    closes the much larger `gene_var_mean`/`gene_mean_mean` gap. Side
+    finding, not yet root-caused: `canalization_strength`'s correlation
+    with its own *intended* effect (`pca_standardized_pc2_9_explained_
+    variance_ratio`-ratio) is now weak and not clearly significant
+    post-fix (rho=+0.065 `.20260816`/+0.049 `.20260817`, p=0.07/0.20,
+    n=786/699) vs. the pre-fix/raw-metric `.20260815` finding of rho=+0.235
+    (n=2137) -- plausibly just the standardized-vs-raw metric swap and/or
+    smaller n, not investigated further this session per user direction.
+  - **Methodology correction** (see the retraction note added to the
+    `.20260816` entry above): re-examining that round's "14/918 trials
+    jointly achieve the low-tension optimum" claim with a proper two-sided
+    +/-20%-of-target match (rather than the original `ratio>=threshold`,
+    which permits arbitrary overshoot) finds only 6/825 `.20260817` trials
+    qualify (same 6 trials, byte-identical, reproduce in `.20260816`'s own
+    pool too -- both rounds share early TPE-sampler-seed=0 startup trials
+    before their differing objectives diverge later trials), and all 6
+    rank near-worst overall (~689/825 by total weighted `distance`) --
+    i.e. they are wild early-exploration draws that happen to overshoot
+    past both thresholds, not genuinely good candidates. Measuring
+    deviation-from-target (`|ratio-1|`) rather than raw ratio,
+    `pca_standardized_pc2_9_explained_variance_ratio` and `gene_var_mean`
+    are actually weakly *positively* correlated (rho=+0.24, p=2.5e-12) --
+    good/bad matches on the two stats tend to co-occur (both driven by
+    some shared "how well-tuned is this candidate overall" quality) rather
+    than trading off. Net picture: no hard antagonism between these two
+    specific stats (the standardized-PCA fix's real, valid achievement),
+    but no free-lunch joint-optimum region to exploit either -- genuinely
+    nailing both simultaneously is just rare, and tightly bound up with
+    doing well on the other ~14 scored stats too.
+  - **New lever identified for the `lib_size_scale` ceiling**: within the
+    band where pruning starts (`lib_size_scale` in (1.2, 2.5), n=913 pooled
+    completed+pruned trials across all four `.20260814`-`.20260817`
+    rounds), a rank-regression of `lib_size_zero_frac` (the pruning
+    trigger) on all 18 knobs shows `dropout_percentile` (+0.294, lower
+    helps), `lib_size_mean` (-0.247, higher helps -- within its current
+    narrow `[3,6]` band), and `outlier_scale`/`outlier_prob`/`outlier_mean`
+    (-0.15 to -0.21 each, higher helps) as real secondary predictors,
+    alongside `lib_size_scale` itself (+0.553, expected). All four
+    already-implicated knobs are already free in the search space -- this
+    suggests the ceiling isn't an absolute wall, just a joint region TPE
+    hasn't consistently found yet, rather than evidence for widening any
+    search-space bound at this point.
+  - Resulting change (this session), new `synthetic_tuning_config.
+    20260818.0{0-7}.json` (cloned from `.20260817.0{0-7}`, single change):
+    `mr_rate_high` `8.0` -> `5.0`. This is a deliberately isolated retest
+    of the `.20260815.pilot_mr{5,6,8}` finding (`mr_rate_high=8` nearly
+    doubled `gene_mean_mean`/`gene_var_mean` match over 3 seeds/80 trials
+    with `max_lib_size_zero_frac` held at the old 0.05 baseline) which did
+    *not* replicate in the full `.20260815.0{0-7}` sweep -- but that sweep
+    confounded the `mr_rate_high` change with a simultaneous
+    `max_lib_size_zero_frac` 0.05->0.10 bump, so it was never a clean A/B.
+    This time, `.20260817.0{0-7}}` (already run, `mr_rate_high=8.0`,
+    `max_lib_size_zero_frac=0.10`) serves as the "mr=8" arm directly --
+    `.20260818.0{0-7}` is the matching "mr=5" arm at the identical guard
+    value (0.10) and every other setting, giving a true isolated comparison
+    for the first time. No weight changes and no search-space bound changes
+    this round (deliberately, to avoid re-confounding with this session's
+    PCA-term work or prematurely acting on the `lib_size_scale`-headroom
+    lead above before seeing if a fresh run finds it unassisted).
+  - **User action required**: run the 8 `.20260818.0{0-7}` processes (same
+    unbounded/graceful-stop workflow, shared `PYTHONHASHSEED`), aiming for
+    a comparable ~80-100 completed trials per seed to `.20260817` for a
+    clean comparison, then copy back `.db`s/`checkpoints/best.pt`/
+    `grn_diags/` (including per-trial `candidate_stats.json`) for analysis
+    against the existing `.20260817` (mr=8) data.
 
 

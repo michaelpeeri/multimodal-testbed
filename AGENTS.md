@@ -696,4 +696,267 @@ Single-file PyTorch research script (`vae-test.py`). No tests, no package struct
     `PYTHONHASHSEED` value (e.g. `PYTHONHASHSEED=0`) for `grn_seed=42` to
     actually produce identical topology across all 8 this time, unlike
     every prior multi-seed batch.
+- The `synthetic_tuning_20260815.0{0-7}` studies (8 seeds,
+  `synthetic_tuning_config.20260815.0{0-7}.json` -- `mr_rate_high` bumped
+  5.0->8.0 per the pilot above, `max_lib_size_zero_frac` 0.05->0.10,
+  unbounded `n_trials`/graceful-stop workflow instead of a fixed 250 --
+  each seed's process actually run to completion at 242-331 trials, not
+  interrupted) were analyzed (`.db`s + `checkpoints/best.pt` + `grn_diags/`,
+  including per-trial `candidate_stats.json`, copied in from the user's
+  machine). The user ran each of the 8 processes with a shared
+  `PYTHONHASHSEED`, confirmed working for the first time: `n_mrs=84`
+  identically across **every one of 2394 pooled trials in all 8 studies**
+  (vs. 40-104 varying per study in every prior multi-seed batch) -- GRN
+  topology is no longer a confound in this round's cross-seed comparisons.
+  Also rendered `plot_grn_diagnostics` for all 8 studies for the first time
+  against *real* (non-synthetic-stub) data --
+  `plots/tune_diags_20260815.0{0-7}.png` -- all 8 panels show sensible,
+  real data (e.g. study 06's panel 2 shows `n_distinct_winners` climbing
+  from 49 to a hard ceiling of 69 as `balancing_strength` approaches its
+  upper search bound 1.5, and panel 6 tracks the target PCA curve closely
+  through PC1-13 before under-shooting the tail). Findings:
+  - Sanity checks clean throughout (unlike several earlier rounds): every
+    study's `best.pt` `distance`/`candidate_stats` reproduce exactly via
+    `compute_stats_distance`, and every `best.pt`'s `trial_number` matches
+    its `.db`'s true argmin.
+  - True-best `distance` per study: **0.027-0.060** (mean 0.038) -- in the
+    same range as `.20260814`'s 0.022-0.054 (not a regression), but *not*
+    the improvement the `mr_rate_high` pilot predicted (see below).
+    `gene_var_mean`/`gene_mean_mean` remain the single largest weighted
+    `distance` contributor in **8/8** studies (candidates average only
+    ~20%/~44% of target magnitude, essentially unchanged from
+    `.20260814`'s ~18%/~40%); PCA structure is also essentially unchanged
+    (PC1 ratio-to-target averages 92% over the 8 best trials, range
+    68-120%; PC2-9 averages 87%, range 55-110%). New minor finding:
+    `zero_frac` (overall dropout) is consistently **2-5 percentage points
+    higher than target in all 8 studies** (0.945-0.971 vs. target 0.923,
+    i.e. candidates are slightly *more* sparse than the reference) --
+    currently weighted (3.0) but never a top contributor, a secondary gap
+    rather than a driver.
+  - **The `mr_rate_high=8` pilot's conclusion did not replicate at full
+    scale**: comparing each of the 8 `.20260815` `best.pt`s directly
+    against its same-seed `.20260814` counterpart (`mr_rate_high=5`, only
+    difference besides `max_lib_size_zero_frac`), `gene_mean_mean`/
+    `gene_var_mean` ratio-to-target moved only 0.401->0.437 /
+    0.183->0.199 on average (vs. the pilot's 0.377->0.690 / 0.152->0.278
+    over 3 seeds/80 trials) -- a much smaller effect, and overall
+    `distance` was flat-to-slightly-worse (0.0366->0.0375 average), with
+    `log_lib_size_std` ratio and `pc1_ratio` both moving in the wrong
+    direction (0.814->0.760, 1.011->0.921). Confound: this sweep changed
+    `max_lib_size_zero_frac` (0.05->0.10) in the *same* config change as
+    `mr_rate_high`, unlike the pilot which isolated `mr_rate_high` alone --
+    so this isn't a clean refutation of the pilot's finding either, just
+    evidence the two changes together didn't deliver the hoped-for
+    combined win. **Recommend re-testing `mr_rate_high` in true isolation
+    at full trial budget** (not just an 80-trial/3-seed pilot) before
+    relying on it further.
+  - **The PCA-structure-vs-gene-magnitude tradeoff first identified in
+    `.20260814` is confirmed and, if anything, stronger** with this
+    round's larger, topology-controlled pooled sample (n=2137 completed
+    trials, all 8 studies, using the per-trial `candidate_stats.json`
+    archives for full resolution rather than just the 8 best trials):
+    `pca_pc2_9_explained_variance_ratio`-ratio-to-target
+    (`pc29_ratio`) vs. `gene_var_mean`-ratio-to-target: raw Spearman
+    rho=-0.61 (was -0.50 in `.20260814`), and a partial correlation
+    controlling for the four knobs `.20260814` implicated
+    (`lib_size_mean/scale`, `outlier_prob/scale`) is *stronger*, not
+    weaker (rho=-0.68) -- ruling those four knobs out as the full
+    explanation for the tradeoff. Only **1 of 2137** completed trials
+    achieved both `pc29_ratio>=0.9` and `gene_var_mean_ratio>=0.5`
+    simultaneously (best PCA-matching trials cap out at
+    `gene_var_mean_ratio`~=0.67; best gene_var-matching trials cap out at
+    `pc29_ratio`~=0.90). A rank-regression of `pc29_ratio` and
+    `gene_var_mean_ratio` jointly on all 18 search-space knobs newly
+    implicates `dropout_percentile` in the same tension (coefficient
+    +0.49 on `pc29_ratio` vs. -0.41/-0.50 on `gene_var_mean`/
+    `gene_mean_mean` ratio, a flipped sign matching the
+    `lib_size_scale`/`outlier_scale`/`outlier_prob` pattern already known).
+  - **`lib_size_scale`'s ceiling (`.20260814`'s widened-but-unexplored
+    upper bound) is now confirmed real, not an artifact of the pruning
+    guard**: loosening `max_lib_size_zero_frac` 0.05->0.10 barely moved
+    anything -- max *completed* `lib_size_scale` is 1.36-1.78 in this
+    round (guard 0.10) vs. 1.36-1.78 in `.20260814` (guard 0.05,
+    essentially identical range), and trials pruned for
+    `degenerate_lib_size_zero_frac` cluster at `lib_size_scale`
+    mean=2.37 (this round) vs. a per-study mean of 2.0-2.6 in
+    `.20260814` -- both rounds hit the same wall regardless of how lax
+    the guard is. Pushing `lib_size_scale` further to close the
+    `gene_var_mean` gap runs directly into cell/library dropout collapse,
+    not an unexplored region of the search space.
+  - Cross-trial correlation analysis (2137 completed trials, all 8
+    studies, first with topology fully controlled) reconfirms and
+    strengthens the coherency/canalization mechanics' internal
+    mechanism-consistency findings from `.20260813`/`.20260814`:
+    `coherency_bias` -> `frac_ambiguous_flipped` Spearman rho=+0.94 (was
+    +0.86), `balancing_strength` -> `n_distinct_winners` rho=+0.90 (was
+    +0.48), -> `mean_canalization_alignment_frac` rho=-0.92 (was -0.69),
+    all p~=0. `canalization_strength` -> its own `mean_canalization_
+    alignment_frac` diagnostic continues the positive trend flagged in
+    `.20260814` (rho=+0.28, up from +0.18/+0.09 in `.20260814`/`.20260813`
+    respectively) -- the mechanism's internal mechanics are behaving more
+    sensibly as the surrounding config (`n_clusters=15`, fixed target
+    depth, etc.) has evolved, not less. Effect on the actual PCA outcome
+    remains real but modest and still second-order: `canalization_
+    strength` -> `pc29_ratio` rho=+0.235, -> `pca_tail_participation_
+    ratio` rho=-0.32 (both a bit stronger than `.20260814`'s
+    |rho|<=0.18/0.29), but a joint rank-regression of `distance` on all 18
+    search-space knobs shows `canalization_strength`'s own net partial
+    coefficient has weakened to -0.02 (from `.20260814`'s -0.111) --
+    `lib_size_scale`/`outlier_prob`/`outlier_scale`/`outlier_mean`/
+    `hill_coeff` (|coef| 0.14-0.48) remain the dominant independent
+    drivers of `distance`, this mechanism is still a second-order lever.
+    `coherency_bias`'s `.20260814`-flagged small adverse net effect on
+    `distance` (+0.076) is not replicated here (net coefficient -0.04,
+    near zero) -- likely just noise given the small effect size either
+    way, not a clear reversal.
+  - **New search-space boundary-saturation signal**: `hill_coeff`
+    (range `[1.0, 3.0]`) is a real, significant predictor of lower
+    `distance` (marginal rho=-0.20, partial coefficient -0.14, both among
+    the largest of any knob) and **27% of each study's top-5%-by-distance
+    trials sit within 5% of the upper bound** -- the clearest per-knob
+    saturation signal found to date (`decays`/`outlier_mean`/
+    `outlier_scale` show a milder version of the same pattern, 12-16%).
+    Not yet acted on (would need a new config bumping this bound, e.g. to
+    4.0-5.0, and a fresh tuning round to test it) -- flagged for next
+    round.
+  - Seed-to-seed robustness, now with topology genuinely controlled:
+    aggregate/pooled conclusions above (the tension, the mechanics, the
+    `lib_size_scale` ceiling) rest on n>2000 trials and are trustworthy,
+    but per-seed point estimates still vary substantially (`distance`
+    0.027-0.060, `pc1_ratio` 0.68-1.20, `gene_var_mean_ratio` 0.15-0.25)
+    and best-trial `coherency_bias`/`canalization_strength`/
+    `balancing_strength`/`path_decay` values remain scattered across
+    nearly their full ranges across the 8 seeds' best trials -- consistent
+    with every prior round's finding that the objective doesn't strongly
+    prefer a particular setting of these four knobs specifically.
+  - No code bugs found this round. **User action required / recommended
+    before the next tuning round**: (1) re-test `mr_rate_high` in true
+    isolation (not bundled with a `max_lib_size_zero_frac` change) at full
+    trial budget, since the pilot's near-doubling of `gene_mean_mean`/
+    `gene_var_mean` ratio did not replicate here; (2) widen `hill_coeff`'s
+    upper bound past 3.0 given the saturation signal above; (3) resume the
+    4 studies that hadn't plateaued by their final 20% of trials (02, 03,
+    04, 06 improved 12-18% late) via the existing resumable/unbounded
+    workflow rather than starting fresh; (4) the PCA-vs-gene-magnitude
+     tradeoff looks like a genuine Pareto frontier at this point (not a
+     weight-balance or knob-confound artifact) -- worth an explicit
+     decision on which matters more for the downstream VAE task rather than
+     expecting a further config change to resolve both simultaneously.
+- Investigated (user question, no data available yet -- this entry
+  documents the mechanistic analysis + resulting code changes, not a
+  tuning-study result) *why* the PCA-vs-gene-magnitude tradeoff above is a
+  real mechanism rather than an artifact of TPE exploring correlated search
+  dimensions, and made two targeted changes to address it:
+  - Traced two concrete, code-level causes: (1) `generate_sergio_grn_from_
+    reference`'s `canalization_strength` reweights each edge's K by up to
+    2x (aligned) or down to 0.05x (disaligned), uncompensated -- since
+    SERGIO's non-MR production rate is `rate = sum_i |K_i| * hill_i(...)`
+    (each `hill_i` in [0, 1]), this directly shrinks a target's overall
+    production-rate ceiling whenever it has any disaligned edges (which
+    `balancing_strength`, needed for multiple distinct MR "winners" i.e.
+    real PC2+ structure, mechanically increases the incidence of); SERGIO's
+    `lib_size_effect` then renormalizes each *cell's* total to a fixed
+    drawn target, forcing every other gene to compete for whatever budget
+    this left behind -- a genuine, traceable path from "more canalization/
+    balancing structure" to "lower gene_mean/gene_var/library size,
+    higher dropout". (2) `compute_summary_stats`' PCA is computed on
+    mean-centered but never per-gene-standardized log1p data (plain
+    covariance, not correlation, matrix) -- so `pca_pc2_9_explained_
+    variance_ratio` and `gene_var_mean` are two different aggregations
+    (eigenstructure vs. arithmetic mean) of the *same* underlying per-gene
+    variances, not independent quantities, even before considering (1).
+  - **Fix for (1)**: each target's K-vector in `generate_sergio_grn_from_
+    reference` is now rescaled, immediately after canalization's alignment-
+    based reweighting, so `sum(|K_i|)` (the target's production-rate
+    ceiling) matches what it would have been without canalization --
+    unconditional (no new parameter), and provably a no-op at
+    `canalization_strength=0.0` (weight is always exactly 1.0 then, so
+    `scale == 1.0` exactly) -- so canalization now only reallocates *which*
+    regulator dominates a target's production (the mechanism that should
+    create between-cluster/PCA-relevant variance), without changing that
+    target's own expression level on average. Verified against the real
+    TRRUST reference GRN (`data/trrust_rawdata.human.tsv`, 200 genes,
+    `seed=42`), comparing this session's code against an unmodified copy of
+    the same function (`git show HEAD:synthetic_data.py`): (a) byte-
+    identical output at `canalization_strength=0.0` between old and new
+    code; (b) topology/regulator-lists/edge-signs/coop-states unaffected by
+    `canalization_strength` in the new code (only K magnitudes change); (c)
+    the *old* code's per-target `sum(|K_i|)` changed for 179/179 targets
+    between `canalization_strength=0.0` and `0.7` (confirming the bug); (d)
+    the *new* code's per-target `sum(|K_i|)` is preserved for 179/179
+    targets to within float rounding (max relative error 2e-16) across the
+    same comparison. `generate_sergio_grn_from_reference`'s `diagnostics`
+    dict (winner_mr/vote_margin/n_aligned_edges/etc.) also confirmed
+    unaffected (still populates sensibly with canalization/balancing/
+    coherency all nonzero).
+  - **Fix for (2)**: `compute_summary_stats` gained a `pca_standardized_*`
+    stat family -- `pca_standardized_explained_variance_ratio` (PCA on each
+    gene standardized to unit variance first, i.e. correlation-matrix PCA,
+    per-gene variance floored at 1e-6; same `X_struct`/`gene_idx` subsample
+    as the existing raw PCA) and `pca_standardized_tail_participation_
+    ratio` (that family's `pca_tail_participation_ratio` counterpart) --
+    computed *in addition to*, not replacing, the existing raw (covariance-
+    matrix) `pca_explained_variance_ratio`/`pca_tail_participation_ratio`.
+    `tune_synthetic_data.py`'s `_add_pca_pc2_9_key` was generalized (now
+    takes `src_key`/`dst_key` params, default unchanged) and is called
+    once per family at both call sites (`run()`/`run_trial()`), yielding a
+    new `pca_standardized_pc2_9_explained_variance_ratio` alongside the
+    existing `pca_pc2_9_explained_variance_ratio`. Verified with real
+    (non-stub) torch in `/tmp/opencode/tuning_venv`: on a synthetic
+    log1p-plausible matrix with real multi-module correlation structure,
+    rescaling one gene's column by 50x leaves `pca_standardized_explained_
+    variance_ratio` completely unchanged (max abs diff 0.0 across all 10
+    components) while the raw ratio shifts by up to 0.75 (same data); on
+    iid-normal (already-near-equal per-gene variance) data the two ratios
+    coincide (max diff 0.0012); a single exactly-constant injected gene
+    produces no NaN/inf (1e-6 floor); the subsampled-genes code path
+    (`n_structure_genes < n_genes`) produces correctly-shaped arrays for
+    both families; `_add_pca_pc2_9_key`'s generalization reproduces the
+    exact same raw-family output as before (no regression) plus correct
+    standardized-family slices, and is a no-op when the source array is
+    too short, matching its original contract.
+  - `synthetic_tuning_config.20260816.0{0-7}.json` (cloned from
+    `.20260815.0{0-7}`, everything else -- `mr_rate_high=8.0`,
+    `max_lib_size_zero_frac=0.10`, search space, `n_clusters=15` --
+    unchanged): `weights.pca_pc2_9_explained_variance_ratio` `6.0` -> `0.0`
+    (joining `pca_explained_variance_ratio`/`pca_tail_participation_ratio`,
+    already `0.0`, at zero weight -- the raw PCA family is still computed
+    for diagnostics/plotting, just no longer drives the objective, per
+    user direction: "calculated in addition to the existing two... but
+    replacing them in evaluating models"); added
+    `weights.pca_standardized_tail_participation_ratio: 6.0` and
+    `weights.pca_standardized_pc2_9_explained_variance_ratio: 6.0`
+    (matching the raw family's old weight, so this round's only real
+    change to the objective's balance is the metric-definition swap, not
+    how much the objective cares about PCA structure overall) plus
+    `weights.pca_standardized_explained_variance_ratio: 0.0` (mirroring why
+    the raw full-vector version is unweighted -- PC1 fidelity itself isn't
+    the target). `max_pca_pc1_ratio_factor`'s hard prune guard deliberately
+    left on the *raw* `pca_explained_variance_ratio[0]` (per user
+    direction) -- it targets a different failure mode (total-variance
+    collapse onto one axis) than the structure metric being swapped, kept
+    as an independent sanity check. `target_stats_path` points at a
+    not-yet-existing `...v4.mean.pickle` (the `.v3` pickle predates the
+    `pca_standardized_*` keys entirely) -- `run()` now warns at startup,
+    analogous to its existing raw-PCA-family check, if a loaded
+    `target_stats_path` lacks `pca_standardized_tail_participation_ratio`
+    or has a mismatched `pca_standardized_explained_variance_ratio` depth.
+  - **User action required before running**: (1) regenerate the target
+    stats pickle (`...v4.mean.pickle`) via the existing recipe in
+    `target_stats_path`'s own docstring against the real reference
+    `.h5ad` -- no code change to the recipe itself was needed (it already
+    stores whatever `compute_summary_stats()` returns generically), it
+    just needs to be rerun with this session's updated code (needs torch/
+    SERGIO/anndata + the reference data, all unavailable in this sandbox);
+    (2) launch the 8 `.20260816.0{0-7}` studies (unbounded `n_trials`/
+    `timeout` as usual, `PYTHONHASHSEED` set as usual) as a **pilot**:
+    interrupt each via SIGINT/SIGTERM after >=80 trials rather than running
+    to convergence, then compare against the `.20260815` studies (the
+    combined change's "before" baseline, since it's simplest to compare
+    against those already-completed runs rather than adding a second new
+    toggle solely for an isolated A/B) on `gene_mean_mean`/`gene_var_mean`
+    ratio-to-target, `log_lib_size_std`, `lib_size_zero_frac`/`zero_frac`,
+    and `pca_standardized_pc2_9_explained_variance_ratio`/`pca_standardized_
+    tail_participation_ratio` match, before committing to a longer sweep.
+
 

@@ -1060,7 +1060,18 @@ def generate_sergio_grn_from_reference(
                   always a free/synthetic quantity regardless of the
                   edge's literature-derived sign. 0.0 (default) leaves
                   every magnitude's weight at exactly 1.0 (no-op,
-                  byte-identical to omitting this parameter).
+                  byte-identical to omitting this parameter). Each target's
+                  full K-vector is then rescaled so sum(|K_i|) (SERGIO's
+                  production-rate ceiling for that target) matches what it
+                  would have been without this reweighting -- i.e. this
+                  knob only reallocates a target's fixed production budget
+                  toward/away from specific regulators, it never changes
+                  the target's own overall expression scale on average
+                  (see the main loop's own comment for the mechanism this
+                  guards against: uncompensated reweighting otherwise
+                  mechanically links "more canalization" to "lower
+                  gene_mean/gene_var/library size"). Also exactly a no-op
+                  at canalization_strength=0.0 (scale is always 1.0 then).
     balancing_strength: in [0, inf). Non-negative fairness penalty applied
                   when picking each target's "winning" master regulator
                   (see below): winner = argmax_mr(vote[mr] -
@@ -1351,6 +1362,34 @@ def generate_sergio_grn_from_reference(
         aligned = (dom_mr == winner_mr) and (np.sign(dom_strength) == edge_sign or dom_strength == 0.0)
         weight = max(1.0 + canalization_strength, 0.05) if aligned else max(1.0 - canalization_strength, 0.05)
       k_values.append(edge_sign * abs(float(mag)) * weight)
+
+    # Renormalize this target's K-vector so its total production-rate
+    # "budget" (sum of |K_i|, i.e. SERGIO's calculate_prod_rate_ ceiling:
+    # rate = sum_i |K_i| * hill_i(...), each hill_i in [0, 1]) matches what
+    # it would have been WITHOUT canalization's per-edge reweighting above.
+    # Without this, canalization_strength systematically shrinks a target's
+    # total achievable production rate whenever it has any "disaligned"
+    # edges (weight as low as 0.05x, uncompensated by the aligned edges'
+    # weight, which only goes up to 2x) -- a real, mechanical link from
+    # "more canalization/balancing -> more PC2+ structure" to "lower
+    # gene_mean/gene_var/library size", since SERGIO's lib_size_effect then
+    # renormalizes each CELL's total to a fixed drawn target, forcing every
+    # other gene to compete for whatever budget this shrinkage left behind.
+    # Preserving sum(|K_i|) here removes that particular coupling: what
+    # canalization does with the (now fixed) budget is purely reallocate
+    # it toward whichever regulator tracks the winning master regulator,
+    # which is what should create between-cluster (PCA-relevant) variance,
+    # rather than shrinking the target's overall expression level.
+    # Exactly a no-op (scale == 1.0) whenever canalization_strength == 0.0,
+    # since weight == 1.0 for every edge then (weighted_abs_sum == raw_sum
+    # exactly) -- byte-identical to omitting this step entirely, same as
+    # every other canalization_strength/coherency_bias/balancing_strength/
+    # path_decay knob's own "0.0 reproduces prior behavior" guarantee.
+    raw_sum          = sum(abs(float(mag)) for mag in magnitudes)
+    weighted_abs_sum = sum(abs(k) for k in k_values)
+    if weighted_abs_sum > 0.0:
+      budget_scale = raw_sum / weighted_abs_sum
+      k_values = [k * budget_scale for k in k_values]
 
     aligned_vals = [dom_strength * es for (dom_mr, dom_strength), es in zip(reg_profiles, edge_signs)
                      if dom_mr == winner_mr]
@@ -2159,13 +2198,31 @@ def compute_summary_stats(
         gene-count-independent summary of the zero-fraction/dropout curve,
         comparable to SERGIO's dropout_shape/dropout_percentile knobs.
       pca_explained_variance_ratio: (n_pca_components,) array, computed on
-        up to n_structure_genes genes.
+        up to n_structure_genes genes. PCA on the raw (mean-centered only,
+        not per-gene standardized) covariance -- so, unlike
+        pca_standardized_explained_variance_ratio below, this is affected
+        by each gene's absolute variance/scale, not just cross-gene
+        correlation structure.
       pca_tail_participation_ratio: scalar "effective number of components"
         among PC2..PC<n_pca_components> (PC1/index 0 excluded -- see
         pca_participation_ratio), i.e. how evenly variance is spread
         across the non-dominant leading PCs rather than how much PC1
         itself dominates. NaN if fewer than 2 non-PC1 components are
-        available (n_pca_components < 3).
+        available (n_pca_components < 3). Computed from
+        pca_explained_variance_ratio, so inherits its scale-sensitivity.
+      pca_standardized_explained_variance_ratio: same shape/semantics as
+        pca_explained_variance_ratio, but computed on each gene
+        standardized to unit variance first (correlation-matrix PCA
+        instead of covariance-matrix PCA; per-gene variance floored at
+        1e-6 before dividing). Scale-invariant: rescaling any one gene's
+        expression (in isolation) does not change this ratio, unlike
+        pca_explained_variance_ratio -- use this one when what you care
+        about is cross-gene *correlation* structure independent of which
+        genes happen to have the largest absolute variance (see this
+        module's AGENTS.md 20260816 entry for why the two can otherwise be
+        in tension as tuning objectives).
+      pca_standardized_tail_participation_ratio: pca_tail_participation_ratio's
+        counterpart computed from pca_standardized_explained_variance_ratio.
       gene_corr_abs_{mean,std,p50,p90}: distribution summary of |pairwise
         gene-gene Pearson correlation| (upper triangle, off-diagonal),
         computed on the same up-to-n_structure_genes genes as PCA above.
@@ -2285,9 +2342,39 @@ def compute_summary_stats(
     total = explained_var.sum()
     ratio = explained_var / total if total > 0 else np.zeros_like(explained_var)
     stats["pca_explained_variance_ratio"] = ratio[:k]
+
+    # Standardized (per-gene z-scored) companion: PCA on the correlation
+    # matrix rather than the raw (non-standardized) covariance matrix above.
+    # The raw version's explained-variance-ratio is directly driven by
+    # which genes happen to have the largest absolute variance -- so it is
+    # NOT independent of each gene's expression *scale*, only of the
+    # dataset's overall scale (mean-centering only, no per-gene rescaling,
+    # see Xc above). This makes "match the reference's PCA structure" and
+    # "match the reference's per-gene variance magnitude" two different
+    # views of the *same* underlying per-gene variances rather than
+    # orthogonal concerns (see AGENTS.md's 20260816 entry for the full
+    # analysis) -- concentrating variance in a few genes to build PC2+
+    # structure mechanically pulls down the population's average variance.
+    # Standardizing each gene to unit variance before PCA removes this:
+    # the resulting explained-variance-ratio only reflects *relative*
+    # cross-gene correlation structure, unaffected by any gene's absolute
+    # variance/scale. Gene variances are floored at 1e-6 (same convention
+    # as this module's MCAR-imputation gap-fill, see _random_fill) before
+    # dividing, so a near-constant gene in this subsample doesn't blow up
+    # into a spurious dominant component.
+    gene_std_struct = np.clip(X_struct.std(axis=0, keepdims=True), 1e-6, None)
+    Xz = (X_struct - X_struct.mean(axis=0, keepdims=True)) / gene_std_struct
+    sz = np.linalg.svd(Xz, full_matrices=False, compute_uv=False)
+    explained_var_z = sz ** 2
+    total_z = explained_var_z.sum()
+    ratio_z = explained_var_z / total_z if total_z > 0 else np.zeros_like(explained_var_z)
+    stats["pca_standardized_explained_variance_ratio"] = ratio_z[:k]
   else:
     stats["pca_explained_variance_ratio"] = np.array([])
+    stats["pca_standardized_explained_variance_ratio"] = np.array([])
   stats["pca_tail_participation_ratio"] = pca_participation_ratio(stats["pca_explained_variance_ratio"])
+  stats["pca_standardized_tail_participation_ratio"] = pca_participation_ratio(
+      stats["pca_standardized_explained_variance_ratio"])
 
   if n_struct_genes >= 2:
     with np.errstate(invalid='ignore'):

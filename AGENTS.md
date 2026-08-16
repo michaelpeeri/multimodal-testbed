@@ -958,5 +958,109 @@ Single-file PyTorch research script (`vae-test.py`). No tests, no package struct
     ratio-to-target, `log_lib_size_std`, `lib_size_zero_frac`/`zero_frac`,
     and `pca_standardized_pc2_9_explained_variance_ratio`/`pca_standardized_
     tail_participation_ratio` match, before committing to a longer sweep.
+- The `synthetic_tuning_20260816.0{0-7}` pilot studies (8 seeds,
+  `synthetic_tuning_config.20260816.0{0-7}.json`, 87-112 completed trials
+  each -- comfortably past the ">=80 trials" pilot threshold) were run and
+  analyzed (`.db`s + `checkpoints/best.pt` + `grn_diags/`, including
+  per-trial `candidate_stats.json`, copied in from the user's machine).
+  Sanity checks all clean: `n_mrs=84` identical across all 8 studies (the
+  `PYTHONHASHSEED` fix continues to hold -- topology remains controlled);
+  every `best.pt`'s `trial_number`/`distance` matches its `.db`'s true
+  argmin exactly; recomputing `compute_stats_distance` from each `best.pt`'s
+  stored `candidate_stats` against the regenerated v4 target pickle
+  reproduces the stored `distance` exactly; the v4 pickle itself has the
+  expected `pca_standardized_*` keys at the correct depth (20). Findings:
+  - **Headline result: the core hypothesis behind introducing the
+    standardized PCA family is confirmed, cleanly, at the pooled-trial
+    level.** Pooling all 918 completed trials across the 8 studies and
+    correlating each candidate's ratio-to-target against
+    `gene_var_mean_ratio`: the *raw* `pca_pc2_9_explained_variance_ratio`
+    remains strongly anti-correlated (Spearman rho=-0.797, p~1e-203, closely
+    matching the `.20260815` entry's pooled rho=-0.61/-0.50 on the
+    predecessor metrics) -- but the new *standardized*
+    `pca_standardized_pc2_9_explained_variance_ratio` shows essentially
+    **zero** correlation with `gene_var_mean_ratio` (rho=+0.062, p=0.06, not
+    significant). Trials jointly achieving `pc29_ratio>=0.9` AND
+    `gene_var_mean_ratio>=0.5` simultaneously went from 1/2137 in the
+    `.20260815` baseline (using the raw metric) to 14/918 using the
+    standardized metric this round (vs. only 2/918 for the raw metric
+    computed on this same `.20260816` data) -- a real, substantial widening
+    of the previously near-empty joint-optimum region. At the population
+    level (pooled per-trial medians, not just the 8 best trials),
+    `gene_mean_mean`/`gene_var_mean` ratio-to-target improved from
+    0.493/0.216 (`.20260815`) to 0.736/0.304 (`.20260816`).
+  - **New wrinkle, not previously flagged: the standardized PCA family's
+    other half doesn't share this decoupling, and actively fights the half
+    that does.** `pca_standardized_tail_participation_ratio` -- weighted
+    equally (6.0) alongside `pca_standardized_pc2_9_explained_variance_
+    ratio` in this round's objective -- shows rho=-0.48 against
+    `gene_var_mean_ratio`, *more* anti-correlated than its raw predecessor
+    (`pca_tail_participation_ratio`, rho=-0.23 on this same data), and this
+    persists (partial rho=-0.57) after statistically controlling for
+    `pca_standardized_pc2_9_explained_variance_ratio`. Worse: the two new
+    terms are themselves anti-correlated with **each other** (rho=-0.63,
+    p~1e-103) despite being intended as complementary "shape" (pc2_9) vs.
+    "evenness" (tail participation ratio) views of the same PCA-standardized
+    tail. This is a plausible, previously-undocumented explanation for why
+    the **best-trial-level** picture across the 8 studies was a wash rather
+    than a clean win: recomputed weighted-term breakdowns show
+    `pca_standardized_pc2_9_explained_variance_ratio` as the #1 or #2
+    largest weighted `distance` contributor in 5/8 studies' best trials (as
+    intended, given its 6.0 weight), `distance` itself was flat-to-worse in
+    7/8 studies vs. `.20260815`'s (non-comparable, since the objective
+    changed, but directionally suggestive) 0.027-0.060 range, secondary
+    stats (`gene_var_std`, `gene_corr_abs_std`/`p90`, `log_lib_size_std`)
+    were mildly worse on pooled median in `.20260816` vs. `.20260815` even
+    as `gene_mean_mean`/`gene_var_mean` improved, and raw PCA fidelity
+    (no longer weighted at all) dropped substantially at the best trial
+    (raw PC1 ratio-to-target averaged ~0.67 across the 8 best trials, down
+    from `.20260815`'s ~0.92) -- each ~100-trial-per-seed budget is
+    plausibly being pulled in two directions by the two new, mutually
+    anti-correlated, equally-weighted terms, rather than cleanly exploiting
+    the low-tension joint-optimum region the pooled analysis shows now
+    exists.
+  - `lib_size_scale` is now the single strongest predictor of `distance`
+    across all 786 pooled completed trials with matched sqlite params
+    (Spearman rho=+0.202, p=1.1e-8) -- notably a **sign flip** from its
+    role in every prior round (previously a lever that *helped*
+    `gene_var_mean`/`log_lib_size_std` at a confirmed cost to PCA
+    structure; now higher `lib_size_scale` correlates with *worse*
+    `distance` overall). Plausibly a consequence of the objective's shift
+    from raw to standardized PCA terms changing which knobs the two
+    (now-competing) PCA terms respond to -- not yet root-caused, flagged for
+    future investigation if it persists in `.20260817`.
+  - The `.20260815` entry's `hill_coeff` saturation concern (27% of top-5%
+    trials within 5% of the upper bound `3.0`, recommended widening next
+    round but not yet acted on) does not reproduce this round: 0% of
+    `.20260816`'s top-5%-by-distance trials sit near the bound -- plausibly
+    because the objective's shift to standardized PCA terms moved the
+    optimum to a different region of the search space where `hill_coeff`
+    saturation isn't beneficial the way it was under the old objective.
+    Not itself evidence the bound should be left alone forever, just no
+    longer an active concern under this round's objective.
+  - Per user direction (given the tail-participation-ratio finding above),
+    resulting change: new `synthetic_tuning_config.20260817.0{0-7}.json`
+    (cloned from `.20260816.0{0-7}`, single change):
+    `weights.pca_standardized_tail_participation_ratio` `6.0` -> `0.0`
+    (joining the raw family, already `0.0`, at zero weight -- still
+    computed for diagnostics/plotting via `_add_pca_pc2_9_key`'s existing
+    generic mechanism, just no longer drives the objective).
+    `weights.pca_standardized_pc2_9_explained_variance_ratio` deliberately
+    left at `6.0`, **not** bumped to compensate for the removed term's
+    weight (per user direction, isolating this one variable change rather
+    than also testing a total-PCA-weight-preserving alternative). Everything
+    else (target `v4` pickle, `mr_rate_high=8.0`, `max_lib_size_zero_frac=
+    0.10`, search space, `n_clusters=15`) unchanged from `.20260816.*`. No
+    `synthetic_data.py`/`tune_synthetic_data.py` code change was needed --
+    pure config change, weight lookups are already fully generic.
+  - **User action required**: run the 8 `.20260817.0{0-7}` processes (same
+    unbounded/graceful-stop workflow, shared `PYTHONHASHSEED`), aiming for a
+    comparable ~90-110 completed trials per seed to the `.20260816` round
+    for an apples-to-apples comparison, then copy back `.db`s/`checkpoints/
+    best.pt`/`grn_diags/` (including per-trial `candidate_stats.json`) for
+    analysis -- specifically to check whether removing the competing
+    tail-participation-ratio term lets TPE actually reach the low-tension
+    joint-optimum region the `.20260816` pooled data shows now exists,
+    rather than the wash seen at the best-trial level this round.
 
 

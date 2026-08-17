@@ -1,0 +1,164 @@
+{
+  "_comment_20260819_normalized_gene_corr_fix": "Cloned from .20260818.0N (see AGENTS.md's 20260818 entry for full analysis/rationale). This round's change: the gene-gene-correlation objective terms are swapped from the raw (library-size-confounded) gene_corr_abs_mean/gene_corr_abs_p50 to the new library-size-normalized gene_corr_abs_normalized_mean/gene_corr_abs_normalized_p50 (compute_summary_stats gained this family this session -- see synthetic_data.py's compute_summary_stats docstring). Diagnosis: pooling ~1900 real trials across .20260817/.20260818, gene_var_mean/gene_mean_mean/log_lib_size_std/pca_standardized_pc2_9 all improve monotonically toward target as lib_size_scale rises (reaching near-perfect matches around lib_size_scale~1.3-1.6), but gene_corr_abs_mean/gene_corr_abs_p50 (weight 3.0 each) explode to 6-17x target over that same range and dominate total distance, actively preventing TPE from ever settling there. Root cause: gene_corr_abs_* is computed on raw (non-library-size-normalized) log1p counts, so SERGIO's lib_size_effect (a per-cell multiplicative rescale applied identically across every gene) inflates every pairwise correlation roughly uniformly as lib_size_scale grows -- hitting the bulk/median of the correlation distribution (mean/p50, dominated by gene pairs with ~0 true correlation) far harder than the tail (std/p90, dominated by genuinely co-regulated pairs, which is why those two behaved reasonably and are left on the raw metric here). gene_corr_abs_normalized_* removes this confound via standard size-factor/CPM-style per-cell renormalization before log1p -- exactly analogous to the pca_standardized_* fix for an equivalent raw-covariance-vs-absolute-gene-variance confound (see the 20260816 entry). mr_rate_high stays at 5.0 (confirmed no effect in an isolated A/B this session -- see 20260818 entry) and max_lib_size_zero_frac stays at 0.10 (the gene_corr_abs_mean/p50 penalty was shown to bind 5-10x harder than this guard, so fix that first). target_stats_path points at the newly-regenerated ...v5.mean.pickle (same recipe as v3/v4, now picking up the gene_corr_abs_normalized_* keys automatically -- no recipe change needed).",
+  "_comment_unbounded_run": "n_trials/timeout both null (unbounded) -- this study is meant to be run with the new graceful-stop workflow (see tune_synthetic_data.py's module docstring's 'Interrupting/resuming a run' section): launch all 8 seeds as independent processes and let each run for as long as you want; send SIGINT/SIGTERM to a given process to stop it gracefully once you're satisfied with its progress (or all of them at some shared deadline) -- the in-flight trial finishes normally and the usual tuned_synthetic_config.*.json summary still gets written. Re-running against this same storage/study_name later resumes correctly. This replaces the previous fixed-n_trials=250 design, which left faster-finishing seeds idle while slower ones were still mid-run, and which (per the .20260814 analysis) still showed meaningful late-stage improvement in 5/8 seeds even at 250 trials.",
+  "_comment_mr_rate_high_pending_pilot": "mr_rate_high bumped 5.0 -> 8.0 based on the .20260815.pilot_mr{5,6,8}.0{0,1,2} pilot (3 seeds x 80 trials each, guard left at the .20260814 baseline 0.05 to isolate this one variable): mr_rate_high=8 nearly doubled gene_mean_mean/gene_var_mean match (ratio-to-target 0.38->0.69 / 0.15->0.28 averaged over 3 seeds, and tightly clustered per-seed 0.68-0.70/0.267-0.287 vs. the noisier mr5/mr6 groups) with no measurable cost to pca_pc2_9_explained_variance_ratio match (flat ~0.64-0.67 across all three mr_rate_high values) -- consistent with the hypothesis that raising the biological MR production ceiling helps gene magnitude without leaning on the lib_size_mean/lib_size_scale knobs that are in real, confirmed tension with PCA structure (see the .20260814 session analysis). Best-trial lib_size_scale also fell 0.83->0.75->0.62 as mr_rate_high rose 5->6->8, consistent with TPE substituting away from that PCA-damaging lever rather than just adding an independent effect. Caveat: only 3 seeds/pilot value -- a real effect, but not a large-sample confirmatory result.",
+  "target_stats_path": "1cb67ec8-c9e3-4d4a-ba23-a1a8ef3f8450.GRNseed42.stats.v5.mean.pickle",
+  "reference_grn_path": "data/trrust_rawdata.human.tsv",
+  "grn_archive_dir": "synthetic_tuning_20260819.01/grn_diags",
+  "n_clusters": 15,
+  "n_genes": 800,
+  "n_cells": 600,
+  "sampling_state": 5,
+  "shared_coop_state": 0,
+  "stats_n_pca_components": 20,
+  "storage": "sqlite:///synthetic_tuning_20260819.01/synthetic_tuning_20260819.01.db",
+  "study_name": "tune_synthetic_data6_20260819.01",
+  "output": "synthetic_tuning_20260819.01/tuned_synthetic_config.20260819.01.json",
+  "artifact_dir": "synthetic_tuning_20260819.01/checkpoints",
+  "n_trials": null,
+  "sampler": "tpe",
+  "pruner": "none",
+  "sim_seed": 1,
+  "max_lib_size_zero_frac": 0.1,
+  "max_pca_pc1_ratio_factor": 1.3,
+  "weights": {
+    "log_lib_size_mean": 3.0,
+    "log_lib_size_std": 3.0,
+    "log_lib_size_p5": 3.0,
+    "log_lib_size_p25": 3.0,
+    "log_lib_size_p50": 3.0,
+    "log_lib_size_p75": 3.0,
+    "log_lib_size_p95": 3.0,
+    "gene_corr_abs_mean": 0.0,
+    "gene_corr_abs_std": 3.0,
+    "gene_corr_abs_p50": 0.0,
+    "gene_corr_abs_p90": 3.0,
+    "pca_explained_variance_ratio": 0.0,
+    "pca_tail_participation_ratio": 0.0,
+    "pca_pc2_9_explained_variance_ratio": 0.0,
+    "zero_frac": 3.0,
+    "dropout_curve_zero_frac": 3.0,
+    "lib_size_zero_frac": 3.0,
+    "gene_mean_mean": 1.0,
+    "gene_mean_std": 1.0,
+    "gene_var_mean": 1.0,
+    "gene_var_std": 1.0,
+    "pca_standardized_explained_variance_ratio": 0.0,
+    "pca_standardized_tail_participation_ratio": 0.0,
+    "pca_standardized_pc2_9_explained_variance_ratio": 6.0,
+    "_comment_excluded_keys": "Explicitly excluded (weight 0.0) rather than merely omitted below: an omitted key still defaults to weight 1.0 in compute_stats_distance, not 0.0 -- these 12 keys were previously omitted by oversight and ended up silently contributing ~25% of the total objective across the 20260811.* studies (see AGENTS.md's Known Issues and compute_stats_distance's own docstring). gene_mean_mean/gene_mean_std/gene_var_mean/gene_var_std were re-added above at weight 1.0 (this config) after the .20260812.* studies showed those four consistently undershooting the target by 2-4x while contributing nothing to the objective; the remaining percentile duplicates (gene_mean_p5/p25/p50/p75/p95, gene_var_p5/p25/p50/p75/p95) and mean_var_log_slope/mean_var_log_corr stay excluded to avoid overweighting the same underlying distribution shape multiple times. Set any of these to a nonzero value if you want to score them too.",
+    "gene_mean_p5": 0.0,
+    "gene_mean_p25": 0.0,
+    "gene_mean_p50": 0.0,
+    "gene_mean_p75": 0.0,
+    "gene_mean_p95": 0.0,
+    "gene_var_p5": 0.0,
+    "gene_var_p25": 0.0,
+    "gene_var_p50": 0.0,
+    "gene_var_p75": 0.0,
+    "gene_var_p95": 0.0,
+    "mean_var_log_slope": 0.0,
+    "mean_var_log_corr": 0.0,
+    "gene_corr_abs_normalized_mean": 3.0,
+    "gene_corr_abs_normalized_p50": 3.0,
+    "gene_corr_abs_normalized_std": 0.0,
+    "gene_corr_abs_normalized_p90": 0.0
+  },
+  "search_space": {
+    "noise_params": {
+      "type": "float",
+      "low": 0.2,
+      "high": 2.0,
+      "log": true
+    },
+    "decays": {
+      "type": "float",
+      "low": 0.3,
+      "high": 1.5
+    },
+    "cluster_conc": {
+      "type": "float",
+      "low": 2.0,
+      "high": 50.0,
+      "log": true
+    },
+    "outlier_prob": {
+      "type": "float",
+      "low": 0.001,
+      "high": 0.1,
+      "log": true
+    },
+    "outlier_mean": {
+      "type": "float",
+      "low": 0.2,
+      "high": 2.0
+    },
+    "outlier_scale": {
+      "type": "float",
+      "low": 0.2,
+      "high": 3.0
+    },
+    "lib_size_mean": {
+      "type": "float",
+      "low": 3.0,
+      "high": 6.0
+    },
+    "lib_size_scale": {
+      "type": "float",
+      "low": 0.1,
+      "high": 3.5
+    },
+    "dropout_shape": {
+      "type": "float",
+      "low": 1.0,
+      "high": 20.0
+    },
+    "dropout_percentile": {
+      "type": "float",
+      "low": 40.0,
+      "high": 99.0
+    },
+    "grn_k_low": {
+      "type": "float",
+      "low": 0.5,
+      "high": 2.0
+    },
+    "grn_k_span": {
+      "type": "float",
+      "low": 0.2,
+      "high": 10.0
+    },
+    "hill_coeff": {
+      "type": "float",
+      "low": 1.0,
+      "high": 3.0
+    },
+    "unknown_mode_repressor_prob": {
+      "type": "float",
+      "low": 0.0,
+      "high": 1.0
+    },
+    "coherency_bias": {
+      "type": "float",
+      "low": 0.0,
+      "high": 1.0
+    },
+    "canalization_strength": {
+      "type": "float",
+      "low": 0.0,
+      "high": 1.0
+    },
+    "balancing_strength": {
+      "type": "float",
+      "low": 0.0,
+      "high": 1.5
+    },
+    "path_decay": {
+      "type": "float",
+      "low": 0.5,
+      "high": 1.0
+    }
+  },
+  "timeout": null,
+  "mr_rate_high": 5.0
+}

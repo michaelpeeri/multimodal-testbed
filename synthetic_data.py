@@ -2226,6 +2226,21 @@ def compute_summary_stats(
       gene_corr_abs_{mean,std,p50,p90}: distribution summary of |pairwise
         gene-gene Pearson correlation| (upper triangle, off-diagonal),
         computed on the same up-to-n_structure_genes genes as PCA above.
+      gene_corr_abs_normalized_{mean,std,p50,p90}: same, but computed after
+        renormalizing each cell's raw counts to a common total (median
+        library size across cells) before log1p -- standard scRNA-seq
+        size-factor/CPM-style normalization. Decouples this statistic from
+        per-cell library-size (sequencing-depth) variation, which -- via
+        e.g. SERGIO's lib_size_effect, a per-cell multiplicative rescale
+        applied identically across every gene -- otherwise inflates every
+        pairwise raw correlation roughly uniformly (hitting
+        gene_corr_abs_mean/p50, dominated by the bulk of gene pairs with
+        ~0 true correlation, far harder than gene_corr_abs_std/p90,
+        dominated by genuinely co-regulated tail pairs); see this module's
+        AGENTS.md 20260818 entry. Exactly analogous to
+        pca_standardized_explained_variance_ratio's relationship to
+        pca_explained_variance_ratio -- computed in addition to, not
+        replacing, the raw family above.
   """
   assert X.dim() == 2, f"expected a 2D (n_cells, n_genes) tensor, got shape {tuple(X.shape)}"
   n_cells, n_genes = X.shape
@@ -2394,6 +2409,59 @@ def compute_summary_stats(
     stats["gene_corr_abs_std"]  = float('nan')
     stats["gene_corr_abs_p50"]  = float('nan')
     stats["gene_corr_abs_p90"]  = float('nan')
+
+  # --- library-size-normalized companion: decouples gene-gene correlation
+  # from per-cell library-size (sequencing-depth) variation -- the raw
+  # version above is computed on X_struct, which is mean-centered/filled
+  # log1p(raw counts) with each cell's *actual* total count baked in. A
+  # per-cell multiplicative library-size effect (e.g. SERGIO's own
+  # lib_size_effect, which rescales a cell's entire gene vector by one
+  # shared lognormal factor before log1p) is by construction perfectly
+  # correlated across every gene, so it inflates *every* pairwise raw
+  # correlation roughly uniformly as library-size variance grows --
+  # hitting gene_corr_abs_mean/p50 (dominated by the bulk of gene pairs,
+  # which have ~0 true correlation in real reference data) far harder
+  # than gene_corr_abs_std/p90 (dominated by genuinely co-regulated tail
+  # pairs, which already have real covariance to compete with the
+  # confound). Confirmed empirically (see AGENTS.md's 20260818 entry):
+  # across ~1900 real tuning trials, gene_corr_abs_mean/p50 explode to
+  # 6-17x the target's value well before gene_var_mean/gene_mean_mean/
+  # pca_standardized_pc2_9 (which all *improve* with the same knob) reach
+  # their own best match, actively blocking the region where those other
+  # stats would otherwise land close to target. Renormalizing each cell to
+  # a common total count before log1p (standard scRNA-seq size-factor/CPM-
+  # style normalization) removes this shared multiplicative confound while
+  # preserving genuine cross-gene covariance, exactly analogous to
+  # pca_standardized_explained_variance_ratio's per-gene standardization
+  # removing PC1's dependence on absolute gene variance. Computed *in
+  # addition to*, not replacing, the raw family above.
+  lib_size_safe  = np.maximum(lib_size, 1e-8)
+  size_factor    = np.median(lib_size_safe) / lib_size_safe
+  raw_for_norm   = np.where(obs_mask, np.expm1(X_np), np.nan)
+  X_normalized   = np.log1p(raw_for_norm * size_factor[:, np.newaxis])
+  with np.errstate(invalid='ignore'):
+    gene_mean_norm = np.nanmean(X_normalized, axis=0)
+  fill_norm            = np.where(np.isfinite(gene_mean_norm), gene_mean_norm, 0.0)
+  X_normalized_filled  = np.where(obs_mask, X_normalized, fill_norm[np.newaxis, :])
+  X_struct_normalized  = X_normalized_filled[:, gene_idx]
+
+  if n_struct_genes >= 2:
+    with np.errstate(invalid='ignore'):
+      corr_matrix_norm = np.corrcoef(X_struct_normalized, rowvar=False)
+    abs_corr_norm = np.abs(corr_matrix_norm[iu])
+    abs_corr_norm = abs_corr_norm[np.isfinite(abs_corr_norm)]
+  else:
+    abs_corr_norm = np.array([])
+  if abs_corr_norm.size:
+    stats["gene_corr_abs_normalized_mean"] = float(np.mean(abs_corr_norm))
+    stats["gene_corr_abs_normalized_std"]  = float(np.std(abs_corr_norm))
+    stats["gene_corr_abs_normalized_p50"]  = float(np.percentile(abs_corr_norm, 50))
+    stats["gene_corr_abs_normalized_p90"]  = float(np.percentile(abs_corr_norm, 90))
+  else:
+    stats["gene_corr_abs_normalized_mean"] = float('nan')
+    stats["gene_corr_abs_normalized_std"]  = float('nan')
+    stats["gene_corr_abs_normalized_p50"]  = float('nan')
+    stats["gene_corr_abs_normalized_p90"]  = float('nan')
 
   return stats
 

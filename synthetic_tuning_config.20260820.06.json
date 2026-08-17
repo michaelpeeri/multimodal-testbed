@@ -1,0 +1,166 @@
+{
+  "_comment_20260820_abc": "Cloned from .20260819.0N (see AGENTS.md's 20260819 entry). Three combined changes this round, all analyzed/validated retroactively against real .20260819 trial data (A/B1/B2) or via standalone invariance tests + a real end-to-end SERGIO smoke test (C) before being wired in here -- see AGENTS.md's 20260820 entry for the full analysis: (A) weights.zero_frac -> 0.0, new weights.nonzero_frac (=1-zero_frac, computed via tune_synthetic_data._add_nonzero_frac_key) -> 3.0 (zero_frac's old weight) -- the plain relative-error-on-zero_frac metric badly under-penalizes sparsity overshoot when the target is already close to 1 (real reference zero_frac=0.9242): a candidate at 0.97 already has ~60% less usable data than the reference but scored a term of only ~0.002; scoring the non-zero fraction instead fixes the scale (same case -> ~0.2) and re-ranks the 'best' trial in 3/8 of the already-completed .20260819 studies, always toward closer-to-target zero_frac. (B1) weights.gene_corr_abs_std/p90 (raw) -> 0.0, weights.gene_corr_abs_normalized_std/p90 -> 3.0 (their old weight) -- same library-size confound already fixed for mean/p50 in .20260818 also affects std/p90 (milder: ~1.4-2.2x overshoot vs. mean/p50's 6-17x, confirmed via the real .20260819 archives), previously left unfixed on the (incorrect) assumption they 'behaved reasonably'. (B2) weights.lib_size_zero_frac -> 0.0 -- this term's eps_abs_floor (0.02) is miscalibrated for a near-zero target (real value ~4e-6), causing it to explode well before the existing hard max_lib_size_zero_frac=0.10 prune guard even binds (confirmed: weighted contribution rose from ~0.0003 to ~3.34 across the .20260819 lib_size_scale range) -- redundant with, and worse-calibrated than, the hard guard already doing this job; dropped rather than re-calibrated for simplicity. (C) weights.pca_standardized_pc2_9_explained_variance_ratio -> 0.0, new weights.pca_size_normalized_standardized_pc2_9_explained_variance_ratio -> 6.0 (its old weight) -- pca_standardized_* removes per-gene scale dependence but not a per-CELL library-size confound (SERGIO's lib_size_effect rescales a cell's entire gene vector by one shared factor, which survives per-gene standardization); confirmed empirically (its ratio-to-target rose monotonically from ~0.7 to ~1.6 as lib_size_scale rose across the .20260819 range, undiluted by any other knob in a full rank-regression) and mechanistically (synthetic_data.compute_summary_stats' new pca_size_normalized_standardized_* family, verified standalone: a strong injected per-cell library-size confound changes pca_standardized_explained_variance_ratio's PC1-5 by up to 0.37 but the new family by only ~0.0001). target_stats_path bumped to the newly-regenerated ...v6.mean.pickle (adds the pca_size_normalized_standardized_* keys; also finally applies the n_cells_subsample=600 correction flagged but deferred in the .20260818 entry, since a regeneration was needed anyway).",
+  "target_stats_path": "1cb67ec8-c9e3-4d4a-ba23-a1a8ef3f8450.GRNseed42.stats.v6.mean.pickle",
+  "reference_grn_path": "data/trrust_rawdata.human.tsv",
+  "grn_archive_dir": "synthetic_tuning_20260820.06/grn_diags",
+  "n_clusters": 15,
+  "n_genes": 800,
+  "n_cells": 600,
+  "sampling_state": 5,
+  "shared_coop_state": 0,
+  "stats_n_pca_components": 20,
+  "storage": "sqlite:///synthetic_tuning_20260820.06/synthetic_tuning_20260820.06.db",
+  "study_name": "tune_synthetic_data6_20260820.06",
+  "output": "synthetic_tuning_20260820.06/tuned_synthetic_config.20260820.06.json",
+  "artifact_dir": "synthetic_tuning_20260820.06/checkpoints",
+  "n_trials": null,
+  "sampler": "tpe",
+  "pruner": "none",
+  "sim_seed": 6,
+  "max_lib_size_zero_frac": 0.1,
+  "max_pca_pc1_ratio_factor": 1.3,
+  "weights": {
+    "log_lib_size_mean": 3.0,
+    "log_lib_size_std": 3.0,
+    "log_lib_size_p5": 3.0,
+    "log_lib_size_p25": 3.0,
+    "log_lib_size_p50": 3.0,
+    "log_lib_size_p75": 3.0,
+    "log_lib_size_p95": 3.0,
+    "gene_corr_abs_mean": 0.0,
+    "gene_corr_abs_std": 0.0,
+    "gene_corr_abs_p50": 0.0,
+    "gene_corr_abs_p90": 0.0,
+    "pca_explained_variance_ratio": 0.0,
+    "pca_tail_participation_ratio": 0.0,
+    "pca_pc2_9_explained_variance_ratio": 0.0,
+    "zero_frac": 0.0,
+    "dropout_curve_zero_frac": 3.0,
+    "lib_size_zero_frac": 0.0,
+    "gene_mean_mean": 1.0,
+    "gene_mean_std": 1.0,
+    "gene_var_mean": 1.0,
+    "gene_var_std": 1.0,
+    "pca_standardized_explained_variance_ratio": 0.0,
+    "pca_standardized_tail_participation_ratio": 0.0,
+    "pca_standardized_pc2_9_explained_variance_ratio": 0.0,
+    "_comment_excluded_keys": "Explicitly excluded (weight 0.0) rather than merely omitted below: an omitted key still defaults to weight 1.0 in compute_stats_distance, not 0.0 -- these 12 keys were previously omitted by oversight and ended up silently contributing ~25% of the total objective across the 20260811.* studies (see AGENTS.md's Known Issues and compute_stats_distance's own docstring). gene_mean_mean/gene_mean_std/gene_var_mean/gene_var_std were re-added above at weight 1.0 (this config) after the .20260812.* studies showed those four consistently undershooting the target by 2-4x while contributing nothing to the objective; the remaining percentile duplicates (gene_mean_p5/p25/p50/p75/p95, gene_var_p5/p25/p50/p75/p95) and mean_var_log_slope/mean_var_log_corr stay excluded to avoid overweighting the same underlying distribution shape multiple times. Set any of these to a nonzero value if you want to score them too.",
+    "gene_mean_p5": 0.0,
+    "gene_mean_p25": 0.0,
+    "gene_mean_p50": 0.0,
+    "gene_mean_p75": 0.0,
+    "gene_mean_p95": 0.0,
+    "gene_var_p5": 0.0,
+    "gene_var_p25": 0.0,
+    "gene_var_p50": 0.0,
+    "gene_var_p75": 0.0,
+    "gene_var_p95": 0.0,
+    "mean_var_log_slope": 0.0,
+    "mean_var_log_corr": 0.0,
+    "gene_corr_abs_normalized_mean": 3.0,
+    "gene_corr_abs_normalized_p50": 3.0,
+    "gene_corr_abs_normalized_std": 3.0,
+    "gene_corr_abs_normalized_p90": 3.0,
+    "nonzero_frac": 3.0,
+    "pca_size_normalized_standardized_explained_variance_ratio": 0.0,
+    "pca_size_normalized_standardized_tail_participation_ratio": 0.0,
+    "pca_size_normalized_standardized_pc2_9_explained_variance_ratio": 6.0
+  },
+  "search_space": {
+    "noise_params": {
+      "type": "float",
+      "low": 0.2,
+      "high": 2.0,
+      "log": true
+    },
+    "decays": {
+      "type": "float",
+      "low": 0.3,
+      "high": 1.5
+    },
+    "cluster_conc": {
+      "type": "float",
+      "low": 2.0,
+      "high": 50.0,
+      "log": true
+    },
+    "outlier_prob": {
+      "type": "float",
+      "low": 0.001,
+      "high": 0.1,
+      "log": true
+    },
+    "outlier_mean": {
+      "type": "float",
+      "low": 0.2,
+      "high": 2.0
+    },
+    "outlier_scale": {
+      "type": "float",
+      "low": 0.2,
+      "high": 3.0
+    },
+    "lib_size_mean": {
+      "type": "float",
+      "low": 3.0,
+      "high": 6.0
+    },
+    "lib_size_scale": {
+      "type": "float",
+      "low": 0.1,
+      "high": 3.5
+    },
+    "dropout_shape": {
+      "type": "float",
+      "low": 1.0,
+      "high": 20.0
+    },
+    "dropout_percentile": {
+      "type": "float",
+      "low": 40.0,
+      "high": 99.0
+    },
+    "grn_k_low": {
+      "type": "float",
+      "low": 0.5,
+      "high": 2.0
+    },
+    "grn_k_span": {
+      "type": "float",
+      "low": 0.2,
+      "high": 10.0
+    },
+    "hill_coeff": {
+      "type": "float",
+      "low": 1.0,
+      "high": 3.0
+    },
+    "unknown_mode_repressor_prob": {
+      "type": "float",
+      "low": 0.0,
+      "high": 1.0
+    },
+    "coherency_bias": {
+      "type": "float",
+      "low": 0.0,
+      "high": 1.0
+    },
+    "canalization_strength": {
+      "type": "float",
+      "low": 0.0,
+      "high": 1.0
+    },
+    "balancing_strength": {
+      "type": "float",
+      "low": 0.0,
+      "high": 1.5
+    },
+    "path_decay": {
+      "type": "float",
+      "low": 0.5,
+      "high": 1.0
+    }
+  },
+  "timeout": null,
+  "mr_rate_high": 5.0
+}

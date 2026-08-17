@@ -186,6 +186,18 @@ pca_tail_participation_ratio's value depends on how many tail PCs went into
 it, so comparing a target computed at one depth against candidates computed
 at another silently compares two different quantities (see run()'s startup
 validation, which now checks this explicitly).
+Note on zero_frac vs. nonzero_frac (added 20260820, see AGENTS.md): scoring
+zero_frac directly badly under-penalizes overshoot (candidate sparser than
+target) whenever the target is already close to 1, as real single-cell
+reference data's is -- a small absolute zero_frac deviation there
+corresponds to a large *relative* change in usable (non-zero) data, which
+the plain relative-error-on-zero_frac formula doesn't reflect (see
+_add_nonzero_frac_key's own docstring for the worked example and empirical
+re-ranking check against real tuning trials). Prefer weighting
+nonzero_frac = 1 - zero_frac (added via _add_nonzero_frac_key, called at
+both run()/run_trial(), exactly like the pc2_9 keys below) instead, and set
+weights["zero_frac"] = 0.0 -- same "retarget the weight at a corrected
+metric" convention as pca_standardized_*/gene_corr_abs_normalized_* below.
 Note on pca_explained_variance_ratio/pca_tail_participation_ratio/
 pca_pc2_9_explained_variance_ratio vs. their pca_standardized_* counterparts
 (added 20260816, see AGENTS.md): the plain ("raw") family is PCA on
@@ -207,6 +219,26 @@ if you want "match the reference's PCA structure" to not be inherently in
 tension with "match the reference's expression magnitude". Same
 n_pca_components-matching caveat as above applies to this family too (see
 run()'s startup validation, which checks both families independently).
+Note on pca_standardized_* vs. pca_size_normalized_standardized_*
+counterparts (added 20260820, see AGENTS.md): pca_standardized_*'s per-gene
+standardization removes dependence on which genes have the largest
+absolute variance, but does NOT remove a per-CELL multiplicative confound
+-- SERGIO's lib_size_effect rescales a cell's *entire* gene vector by one
+shared lognormal factor, which remains a real, shared source of cross-cell
+correlated variation even after standardizing each gene column to unit
+variance, so pca_standardized_pc2_9_explained_variance_ratio can still be
+inflated as lib_size_scale grows (confirmed empirically: across the real
+synthetic_tuning_20260819.* trials, its ratio-to-target rose monotonically
+from ~0.7 to ~1.6 as lib_size_scale rose, essentially undiluted by any
+other search-space knob in a full rank-regression -- see AGENTS.md).
+pca_size_normalized_standardized_* (synthetic_data.compute_summary_stats)
+additionally renormalizes each cell's library size before standardizing,
+combining both confound-removal steps -- prefer weighting *this* family
+(pca_size_normalized_standardized_tail_participation_ratio/
+pca_size_normalized_standardized_pc2_9_explained_variance_ratio) over
+pca_standardized_*'s if you want PCA-structure fidelity independent of
+*both* gene-scale and lib_size_scale. Same n_pca_components-matching
+caveat applies (see run()'s startup validation).
 Each key's term is combined into a single weighted MEAN (not sum) across
 all included keys, so the result stays comparable across trials even if a
 different subset of keys ends up skipped (e.g. mean_var_log_slope/corr are
@@ -873,6 +905,45 @@ def _add_pca_pc2_9_key(
         stats[dst_key] = np.asarray(pca[1:9], dtype=np.float64)
 
 
+def _add_nonzero_frac_key(
+    stats: dict,
+    src_key: str = "zero_frac",
+    dst_key: str = "nonzero_frac",
+) -> None:
+    """Derives `dst_key` = 1 - `stats[src_key]` -- mutates `stats` in place,
+    a no-op if `src_key` is absent. No synthetic_data.py change or
+    target_stats_path regeneration needed (same convention as
+    _add_pca_pc2_9_key's raw-family variant): this only rearranges data
+    compute_summary_stats() already returns.
+
+    Why this exists: compute_stats_distance's plain relative-error formula,
+    scored directly on zero_frac, badly under-penalizes candidates that are
+    *sparser* than the reference (zero_frac overshoot) whenever the target
+    itself is already close to 1 -- e.g. target zero_frac=0.9242 (this
+    project's real reference value): a candidate at zero_frac=0.97 already
+    has ~60% *less* non-zero (usable) data than the reference
+    ((1-0.97)/(1-0.9242) - 1 = -60%), but the plain relative-error term on
+    zero_frac itself is only ((0.97-0.9242)/(0.9242+eps))**2 ~= 0.0022 --
+    negligible next to other terms that typically run 0.05-0.5 (confirmed
+    empirically against real synthetic_tuning_20260819.* trials: this
+    metric change re-ranks the "best" trial in 3/8 of those already-
+    completed studies, in every case toward a trial with zero_frac closer
+    to target -- see AGENTS.md's 20260820 entry). Scoring the *non-zero*
+    fraction instead makes the relative-error denominator the target's own
+    (small) non-zero fraction rather than its (large, close-to-1)
+    zero-fraction, so the same absolute zero_frac deviation is scored at
+    the magnitude of usable-data loss/gain it actually represents --
+    symmetric in either direction (also raises the cost of a candidate
+    *denser* than the reference, not just sparser). See this module's
+    weights docstring for the corresponding config convention (weight
+    nonzero_frac instead of zero_frac, matching the pca_standardized_*/
+    gene_corr_abs_normalized_* precedent of retargeting a weight at a
+    corrected metric rather than the original raw one)."""
+    val = stats.get(src_key)
+    if val is not None:
+        stats[dst_key] = 1.0 - float(val)
+
+
 def _jsonify_stats(stats: dict) -> dict:
     """Convert a compute_summary_stats()-style dict (a mix of plain floats/
     ints and numpy arrays/scalars, e.g. pca_explained_variance_ratio,
@@ -1121,6 +1192,12 @@ def run_trial(trial: optuna.Trial, config: dict, target_stats: dict) -> float:
         src_key="pca_standardized_explained_variance_ratio",
         dst_key="pca_standardized_pc2_9_explained_variance_ratio",
     )
+    _add_pca_pc2_9_key(
+        candidate_stats,
+        src_key="pca_size_normalized_standardized_explained_variance_ratio",
+        dst_key="pca_size_normalized_standardized_pc2_9_explained_variance_ratio",
+    )
+    _add_nonzero_frac_key(candidate_stats)
     trial.set_user_attr(
         "candidate_pca_tail_participation_ratio",
         candidate_stats.get("pca_tail_participation_ratio", float("nan")),
@@ -1476,6 +1553,12 @@ def run(config_path: str) -> optuna.Study:
         src_key="pca_standardized_explained_variance_ratio",
         dst_key="pca_standardized_pc2_9_explained_variance_ratio",
     )
+    _add_pca_pc2_9_key(
+        target_stats,
+        src_key="pca_size_normalized_standardized_explained_variance_ratio",
+        dst_key="pca_size_normalized_standardized_pc2_9_explained_variance_ratio",
+    )
+    _add_nonzero_frac_key(target_stats)
     print(
         f"reference: n_cells={target_stats['n_cells']}  n_genes={target_stats['n_genes']}  "
         f"gene_mean_mean={target_stats['gene_mean_mean']:.4f}  "
@@ -1572,6 +1655,36 @@ def run(config_path: str) -> optuna.Study:
             "['gene_corr_abs_normalized_p90'] to have any effect (those terms will "
             "simply be skipped otherwise)."
         )
+
+    # Same two checks as pca_standardized_* above, for the family that
+    # combines *both* confound-removal steps (per-gene standardization AND
+    # per-cell library-size renormalization) -- see AGENTS.md's 20260820
+    # entry and compute_summary_stats'
+    # pca_size_normalized_standardized_explained_variance_ratio docstring
+    # for why pca_standardized_* alone still isn't scale-invariant with
+    # respect to lib_size_scale.
+    if "pca_size_normalized_standardized_tail_participation_ratio" not in target_stats:
+        print(
+            "  NOTE: target_stats has no "
+            "'pca_size_normalized_standardized_tail_participation_ratio' key -- it "
+            "was computed with an older compute_summary_stats() (predating this "
+            "addition) and needs to be regenerated for "
+            "weights['pca_size_normalized_standardized_tail_participation_ratio']/"
+            "['pca_size_normalized_standardized_pc2_9_explained_variance_ratio'] to "
+            "have any effect (those terms will simply be skipped otherwise)."
+        )
+    else:
+        target_n_pca_zn = len(target_stats.get("pca_size_normalized_standardized_explained_variance_ratio", []))
+        if target_n_pca_zn and target_n_pca_zn != config["stats_n_pca_components"]:
+            print(
+                f"  *** WARNING: target_stats' "
+                f"pca_size_normalized_standardized_explained_variance_ratio has length "
+                f"{target_n_pca_zn} but this config's "
+                f"stats_n_pca_components={config['stats_n_pca_components']} -- "
+                f"pca_size_normalized_standardized_tail_participation_ratio target/"
+                f"candidate are NOT apples-to-apples until target_stats_path is "
+                f"regenerated with a matching n_pca_components. ***"
+            )
 
     study = optuna.create_study(
         study_name=config["study_name"],

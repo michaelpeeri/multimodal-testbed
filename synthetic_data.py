@@ -2241,6 +2241,33 @@ def compute_summary_stats(
         pca_standardized_explained_variance_ratio's relationship to
         pca_explained_variance_ratio -- computed in addition to, not
         replacing, the raw family above.
+      pca_size_normalized_standardized_explained_variance_ratio: same
+        shape/semantics as pca_standardized_explained_variance_ratio, but
+        computed on the library-size-renormalized matrix underlying
+        gene_corr_abs_normalized_* above (each gene additionally
+        standardized to unit variance first, same convention/1e-6 floor as
+        pca_standardized_explained_variance_ratio). Combines BOTH
+        confound-removal steps: pca_standardized_explained_variance_ratio's
+        per-gene standardization removes dependence on which genes happen
+        to have the largest absolute variance, but does NOT remove a
+        per-CELL multiplicative confound -- SERGIO's lib_size_effect
+        rescales a cell's *entire* gene vector by one shared lognormal
+        factor, which remains a real, shared source of cross-cell
+        correlated variation even after standardizing each column (gene)
+        to unit variance, so it can still inflate
+        pca_standardized_explained_variance_ratio's PC2+ components as
+        library-size variance grows -- confirmed empirically (see this
+        module's AGENTS.md 20260820 entry): across the 20260819 tuning
+        trials, pca_standardized_pc2_9_explained_variance_ratio's ratio-to-
+        target rose monotonically from ~0.7 to ~1.6 as lib_size_scale rose
+        across its explored range, with this relationship essentially
+        undiluted (not explained by any other knob) in a full rank-
+        regression against all 18 search-space parameters. Use this family
+        instead of pca_standardized_explained_variance_ratio when you want
+        PCA structure fidelity independent of *both* confounds at once.
+      pca_size_normalized_standardized_tail_participation_ratio:
+        pca_tail_participation_ratio's counterpart computed from
+        pca_size_normalized_standardized_explained_variance_ratio.
   """
   assert X.dim() == 2, f"expected a 2D (n_cells, n_genes) tensor, got shape {tuple(X.shape)}"
   n_cells, n_genes = X.shape
@@ -2462,6 +2489,27 @@ def compute_summary_stats(
     stats["gene_corr_abs_normalized_std"]  = float('nan')
     stats["gene_corr_abs_normalized_p50"]  = float('nan')
     stats["gene_corr_abs_normalized_p90"]  = float('nan')
+
+  # --- library-size-normalized + per-gene-standardized PCA companion: see
+  # pca_size_normalized_standardized_explained_variance_ratio's docstring
+  # above for why this combines the two confound-removal steps above
+  # (pca_standardized_explained_variance_ratio's per-gene standardization,
+  # and gene_corr_abs_normalized_*'s per-cell library-size renormalization)
+  # rather than just reusing one or the other. Computed on
+  # X_struct_normalized (already built above for gene_corr_abs_normalized_*),
+  # standardized exactly like pca_standardized_explained_variance_ratio's Xz.
+  if k >= 1:
+    gene_std_struct_norm = np.clip(X_struct_normalized.std(axis=0, keepdims=True), 1e-6, None)
+    Xzn = (X_struct_normalized - X_struct_normalized.mean(axis=0, keepdims=True)) / gene_std_struct_norm
+    szn = np.linalg.svd(Xzn, full_matrices=False, compute_uv=False)
+    explained_var_zn = szn ** 2
+    total_zn = explained_var_zn.sum()
+    ratio_zn = explained_var_zn / total_zn if total_zn > 0 else np.zeros_like(explained_var_zn)
+    stats["pca_size_normalized_standardized_explained_variance_ratio"] = ratio_zn[:k]
+  else:
+    stats["pca_size_normalized_standardized_explained_variance_ratio"] = np.array([])
+  stats["pca_size_normalized_standardized_tail_participation_ratio"] = pca_participation_ratio(
+      stats["pca_size_normalized_standardized_explained_variance_ratio"])
 
   return stats
 

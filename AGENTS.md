@@ -1374,7 +1374,253 @@ Single-file PyTorch research script (`vae-test.py`). No tests, no package struct
     `checkpoints/best.pt`/`grn_diags/` (including per-trial `candidate_
     stats.json`) for analysis -- specifically to check whether TPE now
     actually converges toward `lib_size_scale`~1.0-1.6 and whether
-    `gene_var_mean`/`gene_mean_mean`/PCA-structure land close to target
-    simultaneously there, as this session's analysis predicts.
+      `gene_var_mean`/`gene_mean_mean`/PCA-structure land close to target
+      simultaneously there, as this session's analysis predicts.
+- The `synthetic_tuning_20260819.0{0-7}` studies (8 seeds, 67-111 completed
+  trials each) were analyzed (`.db`s + `checkpoints/best.pt` + `grn_diags/`
+  copied in from the user's machine). Sanity checks all clean (every
+  `best.pt` reproduces its `.db`'s true argmin exactly; `n_mrs=84` identical
+  across all 8, topology still controlled). Verdict against the user's three
+  target criteria: **sparsity solid** (`zero_frac` ratio-to-target 1.00-1.03x
+  in all 8 seeds), **expression range still off** (`gene_mean_mean`/
+  `gene_var_mean` only 51-76%/20-33% of target in every seed, essentially
+  unchanged from `.20260817`/`.20260818`), **PCA structure mixed, no clear
+  improvement** (raw PC1 ratio 0.59-1.13x, PC2-9 ratio 0.60-0.93x). The
+  round's core hypothesis -- that fixing `gene_corr_abs_mean/p50`'s
+  library-size confound would let `lib_size_scale` reach ~1.3-1.6 where
+  `gene_var_mean`/`log_lib_size_std` were predicted to nearly match target --
+  did not pan out: TPE's `lib_size_scale` distribution barely moved (mean
+  0.797 vs. `.20260817`/`.20260818`'s 0.766/0.769). Root-caused (new this
+  session) by recomputing full weighted `distance` per pooled trial (716
+  completed, all 8 studies) and binning by `lib_size_scale`: the objective's
+  *true* minimum sits at ~0.8-1.2, rising again above ~1.2 -- not unexplored
+  territory, a genuinely worse region, driven by three terms: (1)
+  `gene_corr_abs_p90` (raw, still weight 3.0) suffers the same library-size
+  confound as the now-fixed `mean/p50` (weighted contribution 0.85->3.83
+  across the range) -- left unfixed on the incorrect assumption it "behaved
+  reasonably"; (2) `lib_size_zero_frac` (weight 3.0, target~4e-6) explodes
+  (0.0003->3.34) well before the existing hard `max_lib_size_zero_frac=0.10`
+  prune guard even binds -- its `eps_abs_floor=0.02` is miscalibrated for a
+  near-zero target; (3) `pca_standardized_pc2_9_explained_variance_ratio`
+  (weight 6.0) also rises with `lib_size_scale` (0.18->0.54), a smaller but
+  real tension. `mr_rate_high` confirmed to have no effect (already resolved
+  in `.20260818`, stayed at `5.0` here).
+- User question: is the current parameterization *already* capable of
+  simultaneously matching target range and good PC2-9 structure, with only
+  metric distortions preventing us from finding/selecting such
+  configurations? Investigated via the accumulated evidence: this project's
+  track record is 2-for-2 on prior "hard tradeoffs" turning out to be metric
+  confounds once decomposed (raw PCA vs. gene magnitude -- fixed by
+  `pca_standardized_*`, `.20260816`; raw correlation vs. `lib_size_scale` --
+  fixed by `gene_corr_abs_normalized_*`, `.20260818`). A third instance was
+  found this session: `pca_standardized_pc2_9_explained_variance_ratio` --
+  assumed (in this module's own prior comments) to *improve* alongside
+  `gene_var_mean` as `lib_size_scale` rises -- instead overshoots
+  monotonically (ratio-to-target 0.71->1.64 across the `.20260819` range),
+  and a full rank-regression against all 18 search-space knobs shows this is
+  essentially undiluted by any other knob (partial coef 0.79, next-largest
+  0.30) -- not a GRN-topology effect, but very likely the same per-cell
+  library-size confound already fixed for `gene_corr_abs_*`, just not yet
+  applied to the standardized-PCA computation (which standardizes per-*gene*
+  variance but never renormalizes per-*cell* library size). Conclusion:
+  probable but not yet certain -- the mechanistic argument is strong and
+  the track record favors it, but it remained a hypothesis pending an actual
+  fix + fresh tuning round (this session's `pca_size_normalized_standardized_*`
+  addition below, plus its dedicated standalone verification, directly
+  targets this).
+- Given all of the above, this session implemented and combined three fixes
+  (deliberately bundled into one round rather than split, per user
+  direction/discussion: none of the three's design depends on what the
+  others show, so splitting would mostly cost an extra multi-hour sweep for
+  attribution clarity alone -- mitigated by verifying each low-risk change
+  (A/B1/B2) retroactively against real `.20260819` data, and the higher-risk
+  new-code change (C) standalone + via a real end-to-end SERGIO smoke test,
+  before ever committing to a full sweep):
+  - **(A) `zero_frac` -> `nonzero_frac`** (user-identified): scoring
+    `zero_frac` directly badly under-penalizes sparsity *overshoot*
+    whenever the target is already close to 1, as the real reference is
+    (`zero_frac=0.9242`) -- e.g. a candidate at `zero_frac=0.97` already has
+    ~60% *less* usable (non-zero) data than the reference
+    (`(1-0.97)/(1-0.9242) - 1 = -60%`), but the plain relative-error term on
+    `zero_frac` itself is only `((0.97-0.9242)/(0.9242+eps))**2 ~= 0.0022`
+    -- negligible next to other terms that typically run 0.05-0.5. New
+    `tune_synthetic_data._add_nonzero_frac_key(stats, src_key="zero_frac",
+    dst_key="nonzero_frac")` (mirrors `_add_pca_pc2_9_key`'s no-synthetic_
+    data.py-change-needed convention exactly: `nonzero_frac = 1 -
+    stats["zero_frac"]`, mutates in place, no-op if absent), called at both
+    `run()`/`run_trial()` call sites. Symmetric by construction (also raises
+    the cost of a candidate *denser* than target, not only sparser) -- user
+    confirmed this was the intended shape (Option A from the three discussed:
+    symmetric-via-nonzero_frac / asymmetric-overshoot-only / both) since the
+    corrected relative-error scale alone already does the job the user
+    wanted, without extra asymmetric machinery. Verified by retroactively
+    reranking all `.20260819` studies' already-completed trials under
+    `weights.zero_frac=0.0`/`weights.nonzero_frac=3.0`: the "best" trial
+    changes in 3/8 studies (1, 4, 6), in every case toward a trial with
+    `zero_frac` closer to target (e.g. study 6: `0.9453` (a real 31%
+    usable-data shortfall) -> `0.9239`, almost exact).
+  - **(B1) `gene_corr_abs_std/p90` normalization**: same library-size
+    confound already fixed for `mean/p50` in `.20260818` also affects
+    `std`/`p90`, just milder (raw ratio-to-target reaches ~1.4-2.2x by
+    `lib_size_scale=1.6` vs. `mean/p50`'s 6-17x) -- previously left
+    unweighted-raw on the (incorrect, per this session's binned pooled
+    analysis) assumption they "behaved reasonably". `weights.
+    gene_corr_abs_std/p90` `3.0` -> `0.0`, `weights.gene_corr_abs_
+    normalized_std/p90` `0.0` -> `3.0` (already computed by `synthetic_
+    data.compute_summary_stats` since `.20260818`, just unweighted --
+    config-only change, verified retroactively against real archived
+    `.20260819` `candidate_stats.json` data, no `synthetic_data.py` change
+    needed). Caveat found while verifying: `gene_corr_abs_normalized_p90`
+    does improve with `lib_size_scale` like `mean/p50` did, but `gene_corr_
+    abs_normalized_std` is roughly flat/mildly *worsening* (1.10->1.45) --
+    B1 is a real, worthwhile fix (removes a genuine confound) but a much
+    milder "unlock" than `mean/p50`'s fix was, tempering expectations for
+    how much it alone would move `lib_size_scale` exploration.
+  - **(B2) `lib_size_zero_frac` weight -> `0.0`**: this term's `eps_abs_
+    floor=0.02` is miscalibrated for a near-zero target (~4e-6) -- e.g. even
+    a modest 3% dead-cell fraction produces a term of order 1.0 (roughly
+    10x any other term's typical scale), well before the existing hard
+    `max_lib_size_zero_frac=0.10` prune guard binds at all. Rather than
+    recalibrating the epsilon, dropped the soft weight entirely and rely
+    solely on the hard guard (already doing this exact job, at an explicit,
+    directly-tunable threshold) -- avoids two differently-calibrated
+    mechanisms fighting over the same failure mode.
+  - **(C) new `pca_size_normalized_standardized_*` stat family**
+    (`synthetic_data.compute_summary_stats`, real code change, not just a
+    weight/config change): combines *both* confound-removal steps `pca_
+    standardized_*` and `gene_corr_abs_normalized_*` each separately apply
+    -- computed on `X_struct_normalized` (the library-size-renormalized
+    matrix already built for `gene_corr_abs_normalized_*`), additionally
+    standardized per-gene to unit variance (same 1e-6-floor convention as
+    `pca_standardized_explained_variance_ratio`'s `Xz`). Adds
+    `pca_size_normalized_standardized_explained_variance_ratio` and
+    `..._tail_participation_ratio`; `tune_synthetic_data._add_pca_pc2_9_key`
+    (already generic) derives `pca_size_normalized_standardized_pc2_9_
+    explained_variance_ratio` from it at both call sites, same as the raw/
+    standardized families. `run()` gained the same presence+depth startup
+    check as the other two PCA families. Verified in three stages before
+    trusting it in a real tuning objective (mirroring how `pca_standardized_
+    *`/`gene_corr_abs_normalized_*` were each verified): (1) standalone, on
+    a synthetic log1p-plausible matrix with real multi-module correlation
+    structure -- injecting a strong per-cell multiplicative library-size
+    confound changes raw PCA's and `pca_standardized_*`'s PC1-5 by up to
+    0.37, but the new family by only ~0.0001 (plus edge cases: `n_genes=1`,
+    an all-zero cell, MCAR masking, the `n_structure_genes` subsampling path
+    -- all finite, no NaN/inf, matching `pca_standardized_*`'s own
+    documented edge-case behavior); (2) a real end-to-end smoke test (actual
+    `generate_sergio_grn_from_reference` + `make_synthetic_data6` SERGIO
+    simulation + `compute_summary_stats` + `compute_stats_distance`, using
+    the real `SERGIO` package -- see "Sandbox environment" note below) --
+    completed without error, new key populated with finite values; (3) a
+    second real end-to-end run against the actual new `.20260820.00` config
+    + `weights` + regenerated target pickle (below) -- `state=COMPLETE`,
+    `skipped_stats_keys=[]` (every weighted key, including the three new
+    ones, found and scored, none silently skipped). `weights.pca_
+    standardized_pc2_9_explained_variance_ratio` `6.0` -> `0.0`, new
+    `weights.pca_size_normalized_standardized_pc2_9_explained_variance_
+    ratio` -> `6.0` (its old weight; `..._explained_variance_ratio`/`..._
+    tail_participation_ratio` themselves stay at `0.0`, matching the raw/
+    standardized families' own convention of only weighting the pc2-9
+    slice, not the full vector or the tail-evenness scalar).
+  - **Target stats pickle regenerated** (`...v6.mean.pickle`, same recipe
+    documented in `target_stats_path`'s docstring, ~941s as a detached
+    background process): picks up the three new `pca_size_normalized_
+    standardized_*` keys automatically (recipe is generic, no change
+    needed), and -- since a regeneration was needed anyway -- finally
+    applies the `n_cells_subsample=600` correction flagged but deliberately
+    deferred in the `.20260818` entry (was still `50_000` in `v5`). Values
+    shifted more than a typical regeneration as a result (e.g. `zero_frac`
+    0.9242->0.9161, `gene_corr_abs_normalized_mean` 0.0134->0.0352) --
+    expected, this is precisely the sample-size-apples-to-apples fix that
+    correction called for, not a regression.
+  - **Mistake + recovery, full disclosure**: an early verification step for
+    (C) mistakenly pointed a throwaway `run_trial()` smoke-test call's
+    `config["artifact_dir"]` at the real, already-finished `synthetic_
+    tuning_20260819.00/checkpoints` directory (copied from the loaded
+    `.20260819.00` config without overriding this field first) -- the
+    smoke test's own trial legitimately beat that study's recorded best
+    distance (unrelated non-determinism: reran the same `best_params`,
+    got 0.034995 vs. the original 0.035664, plausibly `generate_sergio_grn_
+    from_reference`'s already-documented `PYTHONHASHSEED` non-determinism,
+    since this process's hash seed was unset/uncontrolled), so `_save_if_
+    best_artifact` correctly-per-its-own-logic overwrote `best.pt` with the
+    smoke test's data. Caught immediately via `best.pt` mtime (only `.00`
+    affected; `.01`-`.07` untouched, confirmed via mtime comparison across
+    all 8). Recovered: `distance`/`candidate_stats`/`params`/`trial_number`
+    restored to their *exact* original values (recoverable losslessly --
+    `distance`/`trial_number` from `tuned_synthetic_config.20260819.00.
+    json`, `candidate_stats` from the untouched `grn_diags/trial23.
+    candidate_stats.json` archive, both independently cross-checked to
+    match byte-for-byte); `X`/`cluster_labels`/`mr_state`/`mr_ids`/`gene_
+    id_to_symbol` regenerated via this module's own sanctioned `regenerate_
+    best()` utility from the same `best_params` -- **not** byte-identical
+    to the original run's tensors (same pre-existing `PYTHONHASHSEED`
+    caveat applies), documented explicitly via a new `_regenerated_note`
+    field left in the restored `best.pt` itself. Net impact: zero data
+    loss for anything this session's (or any prior session's) analysis
+    actually used (all of which reads `candidate_stats`/`distance`, never
+    the raw `X` tensor); the one non-recoverable piece (exact original
+    `X`/`mr_state`) was already understood project-wide to be not-
+    guaranteed-reproducible across processes, and was never itself an input
+    to any completed analysis. Lesson applied immediately afterward: every
+    subsequent smoke/validation run in this session used either a config
+    with `artifact_dir`/`grn_archive_dir` explicitly overridden to a
+    scratch path, or (for the final two real validation runs) the actual
+    intended-for-real `.20260820.00` paths on purpose, never another
+    already-completed study's paths.
+  - **Sandbox environment note**: unlike every prior session this project's
+    `AGENTS.md` describes, this session had a real, working `SERGIO`
+    package available (fetched directly from `https://raw.githubusercontent.
+    com/PayamDiba/SERGIO/master/SERGIO/{__init__,gene,sergio}.py` -- network
+    access to raw.githubusercontent.com/api.github.com worked, whereas
+    `git clone`/full-repo-zip both hung/were impractical (the repo is
+    ~900MB, mostly example data unrelated to the 3 needed source files) --
+    plus `networkx`/`scipy` installed into the existing `tuning_venv`,
+    letting real end-to-end SERGIO simulations run directly in this sandbox
+    for the first time (previously always "unavailable in this sandbox").
+    A separately-downloaded `sergio_rs` (Rust reimplementation) wheel from
+    an earlier session turned out to be a red herring -- `synthetic_data.py`
+    hard-requires the classic `from SERGIO.sergio import sergio` Python
+    package, not `sergio_rs`; installing the latter into `tuning_venv`
+    directly conflicts on `numpy` version (`sergio_rs` needs `==1.26.4`,
+    `scipy`/`anndata`/`torch` need `>=2.0`) and was reverted immediately
+    after discovering this. Not expected to persist to future sessions
+    (this sandbox's state is not guaranteed durable) -- future sessions
+    should re-check availability rather than assume it.
+  - New `synthetic_tuning_config.20260820.0{0-7}.json` (cloned from
+    `.20260819.0{0-7}`): all of A/B1/B2/C's weight changes above, plus
+    `target_stats_path` -> `...v6.mean.pickle`. New `synthetic_tuning_
+    20260820.0{0-7}/{checkpoints,grn_diags}` directories pre-created (the
+    sqlite `storage` path needs its parent directory to already exist).
+    Study `.00` seeded with one real, fully-validated trial each for two
+    purposes: a TPE-suggested trial (legitimately `PRUNED` on `degenerate_
+    lib_size_zero_frac` -- confirms the resumable real-storage path works
+    against the new config) is in the actual persistent `.db`; a second,
+    known-good fixed-`best_params` trial (from a throwaway in-memory study,
+    `state=COMPLETE`, `distance=0.047704`, `skipped_stats_keys=[]`) seeded
+    `checkpoints/best.pt` as a legitimate placeholder that the user's first
+    real completed trial will naturally supersede (not persisted to the
+    real `.db`, since it used a throwaway study object -- by design, so it
+    doesn't skew study `.00`'s real trial history/count).
+  - **Unrelated pre-existing bug noticed while validating** (not fixed this
+    session, flagging only): `run()`'s final summary print
+    (`f"... best_value={study.best_value:.6f} ..."`) raises
+    `ValueError: Record does not exist.` if a study finishes with zero
+    `COMPLETE` trials (e.g. a `n_trials=1` dry run whose only trial happens
+    to get `PRUNED`, as this session's own first `.20260820.00` validation
+    attempt did) -- `study.optimize()` itself already returned successfully
+    and the trial is safely durable in `storage` by that point, so this
+    only breaks the trailing print/`config["output"]` JSON write, not the
+    study/database itself. Effectively never triggered in a real multi-
+    hundred-trial run (would need *every* trial pruned), so left as-is.
+  - **User action required**: launch the 8 `.20260820.0{0-7}` processes
+    (same unbounded/graceful-stop workflow, shared `PYTHONHASHSEED`),
+    aiming for a comparable ~80-100 completed trials per seed to
+    `.20260819` for a clean comparison, then copy back `.db`s/`checkpoints/
+    best.pt`/`grn_diags/` (including per-trial `candidate_stats.json`) for
+    analysis -- specifically to check whether `gene_var_mean`/`gene_mean_
+    mean`/PCA-structure now land closer to target simultaneously, and
+    whether TPE's `lib_size_scale` distribution actually shifts now that
+    all three known distortions pulling against it are addressed.
 
 

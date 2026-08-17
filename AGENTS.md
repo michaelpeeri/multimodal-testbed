@@ -1197,5 +1197,184 @@ Single-file PyTorch research script (`vae-test.py`). No tests, no package struct
     clean comparison, then copy back `.db`s/`checkpoints/best.pt`/
     `grn_diags/` (including per-trial `candidate_stats.json`) for analysis
     against the existing `.20260817` (mr=8) data.
+- The `synthetic_tuning_20260818.0{0-7}` studies (8 seeds,
+  `synthetic_tuning_config.20260818.0{0-7}.json` -- `mr_rate_high` `8.0`
+  -> `5.0`, everything else unchanged from `.20260817.0{0-7}`, 94-128
+  completed trials each) were run and analyzed (`.db`s + `checkpoints/
+  best.pt` + `grn_diags/`, including per-trial `candidate_stats.json`,
+  copied in from the user's machine). Sanity checks all clean: every
+  `best.pt`'s `distance`/`trial_number` reproduces/matches its `.db`'s true
+  argmin exactly (16/16 studies across both `.20260817`/`.20260818`);
+  `n_mrs=84` identical across all 16 studies (topology still controlled).
+  Two major findings, one closing out the `mr_rate_high` question and one
+  opening a much more consequential lead:
+  - **`mr_rate_high`'s pilot-suggested effect (`.20260815.pilot_mr{5,6,8}`)
+    is now refuted by a genuinely isolated A/B, not just an unreplicated
+    one.** Best-trial-level, mr=8 vs mr=5 are indistinguishable:
+    `gene_mean_mean_ratio` 0.535 vs 0.538, `gene_var_mean_ratio` 0.214 vs
+    0.221, mean `distance` 0.0592 vs 0.0568 (well within seed noise). A
+    naive pooled-all-completed-trials comparison initially suggested mr=5
+    was significantly better (Mann-Whitney p=6e-7) -- but this was purely
+    an artifact of `.20260818`'s studies happening to run more trials per
+    seed (94-128 vs `.20260817`'s 80-97; TPE improves over more trials
+    regardless of `mr_rate_high`). Re-tested at truly equal budget
+    (trials 0-79 only, every seed, n=520/525 pooled): **zero significant
+    differences on any of 9 tracked metrics** (all p>0.1, most p>0.8).
+    Combined with `.20260815.0{0-7}`'s earlier (confounded) non-replication,
+    this closes the question: `mr_rate_high` has no measurable effect
+    within the range tested (5.0-8.0) -- reverted to `5.0` (the original
+    default) going forward, no more budget spent on this knob.
+  - **Root-cause diagnosis of the `lib_size_scale` ceiling (first
+    identified `.20260814`, confirmed real `.20260815`/`.20260817`): it is
+    largely a metric artifact, not a fundamental simulator/objective
+    tradeoff.** Pooling all completed+pruned trials with archived
+    `candidate_stats` across both `.20260817`/`.20260818` (n=1884,
+    topology-controlled), binning by `lib_size_scale`: `gene_var_mean`,
+    `gene_mean_mean`, `log_lib_size_std`, `pca_standardized_pc2_9_
+    explained_variance_ratio`, and `gene_corr_abs_std`/`p90` all improve
+    *monotonically* toward target as `lib_size_scale` rises -- reaching
+    near-perfect matches (`gene_var_mean` ratio-to-target ~0.94-0.98,
+    `gene_corr_abs_std` ratio ~0.91) around `lib_size_scale`~1.3-1.6, far
+    better than any best-trial in any round to date. But `gene_corr_abs_
+    mean`/`gene_corr_abs_p50` (weight 3.0 each) explode over that exact
+    same range (ratio-to-target 0.6x -> 6-17x), and a binned breakdown of
+    total weighted `distance` shows this pair alone accounts for the
+    global minimum sitting at `lib_size_scale`~0.7 rather than ~1.3-1.6 --
+    i.e. these two terms, not the `max_lib_size_zero_frac` guard (which
+    only starts binding noticeably past `lib_size_scale`~1.5-2.7, 5-10x
+    less severely), are the actual thing preventing TPE from reaching the
+    region where nearly everything else would land close to target
+    simultaneously. Mechanism: `gene_corr_abs_*` (`synthetic_data.py`'s
+    `compute_summary_stats`) is computed on raw, non-library-size-
+    normalized log1p counts. SERGIO's `lib_size_effect` rescales each
+    cell's *entire* gene vector by one shared per-cell lognormal factor
+    (variance controlled by `lib_size_scale`) -- a rank-1 component that
+    is by construction perfectly correlated across every gene, inflating
+    *every* pairwise raw correlation roughly uniformly as that variance
+    grows. This hits `gene_corr_abs_mean`/`p50` (dominated by the bulk of
+    gene pairs, which have ~0 true correlation in the real reference --
+    target `gene_corr_abs_p50`=0.039 vs `gene_corr_abs_std`=0.133) far
+    harder than `gene_corr_abs_std`/`p90` (dominated by genuinely
+    co-regulated tail pairs, which already have real covariance to compete
+    with the confound, and which is exactly why those two behave
+    reasonably and keep improving with `lib_size_scale` instead). This is
+    mechanistically identical to the `pca_standardized_*` fix's diagnosis
+    (`.20260816` entry) -- a raw, scale/depth-confounded stat masquerading
+    as "structure" -- just discovered a round later, for a different stat
+    family.
+  - Resulting changes (this session):
+    - `synthetic_data.py`'s `compute_summary_stats` gained a library-size-
+      normalized gene-correlation family, `gene_corr_abs_normalized_
+      {mean,std,p50,p90}`: computed identically to the existing raw
+      `gene_corr_abs_*` block, but on `X_struct` rebuilt from each cell's
+      raw counts renormalized to a common total (median library size
+      across cells) before `log1p` -- standard scRNA-seq size-factor/CPM-
+      style normalization, decoupling the statistic from per-cell
+      sequencing-depth variation while preserving genuine cross-gene
+      covariance. Computed *in addition to*, not replacing, the raw
+      family (same convention as `pca_standardized_*`). Verified
+      standalone (real torch/numpy, `/tmp/opencode/tuning_venv`): on a
+      synthetic matrix with genuine 3-module gene correlation structure,
+      injecting a per-cell multiplicative "library effect" factor and
+      comparing a low-variance vs. high-variance draw of that factor --
+      raw `gene_corr_abs_mean`/`p50`/`p90` shift by +0.52/+0.59/+0.79
+      between the two, while `gene_corr_abs_normalized_{mean,std,p50,p90}`
+      all shift by <0.001 (near-exactly flat) and still show the genuine
+      injected module structure (non-collapsed, ~0.25 mean vs. a
+      near-zero true-null baseline). Also verified robust to NaN/MCAR
+      masking, a fully-degenerate (all-zero) cell, the `n_structure_genes`
+      gene-subsampling path, and the `n_struct_genes<2` degenerate case
+      (all produce finite, non-NaN/inf output or the documented NaN
+      fallback, matching the raw block's own edge-case behavior). No
+      existing key's computation was touched -- purely additive (verified
+      via the diff itself: only new lines added, no existing statements
+      modified).
+    - `tune_synthetic_data.py`'s `run()` gained a startup presence check
+      for `gene_corr_abs_normalized_mean` in a loaded `target_stats_path`
+      pickle (same pattern as the existing raw-PCA/standardized-PCA
+      checks, warning rather than erroring if a stale pickle predates this
+      addition) -- no depth/apples-to-apples check needed since these are
+      plain scalars, not an `n_pca_components`-dependent array like the
+      PCA families. `target_stats_path`'s docstring updated to mention the
+      new family alongside the existing PCA-family notes (still no recipe
+      change needed -- the recipe already stores whatever
+      `compute_summary_stats()` returns generically).
+    - **Target stats pickle regenerated in this sandbox** (a change from
+      every prior round, which needed this done on the user's machine):
+      the real reference `.h5ad` (`data/1cb67ec8-...h5ad`, 1.4GB) turned
+      out to already be present locally, and installing `anndata`
+      (network access available this session) was sufficient to run
+      `load_reference_h5ad`/`compute_summary_stats` directly here -- no
+      SERGIO/GRN-simulation step is needed for *this* recipe (it only
+      reads the real reference, not a synthetic candidate). Ran the exact
+      recipe documented in `target_stats_path`'s own docstring (`n_genes=
+      800`, `grn_seed=42`, `reference_n_cells_subsample=50_000` (default),
+      20 averaged runs at `seed=0..19`, `n_pca_components=20`), 731/800
+      requested gene symbols matched (consistent with prior rounds' ~85-95%
+      match rate), as a detached background process (`setsid`, needed since
+      the shell tool's own timeout otherwise kills backgrounded jobs unless
+      fully detached from the invoking shell's process group) -- ~114-130s
+      for the first 3 runs then ~26-30s/run once the OS file cache warmed
+      up for the 1.4GB `.h5ad`, ~13 min total (not the ~44 min originally
+      estimated from the cold-cache first run) -- produced
+      `1cb67ec8-c9e3-4d4a-ba23-a1a8ef3f8450.GRNseed42.stats.v5.mean.pickle`,
+      verified to contain every `v4` key unchanged in kind (values shifted
+      slightly from `v4`'s, e.g. `gene_corr_abs_mean` 0.099->0.065 --
+      expected run-to-run variation from a different random gene/cell
+      subsample, not a regression -- `n_cells`/`n_genes` are in
+      `_EXCLUDED_STATS_KEYS` so don't affect scoring either way) plus the 4
+      new `gene_corr_abs_normalized_*` keys, and to correctly trigger
+      `run()`'s new missing-key warning when pointed at the old `v4`
+      pickle instead. Caveat: unlike the tuning-study processes,
+      `PYTHONHASHSEED` was not fixed for this one-time, single-process
+      `generate_sergio_grn_from_reference` call -- immaterial here (only
+      one call, in one process, its `select_gene_symbols` output reused
+      identically across all 20 `load_reference_h5ad`/
+      `compute_summary_stats` runs within that same process; the
+      known hash-order non-determinism only matters for keeping topology
+      *consistent across separate processes*, e.g. the 8 sim-seed tuning
+      studies, which is unaffected by this one-off target-stats job).
+      **Correction (user-caught): `load_reference_h5ad`'s `n_cells_
+      subsample` was left at its own default (50,000) for this run, but
+      should have been set to `600` -- matching this config's own
+      `n_cells` (the deliberately small, "streamlined" per-trial candidate
+      cell count SERGIO actually simulates at during tuning) -- so the
+      target and every candidate are compared on equal footing for
+      sample-size-sensitive stats (`gene_corr_abs_*`, PCA explained-
+      variance-ratio, any percentile-based stat all have some inherent
+      small-n noise/bias that a 50,000-cell target simply doesn't have,
+      unlike a 600-cell candidate). This is apparently how `v2`/`v3`/`v4`
+      were generated (confirms `v4`'s own `n_cells=600`, noticed but not
+      investigated during this session's `v4`-vs-`v5` sanity diff above).
+      Per user direction, `v5.mean.pickle` itself was *not* regenerated
+      with the corrected cell count -- averaging over 20 runs already
+      washes out most of the sample-size-driven difference for a pickle
+      that's otherwise fine, so a fresh regeneration wasn't judged worth
+      the ~13 min re-run cost this round -- but the recipe in `tune_
+      synthetic_data.py`'s `target_stats_path` docstring is fixed
+      (`n_cells_subsample=600` added to the `load_reference_h5ad(...)`
+      call, with a comment explaining why) for whenever the pickle next
+      needs regenerating for an unrelated reason.
+    - New `synthetic_tuning_config.20260819.0{0-7}.json` (cloned from
+      `.20260818.0{0-7}`, `mr_rate_high` stays `5.0`,
+      `max_lib_size_zero_frac` stays `0.10`, search space unchanged):
+      `weights.gene_corr_abs_mean`/`gene_corr_abs_p50` `3.0` -> `0.0`;
+      new `weights.gene_corr_abs_normalized_mean`/
+      `gene_corr_abs_normalized_p50` -> `3.0` (replacing the zeroed raw
+      ones at the same weight); new `weights.gene_corr_abs_normalized_
+      std`/`gene_corr_abs_normalized_p90` -> `0.0` (left unweighted for
+      now, since the raw `std`/`p90` already behave reasonably and are
+      kept at their existing weight -- avoids double-counting the same
+      tail-correlation signal via two families at once); `target_stats_
+      path` updated to the new `.v5` pickle.
+  - **User action required**: launch the 8 `.20260819.0{0-7}` processes
+    (same unbounded/graceful-stop workflow, shared `PYTHONHASHSEED`),
+    aiming for a comparable ~80-100 completed trials per seed to
+    `.20260817`/`.20260818` for a clean comparison, then copy back `.db`s/
+    `checkpoints/best.pt`/`grn_diags/` (including per-trial `candidate_
+    stats.json`) for analysis -- specifically to check whether TPE now
+    actually converges toward `lib_size_scale`~1.0-1.6 and whether
+    `gene_var_mean`/`gene_mean_mean`/PCA-structure land close to target
+    simultaneously there, as this session's analysis predicts.
 
 

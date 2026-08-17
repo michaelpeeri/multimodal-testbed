@@ -302,10 +302,30 @@ See synthetic_tuning_config.example.json for a full example. Notable keys
                                 # previously omitted n_pca_components, silently defaulting
                                 # to 10 while those studies' candidates used 20 -- run()'s
                                 # startup check now catches this explicitly, see below).
+                                #
+                                # n_cells_subsample here MUST match this config's own
+                                # "n_cells" (the streamlined per-trial candidate cell
+                                # count -- 600 by default, deliberately small so each
+                                # SERGIO trial runs quickly) rather than
+                                # load_reference_h5ad's own much larger 50_000 default --
+                                # several stats here (gene_corr_abs_*, PCA explained-
+                                # variance-ratio, any percentile-based stat) are
+                                # sample-size-sensitive, so comparing a target computed
+                                # from 50_000 reference cells against candidates each
+                                # computed from only 600 simulated cells is not
+                                # apples-to-apples (the target would be far less noisy
+                                # than any candidate could realistically match). This
+                                # was missed when the 20260818 gene_corr_abs_normalized_*
+                                # addition's target pickle (v5) was regenerated -- left
+                                # as-is (v5.mean.pickle not regenerated) since averaging
+                                # over 20 runs already washes out most of the difference
+                                # for that particular pickle, but the recipe itself is
+                                # fixed here for future regenerations.
                                 stats_list = [
                                     compute_summary_stats(
                                         load_reference_h5ad(
-                                            path, select_gene_symbols=select_gene_symbols, seed=i,
+                                            path, select_gene_symbols=select_gene_symbols,
+                                            n_cells_subsample=600, seed=i,
                                         )[0],
                                         n_pca_components=20,
                                     )

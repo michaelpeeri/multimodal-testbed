@@ -269,12 +269,15 @@ weighted-mean distance, via _prune() (excludes the trial from
 best_value/best_trial entirely, unlike a merely-large distance term):
   - candidate_stats["lib_size_zero_frac"] (fraction of cells with ~0 total
     counts) must be <= config["max_lib_size_zero_frac"] (default 0.05).
-  - candidate_stats["pca_explained_variance_ratio"][0] (fraction of
-    variance in the leading PC) must be <=
-    config["max_pca_pc1_ratio_factor"] * target_stats
-    ["pca_explained_variance_ratio"][0] (default factor 1.3), i.e. the
-    candidate's dominant-axis concentration can't exceed the reference's
-    own by more than 30%.
+  - candidate_stats[config["pca_pc1_dominance_key"]][0] (fraction of
+    variance in the leading PC, of whichever PCA family
+    pca_pc1_dominance_key names -- default "pca_explained_variance_ratio",
+    the raw family) must be <= config["max_pca_pc1_ratio_factor"] *
+    target_stats[config["pca_pc1_dominance_key"]][0] (default factor 1.3),
+    i.e. the candidate's dominant-axis concentration can't exceed the
+    reference's own by more than 30%. See pca_pc1_dominance_key's own
+    docstring entry above for why this should track whichever PCA family
+    the objective itself weights, not necessarily the raw default.
 Both are tagged via trial.user_attrs["prune_reason"] ("degenerate_
 lib_size_zero_frac"/"degenerate_pca_pc1_dominance") for post-hoc analysis,
 same convention as grn_generation_failed/simulation_failed/non_finite_
@@ -476,9 +479,36 @@ See synthetic_tuning_config.example.json for a full example. Notable keys
                             a trial is pruned if candidate_stats
                             ["lib_size_zero_frac"] exceeds this.
     max_pca_pc1_ratio_factor : float, default 1.3 -- hard guard: a trial is
-                            pruned if candidate_stats
-                            ["pca_explained_variance_ratio"][0] exceeds
-                            this factor times target_stats's own PC1 ratio.
+                            pruned if candidate_stats[pca_pc1_dominance_key]
+                            [0] exceeds this factor times target_stats's own
+                            value at that same key.
+    pca_pc1_dominance_key   : str, default "pca_explained_variance_ratio" --
+                            which PCA family's PC1 the max_pca_pc1_ratio_
+                            factor guard above checks. Historically always
+                            the raw (un-normalized) family -- but as of the
+                            20260816/20260820 rounds (see AGENTS.md), the
+                            *objective* itself may weight a different PCA
+                            family entirely (pca_standardized_*/pca_size_
+                            normalized_standardized_*), in which case this
+                            guard and the soft objective are checking two
+                            different things: empirically (20260820 AGENTS.md
+                            entry), a large fraction of trials this guard
+                            pruned would have scored *well* under the actual
+                            (size-normalized-standardized) objective, and in
+                            2/8 of that round's studies the single best
+                            guard-rejected trial would have beaten the
+                            study's true best surviving trial. Set this to
+                            whichever family's PC1 key your weights dict
+                            actually scores (e.g.
+                            "pca_size_normalized_standardized_explained_
+                            variance_ratio") to keep the guard aligned with
+                            the objective -- and re-tune max_pca_pc1_ratio_
+                            factor itself when doing so, since each family's
+                            plausible PC1 range differs (the size-normalized-
+                            standardized family's PC1 sits much closer to
+                            its own tail than the raw family's does, so the
+                            same factor value doesn't mean the same thing in
+                            both families).
     storage                : str, default "sqlite:///synthetic_tuning.db" --
                             same sqlite-resumability pattern as tuning.py;
                             run this script from multiple processes against
@@ -733,6 +763,7 @@ _CONFIG_DEFAULTS = {
     # module docstring's "Hard guards" note).
     "max_lib_size_zero_frac":   0.05,  # candidate's lib_size_zero_frac must be <= this
     "max_pca_pc1_ratio_factor": 1.3,   # candidate PC1 ratio must be <= this * target PC1 ratio
+    "pca_pc1_dominance_key": "pca_explained_variance_ratio",  # which PCA family's PC1 the guard above checks -- see docstring
 
     # Optuna
     "storage":      "sqlite:///synthetic_tuning.db",
@@ -1224,20 +1255,30 @@ def run_trial(trial: optuna.Trial, config: dict, target_stats: dict) -> float:
         )
 
     cand_pca = candidate_stats.get("pca_explained_variance_ratio", np.array([]))
-    target_pca = target_stats.get("pca_explained_variance_ratio", np.array([]))
     # Full per-PC explained-variance-ratio vector -- not just the top-5
     # worst compute_stats_distance terms (which only shows the biggest
     # gaps, not the actual shape) -- since PC-by-PC spread (not just PC1
     # dominance) is the whole point of the coherency/canalization/
-    # balancing mechanism; see AGENTS.md's Known Issues entry.
+    # balancing mechanism; see AGENTS.md's Known Issues entry. Always the
+    # *raw* family, regardless of pca_pc1_dominance_key below -- this is a
+    # diagnostics/plotting field (plot_grn_diagnostics), independent of
+    # which family the hard guard itself checks.
     trial.set_user_attr("candidate_pca_explained_variance_ratio", [float(v) for v in cand_pca])
-    if len(cand_pca) and len(target_pca):
-        max_pc1 = float(target_pca[0]) * config["max_pca_pc1_ratio_factor"]
-        if float(cand_pca[0]) > max_pc1:
+
+    # See pca_pc1_dominance_key's own docstring (module docstring's "Hard
+    # guards against degenerate candidates" / _CONFIG_DEFAULTS) for why this
+    # defaults to the raw family but should be pointed at whichever PCA
+    # family the objective's weights dict actually scores.
+    pc1_key = config.get("pca_pc1_dominance_key", "pca_explained_variance_ratio")
+    cand_pc1_pca = candidate_stats.get(pc1_key, np.array([]))
+    target_pc1_pca = target_stats.get(pc1_key, np.array([]))
+    if len(cand_pc1_pca) and len(target_pc1_pca):
+        max_pc1 = float(target_pc1_pca[0]) * config["max_pca_pc1_ratio_factor"]
+        if float(cand_pc1_pca[0]) > max_pc1:
             _prune(
                 trial, "degenerate_pca_pc1_dominance",
-                f"pc1_ratio={float(cand_pca[0]):.4f} > "
-                f"max_allowed={max_pc1:.4f} (target={float(target_pca[0]):.4f}, "
+                f"{pc1_key}[0]={float(cand_pc1_pca[0]):.4f} > "
+                f"max_allowed={max_pc1:.4f} (target={float(target_pc1_pca[0]):.4f}, "
                 f"factor={config['max_pca_pc1_ratio_factor']})",
             )
 
@@ -1685,6 +1726,23 @@ def run(config_path: str) -> optuna.Study:
                 f"candidate are NOT apples-to-apples until target_stats_path is "
                 f"regenerated with a matching n_pca_components. ***"
             )
+
+    # config["pca_pc1_dominance_key"]'s presence check -- see that key's own
+    # docstring entry (module docstring / _CONFIG_DEFAULTS) for why this
+    # should track whichever PCA family the objective's weights dict
+    # actually scores. Unlike the weighted-objective keys above, an absent
+    # key here doesn't just silently skip a soft term -- it silently
+    # disables the hard degenerate-PC1-dominance guard entirely (empty-array
+    # short-circuit in run_trial()), so this is a loud warning even though
+    # nothing strictly breaks.
+    pc1_key = config.get("pca_pc1_dominance_key", "pca_explained_variance_ratio")
+    if pc1_key not in target_stats:
+        print(
+            f"  *** WARNING: config['pca_pc1_dominance_key']={pc1_key!r} is not a key "
+            f"in target_stats -- the degenerate_pca_pc1_dominance hard guard will "
+            f"silently never fire (run_trial() short-circuits when either side's "
+            f"array is empty). Regenerate target_stats_path or fix this config key. ***"
+        )
 
     study = optuna.create_study(
         study_name=config["study_name"],

@@ -1622,5 +1622,191 @@ Single-file PyTorch research script (`vae-test.py`). No tests, no package struct
     mean`/PCA-structure now land closer to target simultaneously, and
     whether TPE's `lib_size_scale` distribution actually shifts now that
     all three known distortions pulling against it are addressed.
+- The `synthetic_tuning_20260820.0{0-7}` studies (8 seeds, 100-155 total
+  trials each, 70-121 completed) were run and analyzed (`.db`s +
+  `checkpoints/best.pt` + `grn_diags/`, including per-trial `candidate_
+  stats.json`, copied in from the user's machine). Sanity checks all clean:
+  every `best.pt`'s `distance`/`trial_number` reproduces/matches its `.db`'s
+  true argmin exactly in all 8 studies (once `_add_pca_pc2_9_key`/
+  `_add_nonzero_frac_key` are applied to the loaded target pickle before
+  recomputing -- these mutate `target_stats` in place inside `run()`, so a
+  raw pickle load alone isn't directly comparable); `n_mrs=84` identical
+  across all 1013 pooled trials (topology still controlled). Findings:
+  - **True-best `distance` per study dropped to 0.016-0.024** (mean 0.018,
+    vs. `.20260819`'s 0.032-0.049/mean 0.042) -- but this is **not**
+    directly comparable to prior rounds' numbers, since the objective's
+    weights changed substantially this round (A/B1/B2/C above); the
+    magnitude drop is largely mechanical (fewer/different weighted terms),
+    not by itself evidence of a better fit.
+  - **Fix C validated exactly as designed**: pooling all 751 completed
+    trials and binning by `lib_size_scale`, `pca_size_normalized_
+    standardized_pc2_9_explained_variance_ratio`-ratio-to-target is now
+    flat (~0.63-0.78) across the entire `lib_size_scale` range 0-1.8 (rho=
+    +0.18 vs. `lib_size_scale`, down from the pre-fix `pca_standardized_
+    pc2_9_*`'s rho on the same `.20260819` data implied by that round's
+    entry) -- the per-cell library-size confound this fix targeted is
+    confirmed removed.
+  - Best-trial ratios-to-target (mean across the 8 studies): `gene_mean_
+    mean` 1.04 (0.93-1.17, up from `.20260819`'s 0.64 -- fix A/reweighting
+    working as intended), `gene_var_mean` 0.56 (0.43-0.81, up from 0.27),
+    `gene_var_std` 0.49 (0.38-0.67, up from 0.29), `log_lib_size_std` 0.93
+    (0.74-1.06, up from 0.70), `zero_frac` 0.98 (solid, as before). New
+    `nonzero_frac` ratio (the metric fix A actually optimizes) averages
+    1.18 (1.11-1.33) -- candidates are ~18% less sparse than target despite
+    `zero_frac` itself looking fine, a real gap this new metric surfaces
+    that `zero_frac` alone was hiding. `gene_corr_abs_normalized_{mean,std,
+    p50,p90}` (fix B1) average 0.78-0.94, still undershooting but improved
+    from the unweighted raw family. `gene_var_std` and `gene_mean_mean`/
+    `gene_var_mean` are the new dominant weighted-`distance` drivers (top-3
+    contributor in 7/8 and 5/8 studies respectively).
+  - **PC1-dominance pruning nearly tripled** (19.8% of all 1013 trials this
+    round vs. `.20260819`'s 12.0%, `.20260817`/`.20260818`'s 7.5-8.6%) --
+    see the dedicated investigation below, which found this to be a real
+    problem (not just wasted budget) and fixed it this session.
+  - `hill_coeff` shows **zero** search-space boundary saturation this round
+    (0% of top-5%-by-distance trials near the bound, vs. `.20260815`'s
+    flagged 27%) -- consistent with the objective having moved to a
+    different optimum region; not currently a concern.
+  - coherency/canalization/balancing mechanism: now essentially uncorrelated
+    with `distance` (all `|rho|<0.1`, pooled n=751) and only weakly
+    correlated with its own intended target (`canalization_strength` vs.
+    `pca_size_normalized_standardized_pc2_9_ratio`: rho=-0.084) -- consistent
+    with prior rounds' finding that this remains a second-order lever;
+    not investigated further this session.
+  - Convergence: 4/8 seeds (00, 03, 05, 07) still improved 10-19% in their
+    final 20% of trials; the other 4 (01, 02, 04, 06) had already flatlined
+    by the 80% mark.
+- **Investigated (user questions) whether (a) `mr_state`'s current i.i.d.
+  random generation is a limiting factor on PC2-9 structure, and (b) the
+  apparent "best PC2-9 trials undershoot gene_mean at the high end" pattern
+  visible in the 8 best-trial table is a real tradeoff.** Both investigated
+  against the real `.20260820` data (best.pt` tensors + pooled per-trial
+  archives), no code changes from this part:
+  - **(a) `mr_state` structuring**: confirmed `_sample_mr_state` draws every
+    `(cluster, MR)` entry fully i.i.d. from `Uniform(mr_rate_low,
+    mr_rate_high)` -- checked directly against real best-trial `mr_state`
+    tensors: per-MR variance *across* the 15 clusters (~1.22) is
+    indistinguishable from the i.i.d. theoretical variance (1.33), i.e. no
+    more/less between-cluster structure than pure chance produces. The
+    actual simulated expression data does show real between-cluster
+    separation concentrated in PC2-9 (ANOVA-style eta^2 ~0.06-0.35 for
+    PC2-9 vs. ~0.02-0.04 for PC1, computed from real best-trial `X`/
+    `cluster_labels`) -- but per the above, this is downstream of *lucky*
+    i.i.d. draws given `n_clusters=15`, not anything designed. Plausible
+    but **not proven** with this session's data that a designed/structured
+    `mr_state` (e.g. a shared low-rank cell-type-program basis rather than
+    independent per-cluster-per-MR draws) would give more reliable/larger
+    PC2-9 structure -- no existing study varies this axis in isolation, and
+    the one available proxy check (`mr_state`'s own participation ratio vs.
+    `pca_size_normalized_standardized_pc2_9_ratio` across the 8 seeds) is
+    far too small-n (rho=0.24, p=0.57) to be informative. Flagged as a
+    plausible, genuinely new, orthogonal-to-the-GRN-topology-mechanism
+    lever worth a dedicated pilot (per user direction, deferred to fold in
+    after this session's plan below, not implemented this session).
+  - **(b) PC2-9-vs-high-`gene_mean` tradeoff: investigated rigorously,
+    does NOT hold up.** Pooled across all 751 completed trials (8 studies),
+    proper deviation-from-target correlation (`|pca_size_normalized_
+    standardized_pc2_9_ratio - 1|` vs. `|gene_mean_p95_ratio - 1|`, the
+    methodologically-correct form per the `.20260817` entry's earlier
+    correction) is **positive** (rho=+0.28, p=4e-15) -- good PC2-9 matches
+    *co-occur* with good `gene_mean_p95` matches, they don't trade off; the
+    same holds within every individual seed (8/8 per-study correlations
+    positive, rho +0.10 to +0.53). Splitting into over/undershoot groups on
+    `gene_mean_p95` shows near-identical mean `pc29_szn_ratio` either way
+    (0.686 vs. 0.717). The visual pattern in the 8-best-trials table is
+    small-sample noise (n=8, rho=-0.24, p=0.57, not remotely significant) --
+    e.g. the single best PC2-9 match among those 8 (study `.07`, ratio
+    0.778) also has one of the best `gene_mean_p95` matches (0.950).
+    Contrast: the **raw** (un-fixed) `pca_pc2_9_explained_variance_ratio`
+    *does* still show a strong negative correlation with `gene_mean_p95_
+    ratio` (rho=-0.59) on this same data, consistent with the already-
+    diagnosed library-size confound in that metric -- but that's exactly
+    the family this round's fix C replaced in the actual objective, so it
+    doesn't apply to what's actually being optimized against.
+- Per user direction, implemented the two highest-priority fixes identified
+  above (deferring the `mr_state`-structuring idea, confirmed orthogonal,
+  to a later dedicated pilot) and validated both with a real end-to-end
+  SERGIO smoke test (`run_trial` invoked directly against a real, if tiny,
+  `n_trials=3` in-memory study, `PYTHONPATH`-injected `SERGIO` package
+  copy still present in this sandbox from an earlier session at
+  `/tmp/opencode/SERGIO_pkg` -- not expected to persist, re-check
+  availability in future sessions) using scratch `artifact_dir`/
+  `grn_archive_dir`/`storage` paths (learning applied from the `.20260820`
+  entry's mistake-and-recovery note: never point a validation run's output
+  paths at a real study's directories):
+  - **Retargeted the degenerate-PC1-dominance hard guard** at whichever PCA
+    family the objective actually weights, instead of always the raw one.
+    New `config["pca_pc1_dominance_key"]` (default
+    `"pca_explained_variance_ratio"`, preserving old behavior byte-for-byte
+    for any config that doesn't set it) names the `candidate_stats`/
+    `target_stats` key `run_trial()`'s hard guard reads PC1 from;
+    `max_pca_pc1_ratio_factor` continues to scale whatever that key's
+    target value is. Root cause this fixes: the `.20260820` objective
+    weights `pca_size_normalized_standardized_pc2_9_explained_variance_
+    ratio` (fix C) and zero-weights the raw PCA family entirely, but the
+    hard guard was still unconditionally checking the *raw* family's PC1 --
+    guard and objective measuring two different things. Recomputing full
+    weighted `compute_stats_distance` for all 201 `.20260820` PC1-dominance-
+    pruned trials (from their already-archived `candidate_stats.json`,
+    exactly as `run_trial` would have scored them had the guard not fired)
+    showed this was a real, not just theoretical, problem: in 2/8 studies
+    (04, 07) the single best trial among that study's own pruned pool would
+    have beaten its true best surviving trial (e.g. study 07: hypothetical
+    0.01627 vs. actual best 0.01701); and the guard disproportionately
+    walled off high `lib_size_scale` (81% pruned above 1.3, vs. 12% pruned
+    within `[0.6, 1.3]`) -- exactly the region driving `gene_var_mean`/
+    `gene_var_std` improvement (`lib_size_scale` is the #1 rank-regression
+    driver of both, partial coef +0.59/+0.66 respectively). New
+    `synthetic_tuning_config.20260821.0{0-7}.json` sets
+    `pca_pc1_dominance_key` -> `"pca_size_normalized_standardized_
+    explained_variance_ratio"` and re-picks `max_pca_pc1_ratio_factor` 1.3
+    -> 2.0 (calibrated from the same real `.20260820` data: candidates with
+    this family's PC1 ratio-to-target in the ~0.7-1.6 range, which covers
+    every `.20260820` best trial, average weighted `distance` ~0.03-0.05,
+    while >2.0 already averages >0.20 -- a real degenerate region, not an
+    arbitrarily-chosen cutoff). `run()` also gained a startup presence
+    check (loud warning, not a hard error) if `pca_pc1_dominance_key` is
+    ever missing from a loaded `target_stats` pickle, since an absent key
+    silently disables the guard entirely (empty-array short-circuit in
+    `run_trial()`) rather than merely skipping one soft term the way the
+    existing per-family presence checks do. Verified via the smoke test:
+    a real trial's `pca_size_normalized_standardized_explained_variance_
+    ratio[0]` ratio-to-target of 0.974 (well under the new 2.0 factor)
+    correctly did not trigger `degenerate_pca_pc1_dominance`, while two
+    other trials were independently pruned for `degenerate_lib_size_
+    zero_frac` first (confirming that guard's own logic is untouched).
+  - **Widened `search_space.lib_size_mean`'s upper bound 6.0 -> 8.0.**
+    Pooled across all 751 `.20260820` completed trials, `gene_var_mean`/
+    `gene_var_std` ratio-to-target rise monotonically with `lib_size_mean`
+    all the way to the old search space's boundary with no sign of
+    plateauing (trials with `lib_size_mean>5.7` still average only ~0.61x/
+    target on `gene_var_mean`), and all 8 studies' best trials cluster near
+    that same boundary (4.96-5.95, mean 5.25) -- the bound itself, not the
+    objective, was the limiting factor. No corresponding change to
+    `dropout_percentile`'s bounds: its best-trial values already span its
+    full `[40, 99]` range (not saturated), it's simply an underexplored
+    lever for decoupling the new `nonzero_frac` overshoot from
+    `gene_var_mean` fit (binning jointly by `lib_size_mean>4.75` and
+    `dropout_percentile` in `[73, 89]` shows `nonzero_frac_ratio`~1.0-1.04
+    achievable at little cost to `gene_var_mean_ratio`, still ~0.40-0.48,
+    same as elsewhere) -- expected to resolve with more trials/the wider
+    `lib_size_mean` range rather than needing its own search-space change.
+  - New `synthetic_tuning_config.20260821.0{0-7}.json` (cloned from
+    `.20260820.0{0-7}`, all of that round's A/B1/B2/C weight changes
+    retained unchanged): the two changes above, plus the usual per-seed
+    path/study_name bump. New `synthetic_tuning_20260821.0{0-7}/
+    {checkpoints,grn_diags}` directories pre-created (sqlite `storage`
+    needs its parent directory to exist).
+  - **User action required**: launch the 8 `.20260821.0{0-7}` processes
+    (same unbounded/graceful-stop workflow, shared `PYTHONHASHSEED`),
+    aiming for a comparable trial budget to `.20260820` for a clean
+    comparison, then copy back `.db`s/`checkpoints/best.pt`/`grn_diags/`
+    (including per-trial `candidate_stats.json`) for analysis --
+    specifically to check whether the PC1-dominance prune rate drops back
+    toward `.20260817`/`.20260818`'s ~7.5-8.6% baseline, whether `lib_size_
+    scale`/`lib_size_mean` actually move into the previously-walled-off
+    higher-value region, and whether `gene_var_mean`/`gene_var_std` close
+    further as a result. The `mr_state`-structuring idea (orthogonal,
+    deferred above) remains open for a future dedicated pilot.
 
 

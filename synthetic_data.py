@@ -1,8 +1,14 @@
+import argparse
 import csv
+import json
 import math
 import os
+import pickle
 import re
 import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -1657,6 +1663,513 @@ def make_synthetic_data6(
 
 
 # --------------------------------------------------------------------------
+# MR overlap tree + tree-correlated mr_state sampling.
+# --------------------------------------------------------------------------
+# _sample_mr_state (tune_synthetic_data.py) draws every (cluster, MR) entry
+# i.i.d. from Uniform(mr_rate_low, mr_rate_high) -- no MR ever gets a rate
+# correlated with any other MR's, regardless of how much regulatory overlap
+# they share. The functions below build a hierarchical clustering of a
+# GRN's master regulators by the overlap of the gene sets they directly
+# regulate (build_mr_overlap_tree), then sample MR states whose cross-MR
+# *correlation* (not marginal distribution) is driven by that tree
+# (sample_mr_state_from_tree): MRs that regulate highly overlapping gene
+# sets get correlated basal rates across states, so their (also overlapping)
+# target genes tend to respond coherently -- inducing exactly the kind of
+# co-regulated-gene correlation structure i.i.d. mr_state sampling cannot.
+#
+# Typical usage (see also run_mr_tree_experiment below for a full paired
+# tree-vs-i.i.d. comparison harness):
+#   grn_path, mr_ids, _ = generate_sergio_grn_from_reference(..., seed=42)
+#   tree     = build_mr_overlap_tree(grn_path, mr_ids)
+#   mr_state = sample_mr_state_from_tree(
+#       tree, n_states=n_clusters, low=1.0, high=5.0, seed=0, tree_strength=1.0)
+#   X, cluster_labels = make_synthetic_data6(
+#       mr_state=torch.tensor(mr_state, dtype=torch.float32),
+#       input_file_targets=grn_path, mr_gene_ids=mr_ids, ...)
+
+@dataclass(frozen=True)
+class MRTree:
+  """
+  A rooted tree over master-regulator (MR) gene ids, as built by
+  build_mr_overlap_tree() (or any other tree-construction strategy sharing
+  this same interface) and consumed by sample_mr_state_from_tree() /
+  mr_tree_pairwise_covariance(). Deliberately minimal so the sampler is
+  independent of *how* the tree was built (Jaccard overlap + average
+  linkage, or any future alternative strategy).
+
+  mr_ids:       ordered list of leaf master-regulator gene ids, len n_mrs.
+                Leaf node ids 0..n_mrs-1 correspond index-for-index to this
+                list (mr_ids[i] is the gene id of leaf node i) --
+                sample_mr_state_from_tree's output columns follow this
+                same order.
+  children:     dict mapping each internal node id (>= n_mrs) to a
+                (left_child_id, right_child_id) 2-tuple of node ids (leaf
+                ids in [0, n_mrs) and/or other internal node ids). Leaf
+                node ids are never keys of this dict.
+  edge_length:  dict mapping every non-root node id (leaf or internal) to
+                the non-negative length of the edge connecting it to its
+                parent. The root has no entry (it has no parent).
+  root:         node id of the root. If n_mrs == 1, root == 0 (the single
+                leaf) and both children/edge_length are empty.
+  """
+  mr_ids:      list
+  children:    dict
+  edge_length: dict
+  root:        int
+
+  @property
+  def n_mrs(self) -> int:
+    return len(self.mr_ids)
+
+
+def build_mr_target_sets(input_file_targets: str, mr_ids: list) -> dict:
+  """
+  Parse a SERGIO-format `input_file_targets` CSV (as written by
+  generate_sergio_grn_from_reference / consumed by make_synthetic_data6,
+  see _parse_sergio_targets_file's row-format docstring) and return, for
+  each gene id in `mr_ids`, the set of target gene ids it *directly*
+  regulates in that file's final, already-DAG-ified graph (one hop --
+  not the transitive closure of its downstream regulatory cascade).
+
+  This deliberately reads the *generated* GRN file rather than the
+  original (possibly cyclic) reference network passed to generate_sergio_
+  grn_from_reference: the generated file is the topology make_synthetic_
+  data6 actually simulates over (post subgraph-sampling, DAG-ification,
+  and isolated-node repair), so it is what build_mr_overlap_tree's
+  clustering should reflect.
+
+  Args:
+    input_file_targets: path to a SERGIO-format targets CSV (row format:
+                  target_id, n_regs, reg_id_1..reg_id_n, K_1..K_n[,
+                  coop_1..coop_n]).
+    mr_ids:       gene ids to build target sets for (typically every
+                  master regulator in the file, e.g. generate_sergio_grn_
+                  from_reference's own returned mr_ids -- but any subset
+                  of regulator ids present in the file also works).
+
+  Returns:
+    dict mapping each id in `mr_ids` to a frozenset of target gene ids it
+    directly regulates. An id with no surviving out-edges maps to an
+    empty frozenset rather than raising -- should not happen for a true
+    master regulator in a well-formed generated GRN (see generate_sergio_
+    grn_from_reference's isolated-node-repair docstring note: every gene
+    ends up with at least one edge, and an MR's zero in-degree forces any
+    such edge to be outgoing), but tolerated here for an arbitrary
+    caller-supplied id.
+  """
+  mr_id_set = set(mr_ids)
+  target_sets = {mr_id: set() for mr_id in mr_id_set}
+  with open(input_file_targets, 'r') as f:
+    reader = csv.reader(f, delimiter=',')
+    for row in reader:
+      row = [c.strip() for c in row if c.strip() != '']
+      if not row:
+        continue
+      target_id = int(float(row[0]))
+      n_regs    = int(float(row[1]))
+      for r in row[2 : 2 + n_regs]:
+        reg_id = int(float(r))
+        if reg_id in mr_id_set:
+          target_sets[reg_id].add(target_id)
+  return {mr_id: frozenset(s) for mr_id, s in target_sets.items()}
+
+
+def _jaccard_distance_matrix(target_sets: list) -> np.ndarray:
+  """
+  Pairwise Jaccard *distance* matrix (1 - |A∩B| / |A∪B|) over a list of
+  gene-id sets (one per MR, in the caller's mr_ids order). Two MRs with
+  identical nonempty target sets get distance 0.0; two MRs where the
+  union is empty (i.e. at least one has an empty target set, since
+  self-unions of an empty set are empty) get distance 1.0 by convention
+  -- |A∩B|/|A∪B| is 0/0 there, treated as "maximally dissimilar" (an
+  empty target set carries no overlap information to cluster on) rather
+  than raising. Diagonal is exactly 0.0.
+  """
+  n = len(target_sets)
+  dist = np.zeros((n, n), dtype=np.float64)
+  for i in range(n):
+    si = target_sets[i]
+    for j in range(i + 1, n):
+      sj = target_sets[j]
+      union = len(si | sj)
+      d = 1.0 if union == 0 else 1.0 - len(si & sj) / union
+      dist[i, j] = dist[j, i] = d
+  return dist
+
+
+def _average_linkage_tree(dist: np.ndarray) -> tuple:
+  """
+  Deterministic UPGMA (average-linkage) agglomerative clustering over a
+  precomputed (n, n) symmetric distance matrix. Leaves are node ids
+  0..n-1 (row/column index into `dist`); each merge creates a new
+  internal node id n, n+1, .... Self-contained (no scipy dependency) and
+  deterministic -- ties are broken by lowest (a, b) active-node-id pair,
+  which is itself fully determined by `dist` and the merge history.
+
+  Returns (children, height, root):
+    children: dict[internal_node_id] = (a, b), the two node ids merged to
+              create it (a < b is NOT guaranteed -- only that they're the
+              two chosen active clusters at that step).
+    height:   dict[node_id] -> float, 0.0 for every leaf (0..n-1) and the
+              UPGMA merge distance for every internal node -- always
+              non-decreasing along any root-ward path (a valid
+              dendrogram, i.e. safe to derive edge lengths from via
+              height(parent) - height(child)).
+    root:     the final (top-level) node id (2 * n - 2 if n >= 2, else 0).
+  """
+  n = dist.shape[0]
+  assert n >= 1, "need at least one leaf"
+  if n == 1:
+    return {}, {0: 0.0}, 0
+
+  size:   dict = {i: 1   for i in range(n)}
+  height: dict = {i: 0.0 for i in range(n)}
+  children: dict = {}
+  # D[a][b]: current inter-cluster distance between active clusters a, b.
+  D: dict = {i: {j: float(dist[i, j]) for j in range(n) if j != i} for i in range(n)}
+  active   = list(range(n))
+  next_id  = n
+
+  while len(active) > 1:
+    best_key = None
+    best_pair = None
+    for ai in range(len(active)):
+      a = active[ai]
+      for b in active[ai + 1:]:
+        key = (D[a][b], a, b)
+        if best_key is None or key < best_key:
+          best_key, best_pair = key, (a, b)
+    d_ab, a, b = best_key[0], best_pair[0], best_pair[1]
+
+    new_id = next_id
+    next_id += 1
+    children[new_id] = (a, b)
+    height[new_id]   = d_ab
+    size[new_id]     = size[a] + size[b]
+
+    merged = {}
+    for c in active:
+      if c == a or c == b:
+        continue
+      merged[c] = (size[a] * D[a][c] + size[b] * D[b][c]) / (size[a] + size[b])
+    del D[a], D[b]
+    for c in D:
+      D[c].pop(a, None)
+      D[c].pop(b, None)
+    D[new_id] = merged
+    for c, d in merged.items():
+      D[c][new_id] = d
+
+    active = [c for c in active if c != a and c != b] + [new_id]
+
+  return children, height, active[0]
+
+
+def build_mr_overlap_tree(
+    input_file_targets: str,
+    mr_ids:             list,
+    target_sets:        dict | None = None,
+) -> MRTree:
+  """
+  Build an MRTree clustering `mr_ids` by the overlap of the gene sets
+  they directly regulate in `input_file_targets` (see
+  build_mr_target_sets): MRs regulating highly overlapping gene sets
+  merge low (near the leaves) and end up sharing a long portion of their
+  root-to-leaf path; MRs regulating disjoint gene sets only merge near
+  the root and share almost none of it.
+
+  Distance: unweighted Jaccard distance (1 - |A∩B|/|A∪B|) between each
+  pair of MRs' direct target-gene sets (see _jaccard_distance_matrix).
+  Linkage: average linkage (UPGMA, see _average_linkage_tree) -- a
+  moderate choice between single linkage (prone to chaining through weak
+  intermediate overlaps) and complete linkage (overly sensitive to a
+  single worst-case pair); Ward linkage is not used since Jaccard
+  distance is not a Euclidean feature-space metric, which Ward's
+  variance-minimization criterion assumes.
+
+  Edge lengths: edge_length(child) = height(parent) - height(child),
+  where `height` is each node's UPGMA merge distance (0.0 for leaves) --
+  i.e. branch lengths are exactly the increments accumulated along the
+  dendrogram from leaves to root, so the length of the path segment any
+  two leaves *share* (root down to their lowest common ancestor) equals
+  (root height - their LCA's height): MRs merging early (low LCA height,
+  high overlap) share a *longer* portion of the path from the root, and
+  MRs only merging near the root (low overlap) share almost none of it
+  -- see sample_mr_state_from_tree's docstring for how this drives each
+  MR pair's sampled correlation.
+
+  Args:
+    input_file_targets: path to the generated SERGIO-format targets CSV
+                  (e.g. generate_sergio_grn_from_reference's output_path)
+                  whose *final, DAG-ified* topology should be clustered.
+    mr_ids:       master-regulator gene ids to cluster (e.g. generate_
+                  sergio_grn_from_reference's own returned mr_ids) --
+                  become the tree's leaves, in this order (the returned
+                  tree.mr_ids == list(mr_ids); duplicates are rejected).
+    target_sets:  optional precomputed build_mr_target_sets(...) result
+                  (must have an entry for every id in mr_ids) -- avoids
+                  re-parsing input_file_targets if the caller already
+                  has it (e.g. run_mr_tree_experiment). Computed
+                  internally via build_mr_target_sets if not given.
+
+  Returns:
+    MRTree with mr_ids in the same order as the `mr_ids` argument (leaf
+    node i's gene id is mr_ids[i], regardless of merge order).
+  """
+  assert len(mr_ids) == len(set(mr_ids)), f"duplicate mr_ids: {mr_ids}"
+  mr_ids = list(mr_ids)
+  n = len(mr_ids)
+  assert n >= 1, "build_mr_overlap_tree requires at least one MR"
+
+  if target_sets is None:
+    target_sets = build_mr_target_sets(input_file_targets, mr_ids)
+  dist = _jaccard_distance_matrix([target_sets[mr_id] for mr_id in mr_ids])
+  children, height, root = _average_linkage_tree(dist)
+
+  edge_length = {}
+  for node, (left, right) in children.items():
+    edge_length[left]  = height[node] - height[left]
+    edge_length[right] = height[node] - height[right]
+
+  return MRTree(mr_ids=mr_ids, children=children, edge_length=edge_length, root=root)
+
+
+def mr_tree_pairwise_covariance(tree: MRTree, root_variance: float = 0.0) -> np.ndarray:
+  """
+  (n_mrs, n_mrs) covariance matrix K implied by `tree`'s branch lengths
+  under the tree-Brownian-motion model sample_mr_state_from_tree is based
+  on: each edge e contributes an independent latent increment of variance
+  edge_length[e], and (if root_variance > 0) the root itself contributes
+  one more shared increment of variance root_variance common to every
+  leaf. Two leaves' covariance is then exactly the total length of the
+  path segment they share (root down to their lowest common ancestor),
+  plus root_variance:
+
+      K[i, j] = root_variance + sum(edge_length[e] for e on the shared
+                                     root-to-LCA(i, j) path)
+
+  with K[i, i] = root_variance + (total root-to-leaf-i path length) as
+  the i == j case (LCA(i, i) = i). This is a valid (symmetric positive
+  semidefinite) covariance matrix by construction -- it is the Gram
+  matrix of the actual random increments in the model above -- provided
+  here purely for diagnostics/testing (e.g. converting to a correlation
+  matrix to check that MRs with more target-gene overlap end up more
+  correlated, or verifying PSD-ness). sample_mr_state_from_tree never
+  materializes this matrix itself; see its own docstring for the
+  equivalent (and exactly distributionally equivalent) direct-simulation
+  approach it actually uses.
+
+  Ordering matches tree.mr_ids (row/column i corresponds to tree.mr_ids[i]).
+  """
+  assert root_variance >= 0.0, "root_variance must be >= 0"
+  n = tree.n_mrs
+
+  # cumulative root-to-node path length, computed top-down from the root.
+  cum_length = {tree.root: root_variance}
+  stack = [tree.root]
+  while stack:
+    node = stack.pop()
+    children = tree.children.get(node)
+    if not children:
+      continue
+    for child in children:
+      cum_length[child] = cum_length[node] + tree.edge_length[child]
+      stack.append(child)
+
+  parent = {}
+  for node, (left, right) in tree.children.items():
+    parent[left]  = node
+    parent[right] = node
+
+  def _ancestors(leaf: int) -> list:
+    chain = [leaf]
+    while chain[-1] != tree.root:
+      chain.append(parent[chain[-1]])
+    return chain
+
+  ancestor_chains = [_ancestors(i) for i in range(n)]
+
+  K = np.empty((n, n), dtype=np.float64)
+  for i in range(n):
+    depth_i = {node: k for k, node in enumerate(ancestor_chains[i])}
+    for j in range(i, n):
+      if i == j:
+        lca = i
+      else:
+        lca = next((node for node in ancestor_chains[j] if node in depth_i), None)
+        assert lca is not None, "no common ancestor found -- malformed tree"
+      K[i, j] = K[j, i] = cum_length[lca]
+  return K
+
+
+def mr_tree_correlation_matrix(tree: MRTree, root_variance: float = 0.0) -> np.ndarray:
+  """
+  Correlation-matrix normalization of mr_tree_pairwise_covariance's K
+  (R[i, j] = K[i, j] / sqrt(K[i, i] * K[j, j])) -- this is the R_tree
+  sample_mr_state_from_tree's docstring refers to. Provided as a
+  standalone diagnostic (e.g. to confirm empirically that MRs with more
+  target-gene overlap end up with a higher implied correlation) --
+  sample_mr_state_from_tree does not use this function internally (see
+  its own docstring for why). Entries involving a leaf with K[i, i] == 0
+  (a degenerate zero-length root-to-leaf path, only possible if
+  root_variance == 0.0 and that leaf's entire path to the root has zero
+  total edge length) are NaN.
+  """
+  K = mr_tree_pairwise_covariance(tree, root_variance=root_variance)
+  d = np.sqrt(np.diag(K))
+  with np.errstate(invalid='ignore', divide='ignore'):
+    R = K / np.outer(d, d)
+  return R
+
+
+def _standard_normal_cdf(z: np.ndarray) -> np.ndarray:
+  """Standard normal CDF, vectorized via math.erf -- avoids adding a hard
+  scipy.stats/scipy.special dependency for this one elementwise
+  transform (Phi(z) = 0.5 * (1 + erf(z / sqrt(2))))."""
+  erf_vec = np.vectorize(math.erf, otypes=[np.float64])
+  return 0.5 * (1.0 + erf_vec(np.asarray(z, dtype=np.float64) / math.sqrt(2.0)))
+
+
+def sample_mr_state_from_tree(
+    tree:          MRTree,
+    n_states:      int,
+    low:           float,
+    high:          float,
+    seed:          int | None = None,
+    tree_strength: float      = 1.0,
+    root_variance: float      = 0.0,
+) -> np.ndarray:
+  """
+  Sample an (n_states, n_mrs) matrix of master-regulator basal production
+  rates whose *marginal* distribution is (via a Gaussian copula, see
+  below) similar to _sample_mr_state's plain i.i.d. Uniform(low, high),
+  but whose *cross-MR correlation* is driven by `tree`: MRs that merge
+  low in the tree (e.g. high target-gene overlap, if `tree` came from
+  build_mr_overlap_tree) get correlated rates across states; MRs that
+  only share the root get ~independent rates. Column i of the output
+  corresponds to tree.mr_ids[i] -- pass tree.mr_ids as make_synthetic_
+  data6's mr_gene_ids to keep them aligned.
+
+  Model: each edge e of `tree` contributes one independent latent
+  Gaussian increment per state, N(0, edge_length[e]); each leaf's raw
+  tree-latent value is the sum of the increments along its root-to-leaf
+  path (plus one N(0, root_variance) term shared by every leaf, if
+  root_variance > 0) -- i.e. Brownian motion along the tree's branches,
+  the standard phylogenetic-comparative-methods model for trait
+  covariance induced by shared ancestry. This makes Cov(leaf_i, leaf_j)
+  exactly mr_tree_pairwise_covariance's K[i, j] (root_variance plus the
+  length of the root-to-LCA path segment leaf_i and leaf_j share). This
+  function never builds or factorizes that (n_mrs, n_mrs) covariance
+  matrix: it draws the underlying per-edge increments directly and sums
+  them along each leaf's path, which is exactly distributionally
+  equivalent, cheaper (O(n_mrs) edges instead of an (n_mrs, n_mrs) matrix
+  + Cholesky/eigendecomposition), and has no possible positive-
+  semidefiniteness numerical edge cases.
+
+  Each leaf's raw tree-latent value is rescaled to unit variance (using
+  its theoretical variance, root_variance + its total root-to-leaf edge
+  length -- not a finite-n_states sample estimate) and blended with an
+  independent standard-normal draw:
+
+      z_i = sqrt(tree_strength) * (tree_latent_i / std_i)
+          + sqrt(1 - tree_strength) * independent_i
+
+  so z_i always has unit variance and Corr(z_i, z_j) = tree_strength *
+  R_tree[i, j] for i != j (R_tree = mr_tree_correlation_matrix(tree,
+  root_variance)), 1.0 for i == j -- i.e. `tree_strength` interpolates
+  linearly, in *correlation*, between fully tree-structured
+  (tree_strength=1.0) and fully independent (tree_strength=0.0) rates,
+  without ever changing each individual MR's own marginal distribution.
+  A leaf whose total root-to-leaf path length is exactly 0.0 (only
+  possible if root_variance == 0.0 too -- i.e. that leaf shares no branch
+  length with anything, a degenerate tree essentially never produced by
+  build_mr_overlap_tree for >1 MR with any genuine target-set
+  differences) has no tree signal to contribute; such a leaf's column
+  always uses a plain independent standard normal regardless of
+  tree_strength, so its marginal distribution is never distorted.
+
+  Each z_i is then mapped through the standard normal CDF (a Gaussian
+  copula) and rescaled into [low, high]:
+
+      mr_state[:, i] = low + (high - low) * Phi(z_i)
+
+  At tree_strength=0.0, every z_i is a plain independent standard normal
+  (the tree-latent term contributes nothing), so mr_state is a matrix of
+  independent Uniform(low, high) columns via the same Gaussian-copula
+  transform used at any other tree_strength -- similar in distribution
+  to (but not a byte-identical reproduction of) _sample_mr_state's direct
+  rng.uniform(...) draw, by design: this lets a tree_strength=0.0 vs.
+  >0.0 comparison isolate the tree's covariance structure as the only
+  variable, without also changing the underlying univariate sampling
+  method itself.
+
+  Args:
+    tree:          an MRTree (e.g. from build_mr_overlap_tree()).
+    n_states:      number of rows (e.g. make_synthetic_data6's n_clusters)
+                   to sample.
+    low, high:     output range (matches _sample_mr_state's low/high --
+                   typically config["mr_rate_low"]/["mr_rate_high"]).
+    seed:          seeds a local np.random.default_rng (same convention
+                   as _sample_mr_state) -- deterministic given the same
+                   tree/n_states/seed/tree_strength/root_variance.
+    tree_strength: in [0, 1]. 0.0 = independent columns (see above); 1.0
+                   = purely tree-structured (no independent component).
+    root_variance: variance of a single latent factor shared by every
+                   leaf regardless of tree structure (e.g. representing
+                   unmodeled shared regulatory context). 0.0 (default)
+                   means every leaf's tree-latent value is driven purely
+                   by edges on its own root-to-leaf path, with no
+                   universal shared component.
+
+  Returns:
+    (n_states, tree.n_mrs) numpy array, values in [low, high].
+  """
+  assert 0.0 <= tree_strength <= 1.0, f"tree_strength must be in [0, 1], got {tree_strength}"
+  assert root_variance >= 0.0, "root_variance must be >= 0"
+  assert high > low, f"high ({high}) must be > low ({low})"
+  n = tree.n_mrs
+  rng = np.random.default_rng(seed)
+
+  # --- top-down simulation of the tree-latent Brownian values, plus the
+  # theoretical (not sampled) cumulative edge-length-to-root of each node,
+  # used below to rescale each leaf to unit variance. ---
+  cum_length = {tree.root: root_variance}
+  node_value = {tree.root: rng.normal(0.0, math.sqrt(root_variance), size=n_states)}
+  stack = [tree.root]
+  while stack:
+    node = stack.pop()
+    children = tree.children.get(node)
+    if not children:
+      continue
+    for child in children:
+      length = tree.edge_length[child]
+      cum_length[child] = cum_length[node] + length
+      std = math.sqrt(length) if length > 0.0 else 0.0
+      increment = rng.normal(0.0, std, size=n_states) if std > 0.0 else np.zeros(n_states)
+      node_value[child] = node_value[node] + increment
+      stack.append(child)
+
+  tree_latent = np.stack([node_value[i] for i in range(n)], axis=1)          # (n_states, n)
+  leaf_var    = np.array([cum_length[i] for i in range(n)], dtype=np.float64)  # (n,)
+
+  independent = rng.normal(0.0, 1.0, size=(n_states, n))
+  degenerate  = leaf_var <= 0.0
+
+  z = np.empty((n_states, n), dtype=np.float64)
+  if (~degenerate).any():
+    tree_latent_unit = tree_latent[:, ~degenerate] / np.sqrt(leaf_var[~degenerate])
+    z[:, ~degenerate] = (
+        math.sqrt(tree_strength) * tree_latent_unit
+        + math.sqrt(1.0 - tree_strength) * independent[:, ~degenerate]
+    )
+  if degenerate.any():
+    z[:, degenerate] = independent[:, degenerate]
+
+  u = _standard_normal_cdf(z)
+  return low + (high - low) * u
+
+
+# --------------------------------------------------------------------------
 # Real-data reference loading & summary statistics, for calibrating
 # make_synthetic_data6's SERGIO-derived parameters against a real scRNA-seq
 # reference matrix.
@@ -2701,4 +3214,895 @@ def plot_summary_stats(
     fig.savefig(path, dpi=120)
     plt.close(fig)
   return fig
+
+
+# --------------------------------------------------------------------------
+# MR-tree paired experiment: tree-correlated vs. i.i.d. mr_state sampling.
+# --------------------------------------------------------------------------
+# Compares sample_mr_state_from_tree's tree-correlated MR states (built from
+# build_mr_overlap_tree) against its own tree_strength=0.0 control, holding
+# everything else (GRN topology, simulation parameters, seeds) fixed, via
+# compute_summary_stats -- see this module's/AGENTS.md's "MR overlap tree"
+# design discussion for the full rationale. Reuses tune_synthetic_data.py's
+# config-resolution/distance-scoring helpers (imported lazily -- see
+# _import_tune_synthetic_data -- to avoid a circular top-level import, since
+# tune_synthetic_data.py itself imports several names from this module) so a
+# tune_synthetic_data.py-style JSON config is handled identically to how an
+# actual tuning trial would.
+#
+# Typical usage (Colab or command line):
+#   import synthetic_data
+#   result = synthetic_data.run_mr_tree_experiment(
+#       "synthetic_tuning_20260820.00/tuned_synthetic_config.20260820.00.json",
+#       n_replicates=20, tree_strength=1.0)
+#   print(result["summary"])
+# or, from the command line:
+#   python synthetic_data.py --config tuned_synthetic_config.20260820.00.json \
+#       --n-replicates 20 --tree-strength 1.0 --output result.pickle
+
+def _import_tune_synthetic_data():
+  """Lazily import tune_synthetic_data.py (deferred to function-call time,
+  not module import time, to avoid a circular top-level import -- that
+  module imports several names from this one at ITS OWN module level).
+  Used by _load_mr_tree_experiment_config/run_mr_tree_experiment to reuse
+  its config-resolution/distance-scoring helpers rather than duplicating
+  them here."""
+  try:
+    import tune_synthetic_data as _tsd
+  except ImportError as e:
+    raise ImportError(
+        "This function relies on tune_synthetic_data.py's own config-"
+        "resolution/distance-scoring helpers (_CONFIG_DEFAULTS, "
+        "_SIM_KWARG_DEFAULTS, _GRN_KWARG_DEFAULTS, _split_resolved, "
+        "compute_stats_distance), which in turn requires that module's "
+        "own dependencies (optuna, tqdm) to be importable -- even though "
+        "nothing here runs an actual Optuna study."
+    ) from e
+  return _tsd
+
+
+def _load_mr_tree_experiment_config(config) -> dict:
+  """
+  Normalize `config` (a path to a tune_synthetic_data.py-style JSON
+  config, or an already-loaded dict of the same shape) into a flat dict
+  of every keyword argument run_mr_tree_experiment needs to call
+  generate_sergio_grn_from_reference / make_synthetic_data6 /
+  compute_summary_stats identically to how tune_synthetic_data.run_trial
+  would for that same config.
+
+  Accepts either shape of JSON tune_synthetic_data.py produces/consumes:
+    - a *tuning* config (e.g. synthetic_tuning_config.20260820.00.json):
+      flat top-level keys (reference_grn_path, n_clusters, n_genes, ...)
+      plus "search_space" (ignored here -- this experiment does not tune
+      anything, it needs one concrete parameter set, not a search space).
+      Every tunable key (see tune_synthetic_data.TUNABLE_KEYS) MUST be
+      given a fixed value directly at this config's top level (not merely
+      a search_space entry) for it to be anything other than tune_
+      synthetic_data's plain default here -- a bare tuning config carries
+      no *resolved* values for its search_space keys at all.
+    - a *tuned-result* config (e.g. tuned_synthetic_config.20260820.00.json,
+      i.e. run()'s own `output` -- what this project actually uses in
+      practice day to day): structural/reference settings live under
+      "_meta" and resolved tunable values live under
+      "best_resolved_params" (falling back to "best_params" if that key
+      is absent). Note that a tuned-result config's "_meta" is a much
+      smaller key set than a tuning config's top level (only
+      reference_h5ad_path/target_stats_path/reference_grn_path/
+      n_clusters/n_genes/n_cells/sampling_state/shared_coop_state/
+      grn_seed/sim_seed -- see tune_synthetic_data.run()'s own `summary`
+      dict) -- so mr_rate_low/mr_rate_high/dt/noise_type/
+      min_cells_per_cluster/add_*/grn_delimiter & friends/stats_*/
+      weights/max_lib_size_zero_frac/max_pca_pc1_ratio_factor are NOT
+      captured by a tuned-result config and fall back to tune_
+      synthetic_data's plain defaults here. Pass the *original* tuning
+      config instead (or run_mr_tree_experiment's own stats_*/
+      mr_rate_low/mr_rate_high override kwargs) if you need those to
+      match a specific tuning run exactly.
+
+  A plain flat dict (already containing every needed key directly, no
+  "_meta"/"best_resolved_params" nesting) is also accepted unchanged.
+
+  Returns the merged dict: {**_CONFIG_DEFAULTS, **_SIM_KWARG_DEFAULTS,
+  **_GRN_KWARG_DEFAULTS, **flat}. Raises ValueError if reference_grn_path/
+  n_genes/n_clusters/n_cells are still missing after that merge (i.e. not
+  a plain _CONFIG_DEFAULTS key and not present in `config` either).
+  """
+  _tsd = _import_tune_synthetic_data()
+
+  if isinstance(config, str):
+    with open(config) as f:
+      raw = json.load(f)
+  else:
+    raw = dict(config)
+
+  if "_meta" in raw:
+    flat = {**raw["_meta"], **(raw.get("best_resolved_params") or raw.get("best_params") or {})}
+  else:
+    if "search_space" in raw and not (raw.get("best_resolved_params") or raw.get("best_params")):
+      print(
+          "*** WARNING: this config looks like a bare *tuning* config "
+          "(has 'search_space' but no 'best_resolved_params'/'best_params') "
+          "-- every tunable parameter will fall back to tune_synthetic_"
+          "data's plain defaults, NOT any tuned value. Pass the tuning "
+          "*output* config (e.g. tuned_synthetic_config....json) if you "
+          "want the actual best-found parameters instead. ***"
+      )
+    flat = dict(raw)
+    flat.pop("search_space", None)
+
+  merged = {**_tsd._CONFIG_DEFAULTS, **_tsd._SIM_KWARG_DEFAULTS, **_tsd._GRN_KWARG_DEFAULTS, **flat}
+
+  required = ["reference_grn_path", "n_genes", "n_clusters", "n_cells"]
+  missing = [k for k in required if merged.get(k) is None]
+  if missing:
+    raise ValueError(f"MR-tree experiment config is missing required key(s): {missing}")
+
+  return merged
+
+
+def _augment_candidate_stats(stats: dict, _tsd) -> None:
+  """Applies the same derived-key augmentations tune_synthetic_data.py's
+  run()/run_trial() apply to every target/candidate stats dict (the
+  pca_*_pc2_9_explained_variance_ratio slices and nonzero_frac) -- see
+  those functions' own calls to _add_pca_pc2_9_key/_add_nonzero_frac_key.
+  Mutates `stats` in place; a no-op for any key whose source array/value
+  is absent (see those helpers' own docstrings). Only matters for this
+  module's optional compute_stats_distance comparison below, since a
+  config's `weights` dict may reference these derived keys."""
+  _tsd._add_pca_pc2_9_key(stats)
+  _tsd._add_pca_pc2_9_key(
+      stats,
+      src_key="pca_standardized_explained_variance_ratio",
+      dst_key="pca_standardized_pc2_9_explained_variance_ratio",
+  )
+  _tsd._add_pca_pc2_9_key(
+      stats,
+      src_key="pca_size_normalized_standardized_explained_variance_ratio",
+      dst_key="pca_size_normalized_standardized_pc2_9_explained_variance_ratio",
+  )
+  _tsd._add_nonzero_frac_key(stats)
+
+
+def _mr_state_participation_ratio(mr_state: np.ndarray) -> float:
+  """Participation ratio of the singular-value spectrum of an
+  (n_states, n_mrs) mr_state matrix: (sum(sv**2))**2 / sum(sv**4), the
+  "effective number of independent directions" among the n_states MR-state
+  rows. Returns NaN when fewer than 2 rows or all singular values are zero.
+  This is a natural companion to pca_participation_ratio: a purely i.i.d.
+  sampler will tend toward n_mrs (all MRs move independently), while a
+  tree-correlated sampler with one dominant module will tend toward 1."""
+  if mr_state.shape[0] < 2 or mr_state.shape[1] < 1:
+    return float("nan")
+  sv = np.linalg.svd(mr_state - mr_state.mean(axis=0, keepdims=True),
+                     full_matrices=False, compute_uv=False)
+  sv2 = sv ** 2
+  total = sv2.sum()
+  if total <= 0.0:
+    return float("nan")
+  return float(total ** 2 / np.sum(sv2 ** 2))
+
+
+def _gene_module_correlations(
+    X_sim,
+    cluster_labels: np.ndarray,
+    winner_mr:      list | None,
+    mr_ids:         list,
+    gene_id_to_symbol: dict,
+    n_structure_genes: int | None = 500,
+    seed:              int | None = 0,
+) -> dict:
+  """
+  Compute within-module vs. across-module gene-pair Pearson correlation
+  using the winner_mr assignments from generate_sergio_grn_from_reference's
+  diagnostics to define which gene belongs to which regulatory module.
+
+  winner_mr[k] is the dominant master regulator for the k-th target gene
+  (in diagnostics["tgt_ids"] order, parallel to diagnostics["winner_mr"]).
+  Genes whose winner_mr is the same are considered in the same module.
+
+  Returns a dict with:
+    "within_module_mean_abs_corr":  mean |corr| among gene pairs in the
+                                    same module (NaN if no within-module
+                                    pairs exist, e.g. all modules are
+                                    singletons).
+    "across_module_mean_abs_corr":  mean |corr| among gene pairs in
+                                    different modules (NaN if fewer than
+                                    2 modules).
+    "within_minus_across":          difference (NaN if either is NaN).
+    "n_modules":                    number of distinct winner_mr values.
+    "n_within_pairs":               number of within-module pairs scored.
+    "n_across_pairs":               number of across-module pairs scored.
+
+  All three correlation values use the same size-normalized standardized
+  data path as compute_summary_stats (raw counts renormalized to median
+  library size -> log1p -> per-gene standardize), so they are directly
+  comparable to gene_corr_abs_normalized_* from compute_summary_stats.
+
+  Returns a dict with all values NaN / 0 if winner_mr is None/empty, or
+  if X_sim has fewer than 2 genes, or if there are no valid pairs.
+  """
+  nan_result = {
+      "within_module_mean_abs_corr": float("nan"),
+      "across_module_mean_abs_corr": float("nan"),
+      "within_minus_across":         float("nan"),
+      "n_modules":                   0,
+      "n_within_pairs":              0,
+      "n_across_pairs":              0,
+  }
+  if winner_mr is None or len(winner_mr) == 0:
+    return nan_result
+
+  X_np = X_sim.detach().to(torch.float64).cpu().numpy() if hasattr(X_sim, "detach") else np.asarray(X_sim, dtype=np.float64)
+  n_cells, n_genes = X_np.shape
+  if n_genes < 2:
+    return nan_result
+
+  # Library-size-normalize then per-gene standardize, same as compute_
+  # summary_stats's pca_size_normalized_standardized_* / gene_corr_abs_
+  # normalized_* path.
+  obs_mask = ~np.isnan(X_np)
+  raw = np.expm1(np.where(obs_mask, X_np, 0.0))
+  raw[~obs_mask] = 0.0
+  lib_size      = raw.sum(axis=1)
+  lib_size_safe = np.maximum(lib_size, 1e-8)
+  size_factor   = np.median(lib_size_safe) / lib_size_safe
+  raw_for_norm  = np.where(obs_mask, np.expm1(X_np), np.nan)
+  X_norm        = np.log1p(raw_for_norm * size_factor[:, np.newaxis])
+  with np.errstate(invalid="ignore"):
+    gene_mean_norm = np.nanmean(X_norm, axis=0)
+  fill_norm    = np.where(np.isfinite(gene_mean_norm), gene_mean_norm, 0.0)
+  X_norm_filled = np.where(obs_mask, X_norm, fill_norm[np.newaxis, :])
+  gene_std = np.clip(X_norm_filled.std(axis=0, keepdims=True), 1e-6, None)
+  X_std = (X_norm_filled - X_norm_filled.mean(axis=0, keepdims=True)) / gene_std
+
+  # Subsample genes for tractability (same budget as compute_summary_stats).
+  rng = np.random.default_rng(seed)
+  if n_structure_genes is not None and n_genes > n_structure_genes:
+    gene_idx = np.sort(rng.choice(n_genes, size=n_structure_genes, replace=False))
+  else:
+    gene_idx = np.arange(n_genes)
+  X_sub = X_std[:, gene_idx]
+
+  # Map each sampled gene index back to its winner_mr (via gene_id_to_symbol
+  # / tgt_ids alignment in diagnostics). winner_mr is parallel to tgt_ids.
+  # gene_id_to_symbol maps gene_id (int) -> symbol; here we need gene_id ->
+  # winner_mr. Build that mapping from diagnostics lists.
+  # (MR genes themselves have no winner_mr entry -- they are excluded from
+  # the within/across comparison, since only target genes have a winner_mr.)
+  gene_id_to_winner: dict = {}
+  for gene_id_val, wm in zip(winner_mr[0], winner_mr[1]):
+    gene_id_to_winner[int(gene_id_val)] = int(wm)
+
+  gene_winners = np.array(
+      [gene_id_to_winner.get(int(gene_idx[i]), -1) for i in range(len(gene_idx))],
+      dtype=np.int64,
+  )
+  # -1 means "no winner_mr" (MR gene or not in diagnostics) -- exclude from pairs.
+  valid_mask = gene_winners >= 0
+  if valid_mask.sum() < 2:
+    return nan_result
+
+  X_valid   = X_sub[:, valid_mask]
+  gw_valid  = gene_winners[valid_mask]
+  n_valid   = X_valid.shape[1]
+
+  with np.errstate(invalid="ignore"):
+    corr = np.corrcoef(X_valid, rowvar=False)
+  np.fill_diagonal(corr, np.nan)
+
+  iu_rows, iu_cols = np.triu_indices(n_valid, k=1)
+  same_module   = gw_valid[iu_rows] == gw_valid[iu_cols]
+  abs_corr_vals = np.abs(corr[iu_rows, iu_cols])
+  finite        = np.isfinite(abs_corr_vals)
+
+  within_vals = abs_corr_vals[same_module  & finite]
+  across_vals = abs_corr_vals[~same_module & finite]
+
+  within_mean = float(np.mean(within_vals)) if within_vals.size else float("nan")
+  across_mean = float(np.mean(across_vals)) if across_vals.size else float("nan")
+
+  return {
+      "within_module_mean_abs_corr": within_mean,
+      "across_module_mean_abs_corr": across_mean,
+      "within_minus_across":         (within_mean - across_mean)
+                                     if math.isfinite(within_mean) and math.isfinite(across_mean)
+                                     else float("nan"),
+      "n_modules":      int(len(set(gw_valid.tolist()))),
+      "n_within_pairs": int(within_vals.size),
+      "n_across_pairs": int(across_vals.size),
+  }
+
+
+def _summarize_mr_tree_experiment(replicates: list) -> dict:
+  """
+  Aggregate paired tree-vs-control differences across run_mr_tree_
+  experiment's replicates.
+
+  Scalar metrics (each -> {"tree_mean", "control_mean", "diff_mean",
+  "diff_std", "n"}): differences are computed paired (tree - control per
+  replicate), so diff_mean/diff_std reflect within-replicate differences
+  rather than between-arm marginals.  n = number of replicates where both
+  arms' value was finite.
+
+  Array metrics (each -> {"tree_mean": 1D array, "control_mean": 1D array,
+  "diff_mean": 1D array, "diff_std": 1D array, "n": int}): elementwise
+  paired differences across replicates where both arms' array had the same
+  finite length; n is the number of such replicates.
+
+  Scalar metrics returned:
+    pca_size_normalized_standardized_pc1_ratio
+    pca_size_normalized_standardized_pc2_9_sum
+    pca_size_normalized_standardized_tail_participation_ratio
+    gene_corr_abs_normalized_mean
+    gene_corr_abs_normalized_p90
+    gene_mean_mean, gene_var_mean, log_lib_size_std
+    zero_frac
+    mr_state_participation_ratio
+    within_module_mean_abs_corr
+    across_module_mean_abs_corr
+    within_minus_across
+    distance (NaN entries when target_stats unavailable)
+
+  Array metrics returned:
+    pca_size_normalized_standardized_explained_variance_ratio
+      (per-PC mean and std, for directly inspecting the full spectrum)
+    top_distance_terms
+      (mean weighted contribution per key across replicates, tree and
+      control separately -- helps identify which stats actually drove any
+      distance change, not just the scalar total)
+  """
+  def _scalar(arm, *keys):
+    """Dig out a scalar stat from arm['stats'] or arm directly, trying
+    each key in order; returns NaN if none found or not finite."""
+    for k in keys:
+      v = arm["stats"].get(k) if k not in arm else arm.get(k)
+      if v is None:
+        v = arm["stats"].get(k)
+      if v is not None:
+        try:
+          f = float(v)
+          if math.isfinite(f):
+            return f
+        except (TypeError, ValueError):
+          pass
+    return float("nan")
+
+  scalar_metrics = {
+      "pca_size_normalized_standardized_pc1_ratio": lambda arm: (
+          float(arm["stats"]["pca_size_normalized_standardized_explained_variance_ratio"][0])
+          if len(arm["stats"].get("pca_size_normalized_standardized_explained_variance_ratio", [])) >= 1
+          else float("nan")),
+      "pca_size_normalized_standardized_pc2_9_sum": lambda arm: (
+          float(np.sum(arm["stats"]["pca_size_normalized_standardized_explained_variance_ratio"][1:9]))
+          if len(arm["stats"].get("pca_size_normalized_standardized_explained_variance_ratio", [])) >= 9
+          else float("nan")),
+      "pca_size_normalized_standardized_tail_participation_ratio": lambda arm:
+          _scalar(arm, "pca_size_normalized_standardized_tail_participation_ratio"),
+      "gene_corr_abs_normalized_mean": lambda arm: _scalar(arm, "gene_corr_abs_normalized_mean"),
+      "gene_corr_abs_normalized_p90":  lambda arm: _scalar(arm, "gene_corr_abs_normalized_p90"),
+      "gene_mean_mean":     lambda arm: _scalar(arm, "gene_mean_mean"),
+      "gene_var_mean":      lambda arm: _scalar(arm, "gene_var_mean"),
+      "log_lib_size_std":   lambda arm: _scalar(arm, "log_lib_size_std"),
+      "zero_frac":          lambda arm: _scalar(arm, "zero_frac"),
+      "mr_state_participation_ratio": lambda arm: _scalar(arm, "mr_state_participation_ratio"),
+      "within_module_mean_abs_corr":  lambda arm: _scalar(arm, "within_module_mean_abs_corr"),
+      "across_module_mean_abs_corr":  lambda arm: _scalar(arm, "across_module_mean_abs_corr"),
+      "within_minus_across":          lambda arm: _scalar(arm, "within_minus_across"),
+      "distance": lambda arm: float(arm["distance"]) if arm.get("distance") is not None else float("nan"),
+  }
+
+  summary: dict = {}
+  for name, fn in scalar_metrics.items():
+    tree_vals = np.array([fn(rep["tree"])    for rep in replicates], dtype=np.float64)
+    ctrl_vals = np.array([fn(rep["control"]) for rep in replicates], dtype=np.float64)
+    valid = np.isfinite(tree_vals) & np.isfinite(ctrl_vals)
+    diff  = tree_vals[valid] - ctrl_vals[valid]
+    summary[name] = {
+        "tree_mean":    float(np.mean(tree_vals[valid])) if valid.any() else float("nan"),
+        "control_mean": float(np.mean(ctrl_vals[valid])) if valid.any() else float("nan"),
+        "diff_mean":    float(np.mean(diff))              if valid.any() else float("nan"),
+        "diff_std":     float(np.std(diff))               if valid.any() else float("nan"),
+        "n":            int(valid.sum()),
+    }
+
+  # --- per-PC PCA spectrum: elementwise mean/std across replicates ---
+  for arm_name in ("tree", "control"):
+    key = "pca_size_normalized_standardized_explained_variance_ratio"
+    arrays = []
+    for rep in replicates:
+      v = rep[arm_name]["stats"].get(key)
+      if v is not None and len(v):
+        arrays.append(np.asarray(v, dtype=np.float64))
+    if arrays:
+      # align to shortest (different n_pca_components would be a config
+      # mistake, but handle gracefully rather than crashing)
+      min_len = min(len(a) for a in arrays)
+      mat = np.stack([a[:min_len] for a in arrays], axis=0)  # (n_reps, n_pcs)
+      summary.setdefault("pca_spectrum_per_arm", {})[arm_name] = {
+          "mean": mat.mean(axis=0).tolist(),
+          "std":  mat.std(axis=0).tolist(),
+          "n":    len(arrays),
+      }
+
+  # --- top distance terms: mean weighted contribution per key per arm ---
+  for arm_name in ("tree", "control"):
+    term_accum: dict = {}
+    n_reps_with_terms = 0
+    for rep in replicates:
+      breakdown = rep[arm_name].get("distance_breakdown") or {}
+      terms  = breakdown.get("terms",   {})
+      weights = breakdown.get("weights", {})
+      if not terms:
+        continue
+      n_reps_with_terms += 1
+      for k, raw_term in terms.items():
+        w = weights.get(k, 1.0)
+        weighted = w * raw_term
+        term_accum.setdefault(k, []).append(weighted)
+    if term_accum:
+      mean_terms = {k: float(np.mean(v)) for k, v in term_accum.items()}
+      sorted_terms = dict(sorted(mean_terms.items(), key=lambda kv: kv[1], reverse=True))
+      summary.setdefault("top_distance_terms_per_arm", {})[arm_name] = {
+          "mean_weighted_contribution": sorted_terms,
+          "n_replicates": n_reps_with_terms,
+      }
+
+  return summary
+
+
+def run_mr_tree_experiment(
+    config:                  str | dict,
+    n_replicates:            int         = 20,
+    n_states:                int | None  = None,
+    tree_strength:           float       = 1.0,
+    root_variance:           float       = 0.0,
+    seed_base:               int         = 0,
+    mr_rate_low:             float | None = None,
+    mr_rate_high:            float | None = None,
+    stats_n_pca_components:  int | None  = None,
+    stats_n_structure_genes: int | None  = None,
+    stats_percentiles:       tuple | None = None,
+    stats_seed:              int | None  = None,
+    grn_tmp_dir:             str | None  = None,
+    grn_output_path:         str | None  = None,
+    verbose:                 bool        = True,
+) -> dict:
+  """
+  Paired experiment comparing sample_mr_state_from_tree's tree-correlated
+  MR states (test arm, tree_strength=`tree_strength`) against its own
+  tree_strength=0.0 control arm, holding every other simulation input
+  fixed.
+
+  For a *single*, fixed GRN (built once from `config` -- exactly one call
+  to generate_sergio_grn_from_reference / build_mr_overlap_tree in this
+  whole function, shared by every replicate and both arms): runs
+  `n_replicates` paired (tree, control) make_synthetic_data6 simulations,
+  each pair sharing the same per-replicate state/simulation seed (so the
+  MR-state draw and every other simulation randomness source -- cluster
+  sizing, SERGIO's own stochastic simulation, technical noise -- are as
+  comparable as possible between the pair; the *only* difference between
+  a pair's two arms is tree_strength itself, via sample_mr_state_from_
+  tree's own derivation), computes compute_summary_stats() on each of the
+  2 * n_replicates resulting matrices (missing_rate=0.0, matching how
+  target_stats_path's own reference statistics are generated -- see
+  compute_summary_stats' module-level usage note), and returns everything
+  needed for a paired comparison (see _summarize_mr_tree_experiment).
+
+  Args:
+    config:          path to a tune_synthetic_data.py-style JSON config
+                      (either a *tuning* config or a *tuned-result*
+                      config, e.g. tuned_synthetic_config.20260820.00.json
+                      -- see _load_mr_tree_experiment_config), or an
+                      already-loaded/flat dict of the same shape. Supplies
+                      every make_synthetic_data6/generate_sergio_grn_
+                      from_reference/compute_summary_stats argument this
+                      experiment needs; a tuned-result config does not
+                      capture every such argument (see
+                      _load_mr_tree_experiment_config) -- use the
+                      mr_rate_low/mr_rate_high/stats_* keyword arguments
+                      below, or pass the original tuning config instead,
+                      to override its gaps explicitly.
+    n_replicates:    number of paired (tree, control) datasets to
+                      generate from the one fixed GRN/tree.
+    n_states:        number of MR-state rows per make_synthetic_data6
+                      call, i.e. its `n_clusters` -- defaults to
+                      config["n_clusters"] (None means "use the config's
+                      own value unchanged").
+    tree_strength:   sample_mr_state_from_tree's tree_strength for the
+                      test arm (the control arm always uses 0.0).
+    root_variance:   sample_mr_state_from_tree's root_variance, shared by
+                      both arms.
+    seed_base:       replicate r's paired state/sim seed is
+                      seed_base + r (r in range(n_replicates)) -- the
+                      GRN's own grn_seed (from `config`) is untouched
+                      (the GRN/tree stay fixed across every replicate).
+    mr_rate_low, mr_rate_high: override config["mr_rate_low"]/
+                      ["mr_rate_high"] (not captured by a tuned-result
+                      config's "_meta" -- see _load_mr_tree_experiment_
+                      config). None (default) uses the resolved config
+                      value (tune_synthetic_data's plain defaults, 1.0/
+                      5.0, if `config` doesn't set them either).
+    stats_n_pca_components, stats_n_structure_genes, stats_percentiles,
+    stats_seed:      override the corresponding config["stats_*"] entry
+                      (also not captured by a tuned-result config's
+                      "_meta") -- IMPORTANT: if target_stats_path is set,
+                      these should match however that pickle's own
+                      compute_summary_stats() call was configured (this
+                      function warns, but does not raise, on a
+                      stats_n_pca_components mismatch against the loaded
+                      target's own PCA depth -- see the loud warning
+                      below, mirroring tune_synthetic_data.run()'s
+                      identical check).
+    grn_tmp_dir:     directory for the one generated GRN CSV -- defaults
+                      to config.get("grn_tmp_dir") or the system temp dir
+                      (same convention as tune_synthetic_data.run_trial).
+    grn_output_path: if given, the generated GRN CSV is written here and
+                      NOT deleted afterward (e.g. to inspect/reuse it);
+                      otherwise a temp file is used and removed at the
+                      end of this function.
+    verbose:         print a one-line progress message per replicate.
+
+  Returns a dict:
+    "config":            the normalized flat config actually used (after
+                         applying every override argument above).
+    "tree_strength", "root_variance", "n_states", "n_replicates": as given/resolved.
+    "mr_ids":            list[int], the GRN's master-regulator gene ids
+                         (== tree.mr_ids).
+    "gene_id_to_symbol": dict[int, str], from generate_sergio_grn_from_reference.
+    "tree":              the single MRTree built and reused for every
+                         replicate.
+    "mr_target_sets":    dict[mr_id, frozenset[int]] used to build the
+                         tree (see build_mr_target_sets).
+    "grn_diagnostics":   dict populated by generate_sergio_grn_from_
+                         reference's own `diagnostics` parameter --
+                         contains "tgt_ids", "winner_mr", "vote_margin",
+                         "n_regs", "n_ambiguous", "n_ambiguous_flipped",
+                         "n_aligned_edges", "propagated_strength",
+                         "mr_load", "n_distinct_winners",
+                         "top1_winner_share" (see that function's
+                         docstring for full per-field semantics). Use
+                         this to check whether canalization/balancing
+                         produced sensible winner assignments, and
+                         whether those assignments align with the
+                         Jaccard-overlap-based tree structure.
+    "tree_correlation_matrix": (n_mrs, n_mrs) ndarray, the theoretical
+                         MR-MR correlation matrix implied by the tree
+                         under the Brownian-motion model with the given
+                         root_variance (see mr_tree_correlation_matrix).
+                         Compare to each arm's per-replicate empirical
+                         "mr_mr_correlation" to verify the sampler's
+                         fidelity, and inspect directly to confirm that
+                         MRs with more target-gene overlap have higher
+                         implied correlation.
+    "jaccard_similarity_offdiag": 1D ndarray of all upper-triangle
+                         pairwise Jaccard similarities (= 1 - Jaccard
+                         distance) among the n_mrs MR target sets --
+                         the raw overlap distribution the tree is built
+                         from. If this distribution is concentrated near
+                         0 (all MRs have nearly disjoint target sets),
+                         the tree will be nearly flat and tree_strength
+                         will have little effect.
+    "target_set_sizes":  list[int], direct target-gene count per MR
+                         (parallel to mr_ids) -- quick check for whether
+                         MRs actually regulate enough genes to produce
+                         meaningful pairwise overlap.
+    "target_stats":      compute_summary_stats()-style dict loaded from
+                         config["target_stats_path"], if set and
+                         loadable, else None.
+    "replicates": list (len n_replicates) of per-replicate dicts, each:
+        "seed": this replicate's paired state/sim seed.
+        "tree" and "control": per-arm dicts, each containing:
+            "mr_state":       (n_states, n_mrs) ndarray of sampled
+                              basal production rates.
+            "cluster_labels": (n_cells,) int64 ndarray from
+                              make_synthetic_data6.
+            "stats":          compute_summary_stats() dict (all families,
+                              plus augmented derived keys from
+                              _augment_candidate_stats).
+            "distance":       float or None -- compute_stats_distance
+                              vs. target_stats (None if target_stats
+                              unavailable).
+            "distance_breakdown": dict with "terms" (per-key raw
+                              relative-squared-error), "skipped", and
+                              "weights" -- the full breakdown discarded
+                              by tune_synthetic_data.run_trial (kept
+                              here for post-hoc diagnosis of which stats
+                              actually drive the distance, independently
+                              of the scalar total). None if target_stats
+                              unavailable.
+            "mr_mr_correlation": (n_mrs, n_mrs) ndarray, empirical MR-
+                              MR correlation matrix from the sampled
+                              mr_state rows. Compare to
+                              "tree_correlation_matrix" (theoretical) to
+                              verify fidelity; compare tree vs. control
+                              arms to confirm tree_strength has the
+                              intended effect at this n_states.
+            "mr_state_participation_ratio": float, effective rank of
+                              the mr_state matrix (participation ratio
+                              of its mean-centered singular-value
+                              spectrum). Near n_mrs = fully independent;
+                              near 1 = one dominant shared direction.
+            "within_module_mean_abs_corr": float, mean |Pearson corr|
+                              among gene pairs in the same winner_mr
+                              module (see _gene_module_correlations).
+                              NaN if winner_mr unavailable.
+            "across_module_mean_abs_corr": float, same for gene pairs
+                              in different modules.
+            "within_minus_across": float, difference of the two above.
+    "summary": aggregate paired-difference statistics across replicates,
+      see _summarize_mr_tree_experiment -- includes scalar metric
+      mean/std/diff tables, per-PC PCA spectrum (mean/std per arm), and
+      mean top distance terms per arm.
+
+  Note: this function does not persist anything to disk itself (unlike
+  tune_synthetic_data.run_trial's grn_archive_dir) -- the caller (e.g.
+  this module's own CLI, see main()) is responsible for pickling/saving
+  the returned dict if it should outlive the calling process. mr_state/
+  cluster_labels/stats/correlation matrices are numpy arrays throughout,
+  not JSON-ified (see tune_synthetic_data._jsonify_stats for a ready-
+  made converter if a JSON-based archive is preferred).
+  """
+  _tsd = _import_tune_synthetic_data()
+  cfg = _load_mr_tree_experiment_config(config)
+
+  if mr_rate_low             is not None: cfg["mr_rate_low"]             = mr_rate_low
+  if mr_rate_high            is not None: cfg["mr_rate_high"]            = mr_rate_high
+  if stats_n_pca_components  is not None: cfg["stats_n_pca_components"]  = stats_n_pca_components
+  if stats_n_structure_genes is not None: cfg["stats_n_structure_genes"] = stats_n_structure_genes
+  if stats_percentiles       is not None: cfg["stats_percentiles"]       = stats_percentiles
+  if stats_seed              is not None: cfg["stats_seed"]              = stats_seed
+
+  n_states = cfg["n_clusters"] if n_states is None else n_states
+  device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+  target_stats = None
+  if cfg.get("target_stats_path"):
+    with open(cfg["target_stats_path"], "rb") as f:
+      target_stats = pickle.load(f)
+    _augment_candidate_stats(target_stats, _tsd)
+    target_pca = target_stats.get("pca_explained_variance_ratio")
+    if target_pca is not None and len(target_pca) and len(target_pca) != cfg["stats_n_pca_components"]:
+      print(
+          f"*** WARNING: target_stats_path's pca_explained_variance_ratio "
+          f"has {len(target_pca)} components, but stats_n_pca_components="
+          f"{cfg['stats_n_pca_components']} -- candidates will not be "
+          f"apples-to-apples with the target's PCA depth. Pass an explicit "
+          f"stats_n_pca_components={len(target_pca)} to run_mr_tree_"
+          f"experiment (matching how target_stats_path was generated), or "
+          f"supply the *original* tuning config (not just its tuned-result "
+          f"output) if it sets stats_n_pca_components itself. ***"
+      )
+
+  sim_kwargs, grn_k_dist, hill_coeff_dist, unknown_mode_repressor_prob, grn_coherency_kwargs = \
+      _tsd._split_resolved(cfg)
+
+  grn_tmp_dir = grn_tmp_dir or cfg.get("grn_tmp_dir") or tempfile.gettempdir()
+  Path(grn_tmp_dir).mkdir(parents=True, exist_ok=True)
+  grn_path = grn_output_path or os.path.join(
+      grn_tmp_dir, f"sergio_grn_mr_tree_experiment_{os.getpid()}.csv")
+
+  if verbose:
+    print(f"[run_mr_tree_experiment] generating GRN ({cfg['n_genes']} genes, "
+          f"grn_seed={cfg['grn_seed']}) -> {grn_path!r} ...")
+  grn_diagnostics: dict = {}
+  _, mr_ids, gene_id_to_symbol = generate_sergio_grn_from_reference(
+      reference_grn_path=cfg["reference_grn_path"],
+      n_genes=cfg["n_genes"],
+      output_path=grn_path,
+      delimiter=cfg["grn_delimiter"],
+      regulator_col=cfg["grn_regulator_col"],
+      target_col=cfg["grn_target_col"],
+      mode_col=cfg["grn_mode_col"],
+      activation_labels=cfg["grn_activation_labels"],
+      repression_labels=cfg["grn_repression_labels"],
+      unknown_mode_repressor_prob=unknown_mode_repressor_prob,
+      k_dist=grn_k_dist,
+      hill_coeff_dist=hill_coeff_dist,
+      max_seed_attempts=cfg["grn_max_seed_attempts"],
+      seed=cfg["grn_seed"],
+      diagnostics=grn_diagnostics,
+      **grn_coherency_kwargs,
+  )
+
+  # winner_mr_by_gene: pair of parallel lists (tgt_ids, winner_mr) taken
+  # directly from grn_diagnostics -- used by _gene_module_correlations.
+  winner_mr_by_gene = (
+      (grn_diagnostics.get("tgt_ids", []), grn_diagnostics.get("winner_mr", []))
+      if grn_diagnostics.get("winner_mr") else None
+  )
+
+  try:
+    mr_target_sets = build_mr_target_sets(grn_path, mr_ids)
+    tree = build_mr_overlap_tree(grn_path, mr_ids, target_sets=mr_target_sets)
+
+    # GRN-level instrumentation (computed once, shared across all replicates).
+    tree_correlation_matrix = mr_tree_correlation_matrix(tree)
+    R_offdiag = tree_correlation_matrix[np.triu_indices(tree.n_mrs, k=1)]
+    target_set_sizes = [len(mr_target_sets[mr]) for mr in mr_ids]
+    dist_matrix = _jaccard_distance_matrix([mr_target_sets[mr] for mr in mr_ids])
+    jaccard_sim_offdiag = (1.0 - dist_matrix)[np.triu_indices(tree.n_mrs, k=1)]
+
+    if verbose:
+      print(f"[run_mr_tree_experiment] built MR overlap tree over "
+            f"{tree.n_mrs} MRs | target-set sizes min/median/max = "
+            f"{min(target_set_sizes)}/{int(np.median(target_set_sizes))}/{max(target_set_sizes)} | "
+            f"Jaccard similarity off-diag mean={float(np.mean(jaccard_sim_offdiag)):.3f} | "
+            f"R_tree off-diag mean={float(np.mean(R_offdiag)):.3f} ...")
+
+    replicates = []
+    for r in range(n_replicates):
+      replicate_seed = seed_base + r
+      if verbose:
+        print(f"[run_mr_tree_experiment] replicate {r + 1}/{n_replicates} "
+              f"(seed={replicate_seed}) ...")
+
+      arms = {}
+      for arm_name, strength in (("tree", tree_strength), ("control", 0.0)):
+        mr_state_np = sample_mr_state_from_tree(
+            tree, n_states=n_states,
+            low=cfg["mr_rate_low"], high=cfg["mr_rate_high"],
+            seed=replicate_seed, tree_strength=strength, root_variance=root_variance,
+        )
+        mr_state = torch.tensor(mr_state_np, dtype=torch.float32, device=device)
+
+        X_sim, cluster_labels = make_synthetic_data6(
+            mr_state=mr_state,
+            input_file_targets=grn_path,
+            n_cells=cfg["n_cells"],
+            mr_gene_ids=mr_ids,
+            shared_coop_state=cfg["shared_coop_state"],
+            noise_type=cfg["noise_type"],
+            sampling_state=cfg["sampling_state"],
+            dt=cfg["dt"],
+            min_cells_per_cluster=cfg["min_cells_per_cluster"],
+            add_outlier_genes=cfg["add_outlier_genes"],
+            add_lib_size_effect=cfg["add_lib_size_effect"],
+            add_dropout=cfg["add_dropout"],
+            convert_to_umi_counts=cfg["convert_to_umi_counts"],
+            missing_rate=0.0,
+            seed=replicate_seed,
+            device=device,
+            **sim_kwargs,
+        )
+        stats = compute_summary_stats(
+            X_sim,
+            n_pca_components=cfg["stats_n_pca_components"],
+            n_structure_genes=cfg["stats_n_structure_genes"],
+            percentiles=tuple(cfg["stats_percentiles"]),
+            seed=cfg["stats_seed"],
+        )
+        _augment_candidate_stats(stats, _tsd)
+
+        distance = None
+        distance_breakdown = None
+        if target_stats is not None:
+          distance, breakdown = _tsd.compute_stats_distance(
+              target_stats, stats, weights=cfg.get("weights"),
+              eps=cfg.get("distance_eps", 1e-6),
+              eps_frac=cfg.get("distance_eps_frac", 0.05),
+              eps_abs_floor=cfg.get("distance_eps_abs_floor", 0.02),
+          )
+          # Store terms + the weights used so _summarize can re-rank them.
+          distance_breakdown = {
+              "terms":   breakdown["terms"],
+              "skipped": breakdown["skipped"],
+              "weights": dict(cfg.get("weights") or {}),
+          }
+
+        # Per-arm instrumentation.
+        mr_state_corr = (
+            np.corrcoef(mr_state_np, rowvar=True)  # (n_states, n_states) -- rows as obs
+            if mr_state_np.shape[0] >= 2 else np.full((1, 1), float("nan"))
+        )
+        # MR-MR empirical correlation (columns as variables).
+        mr_mr_corr = (
+            np.corrcoef(mr_state_np, rowvar=False)  # (n_mrs, n_mrs)
+            if mr_state_np.shape[0] >= 2 else np.full((mr_state_np.shape[1],) * 2, float("nan"))
+        )
+        mr_state_pr = _mr_state_participation_ratio(mr_state_np)
+
+        gene_mod_corr = _gene_module_correlations(
+            X_sim, cluster_labels, winner_mr_by_gene, mr_ids, gene_id_to_symbol,
+            n_structure_genes=cfg["stats_n_structure_genes"],
+            seed=cfg["stats_seed"],
+        )
+
+        arms[arm_name] = {
+            "mr_state":                    mr_state_np,
+            "cluster_labels":              cluster_labels,
+            "stats":                       stats,
+            "distance":                    distance,
+            "distance_breakdown":          distance_breakdown,
+            "mr_mr_correlation":           mr_mr_corr,
+            "mr_state_participation_ratio": mr_state_pr,
+            "within_module_mean_abs_corr": gene_mod_corr["within_module_mean_abs_corr"],
+            "across_module_mean_abs_corr": gene_mod_corr["across_module_mean_abs_corr"],
+            "within_minus_across":         gene_mod_corr["within_minus_across"],
+        }
+
+      replicates.append({"seed": replicate_seed, "tree": arms["tree"], "control": arms["control"]})
+  finally:
+    if grn_output_path is None and os.path.exists(grn_path):
+      os.remove(grn_path)
+
+  summary = _summarize_mr_tree_experiment(replicates)
+
+  return {
+      "config":            cfg,
+      "tree_strength":     tree_strength,
+      "root_variance":     root_variance,
+      "n_states":          n_states,
+      "n_replicates":      n_replicates,
+      "mr_ids":            mr_ids,
+      "gene_id_to_symbol": gene_id_to_symbol,
+      "tree":              tree,
+      "mr_target_sets":    mr_target_sets,
+      "grn_diagnostics":   grn_diagnostics,
+      "tree_correlation_matrix":        tree_correlation_matrix,
+      "jaccard_similarity_offdiag":     jaccard_sim_offdiag,
+      "target_set_sizes":               target_set_sizes,
+      "target_stats":      target_stats,
+      "replicates":        replicates,
+      "summary":           summary,
+  }
+
+
+def main(argv=None) -> dict:
+  parser = argparse.ArgumentParser(
+      description=(
+          "Compare tree-correlated vs. i.i.d. master-regulator mr_state "
+          "sampling (build_mr_overlap_tree / sample_mr_state_from_tree) "
+          "via run_mr_tree_experiment."
+      ),
+      formatter_class=argparse.RawDescriptionHelpFormatter,
+  )
+  parser.add_argument(
+      "--config", required=True,
+      help="Path to a tune_synthetic_data.py-style JSON config (tuning or "
+           "tuned-result shape -- see _load_mr_tree_experiment_config).",
+  )
+  parser.add_argument("--n-replicates", type=int, default=20)
+  parser.add_argument("--n-states", type=int, default=None)
+  parser.add_argument("--tree-strength", type=float, default=1.0)
+  parser.add_argument("--root-variance", type=float, default=0.0)
+  parser.add_argument("--seed-base", type=int, default=0)
+  parser.add_argument("--mr-rate-low", type=float, default=None)
+  parser.add_argument("--mr-rate-high", type=float, default=None)
+  parser.add_argument("--stats-n-pca-components", type=int, default=None)
+  parser.add_argument("--grn-output-path", default=None)
+  parser.add_argument(
+      "--output", default="mr_tree_experiment_result.pickle",
+      help="Where to pickle the full result dict (see run_mr_tree_"
+           "experiment's return-value docstring).",
+  )
+  args = parser.parse_args(argv)
+
+  result = run_mr_tree_experiment(
+      args.config,
+      n_replicates=args.n_replicates,
+      n_states=args.n_states,
+      tree_strength=args.tree_strength,
+      root_variance=args.root_variance,
+      seed_base=args.seed_base,
+      mr_rate_low=args.mr_rate_low,
+      mr_rate_high=args.mr_rate_high,
+      stats_n_pca_components=args.stats_n_pca_components,
+      grn_output_path=args.grn_output_path,
+  )
+
+  with open(args.output, "wb") as f:
+    pickle.dump(result, f)
+  print(f"\nSaved full result to {args.output!r}")
+
+  print(f"\nPaired tree-vs-control summary (tree_strength={args.tree_strength}, "
+        f"n_replicates={args.n_replicates}):")
+  for name, s in result["summary"].items():
+    print(f"  {name}: tree={s['tree_mean']:.4f}  control={s['control_mean']:.4f}  "
+          f"diff={s['diff_mean']:.4f} +/- {s['diff_std']:.4f}  (n={s['n']})")
+
+  return result
+
+
+if __name__ == "__main__":
+  main()
 

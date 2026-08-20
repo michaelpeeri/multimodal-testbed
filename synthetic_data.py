@@ -1774,6 +1774,127 @@ def build_mr_target_sets(input_file_targets: str, mr_ids: list) -> dict:
   return {mr_id: frozenset(s) for mr_id, s in target_sets.items()}
 
 
+def build_mr_transitive_profiles(
+    input_file_targets: str,
+    mr_ids:             list,
+    path_decay:         float = 0.9,
+) -> tuple[np.ndarray, np.ndarray]:
+  """
+  Build hard and shortest-path-decayed downstream influence profiles for MRs.
+
+  The generated SERGIO targets file is already DAG-ified, so each profile is
+  computed by traversing the final graph actually used by make_synthetic_data6.
+  The MR's own column is excluded: only downstream genes are part of its
+  regulatory footprint.
+
+  Returns:
+    (hard_profiles, soft_profiles), each shaped (n_mrs, n_genes).
+    hard_profiles[mr, gene] is 1.0 iff gene is reachable from mr.
+    soft_profiles[mr, gene] is path_decay ** (shortest_hop_count - 1) for
+    reachable genes, so direct targets have weight 1.0.
+
+  Using the shortest path rather than summing all paths prevents highly
+  branched MRs from receiving an artificial weight advantage merely because
+  many redundant paths reach the same gene.
+  """
+  assert 0.0 <= path_decay <= 1.0, (
+      f"path_decay must be in [0, 1], got {path_decay}"
+  )
+  n_genes, _ = _parse_sergio_targets_file(input_file_targets)
+  mr_ids = list(mr_ids)
+  mr_id_set = set(mr_ids)
+  adjacency = {gene_id: [] for gene_id in range(n_genes)}
+
+  with open(input_file_targets, 'r') as f:
+    reader = csv.reader(f, delimiter=',')
+    for row in reader:
+      row = [c.strip() for c in row if c.strip() != '']
+      if not row:
+        continue
+      target_id = int(float(row[0]))
+      n_regs = int(float(row[1]))
+      for reg in row[2 : 2 + n_regs]:
+        adjacency[int(float(reg))].append(target_id)
+
+  hard = np.zeros((len(mr_ids), n_genes), dtype=np.float64)
+  soft = np.zeros_like(hard)
+  for mr_index, mr_id in enumerate(mr_ids):
+    assert mr_id in mr_id_set
+    hop_count = {mr_id: 0}
+    stack = [mr_id]
+    while stack:
+      node = stack.pop()
+      next_hop = hop_count[node] + 1
+      for child in adjacency[node]:
+        previous = hop_count.get(child)
+        if previous is not None and previous <= next_hop:
+          continue
+        hop_count[child] = next_hop
+        stack.append(child)
+
+    for gene_id, hops in hop_count.items():
+      if gene_id == mr_id:
+        continue
+      hard[mr_index, gene_id] = 1.0
+      soft[mr_index, gene_id] = path_decay ** (hops - 1)
+
+  return hard, soft
+
+
+def _profile_distance_matrix(profiles: np.ndarray, weighted: bool) -> np.ndarray:
+  """Return Jaccard or weighted-Jaccard distance between MR profiles."""
+  profiles = np.asarray(profiles, dtype=np.float64)
+  assert profiles.ndim == 2, f"profiles must be 2D, got shape {profiles.shape}"
+  assert np.all(np.isfinite(profiles)), "profiles contain non-finite values"
+  assert np.all(profiles >= 0.0), "profiles must be non-negative"
+
+  n_mrs = profiles.shape[0]
+  distance = np.zeros((n_mrs, n_mrs), dtype=np.float64)
+  for i in range(n_mrs):
+    for j in range(i + 1, n_mrs):
+      if weighted:
+        numerator = np.minimum(profiles[i], profiles[j]).sum()
+        denominator = np.maximum(profiles[i], profiles[j]).sum()
+      else:
+        numerator = np.count_nonzero((profiles[i] > 0.0) & (profiles[j] > 0.0))
+        denominator = np.count_nonzero((profiles[i] > 0.0) | (profiles[j] > 0.0))
+      similarity = numerator / denominator if denominator > 0.0 else 0.0
+      distance[i, j] = distance[j, i] = 1.0 - similarity
+  return distance
+
+
+def _tree_from_distance_matrix(mr_ids: list, distance: np.ndarray) -> MRTree:
+  """Build an MRTree from a precomputed symmetric MR distance matrix."""
+  mr_ids = list(mr_ids)
+  distance = np.asarray(distance, dtype=np.float64)
+  assert distance.shape == (len(mr_ids), len(mr_ids)), (
+      f"distance shape {distance.shape} does not match {len(mr_ids)} MRs"
+  )
+  assert np.all(np.isfinite(distance)), "distance contains non-finite values"
+  assert np.allclose(distance, distance.T), "distance must be symmetric"
+  assert np.all(distance >= -1e-12), "distance must be non-negative"
+  distance = np.maximum(distance, 0.0)
+  np.fill_diagonal(distance, 0.0)
+
+  children, height, root = _average_linkage_tree(distance)
+  edge_length = {}
+  for node, (left, right) in children.items():
+    edge_length[left] = height[node] - height[left]
+    edge_length[right] = height[node] - height[right]
+  return MRTree(mr_ids=mr_ids, children=children, edge_length=edge_length, root=root)
+
+
+def build_mr_profile_tree(
+    mr_ids:   list,
+    profiles: np.ndarray,
+    weighted: bool = False,
+) -> MRTree:
+  """Build a UPGMA MRTree from hard or non-negative weighted profiles."""
+  return _tree_from_distance_matrix(
+      list(mr_ids), _profile_distance_matrix(profiles, weighted=weighted)
+  )
+
+
 def _jaccard_distance_matrix(target_sets: list) -> np.ndarray:
   """
   Pairwise Jaccard *distance* matrix (1 - |A∩B| / |A∪B|) over a list of
@@ -1924,14 +2045,7 @@ def build_mr_overlap_tree(
   if target_sets is None:
     target_sets = build_mr_target_sets(input_file_targets, mr_ids)
   dist = _jaccard_distance_matrix([target_sets[mr_id] for mr_id in mr_ids])
-  children, height, root = _average_linkage_tree(dist)
-
-  edge_length = {}
-  for node, (left, right) in children.items():
-    edge_length[left]  = height[node] - height[left]
-    edge_length[right] = height[node] - height[right]
-
-  return MRTree(mr_ids=mr_ids, children=children, edge_length=edge_length, root=root)
+  return _tree_from_distance_matrix(mr_ids, dist)
 
 
 def mr_tree_pairwise_covariance(tree: MRTree, root_variance: float = 0.0) -> np.ndarray:
@@ -3513,10 +3627,14 @@ def _gene_module_correlations(
   }
 
 
-def _summarize_mr_tree_experiment(replicates: list) -> dict:
+def _summarize_mr_tree_experiment(
+    replicates: list,
+    arm_names:  tuple | list | None = None,
+) -> dict:
   """
-  Aggregate paired tree-vs-control differences across run_mr_tree_
-  experiment's replicates.
+  Aggregate paired arm differences across run_mr_tree_experiment's
+  replicates. With no explicit arm_names, retain the original tree/control
+  summary shape for callers of the original two-arm helper.
 
   Scalar metrics (each -> {"tree_mean", "control_mean", "diff_mean",
   "diff_std", "n"}): differences are computed paired (tree - control per
@@ -3591,22 +3709,69 @@ def _summarize_mr_tree_experiment(replicates: list) -> dict:
       "distance": lambda arm: float(arm["distance"]) if arm.get("distance") is not None else float("nan"),
   }
 
+  if arm_names is None:
+    arm_names = ("tree", "control")
+  else:
+    arm_names = tuple(arm_names)
+  assert arm_names, "need at least one arm"
+
   summary: dict = {}
   for name, fn in scalar_metrics.items():
-    tree_vals = np.array([fn(rep["tree"])    for rep in replicates], dtype=np.float64)
-    ctrl_vals = np.array([fn(rep["control"]) for rep in replicates], dtype=np.float64)
-    valid = np.isfinite(tree_vals) & np.isfinite(ctrl_vals)
-    diff  = tree_vals[valid] - ctrl_vals[valid]
-    summary[name] = {
-        "tree_mean":    float(np.mean(tree_vals[valid])) if valid.any() else float("nan"),
-        "control_mean": float(np.mean(ctrl_vals[valid])) if valid.any() else float("nan"),
-        "diff_mean":    float(np.mean(diff))              if valid.any() else float("nan"),
-        "diff_std":     float(np.std(diff))               if valid.any() else float("nan"),
-        "n":            int(valid.sum()),
+    values = {
+        arm: np.array([fn(rep[arm]) for rep in replicates], dtype=np.float64)
+        for arm in arm_names
     }
+    arm_summary = {}
+    for arm, vals in values.items():
+      valid = np.isfinite(vals)
+      arm_summary[arm] = {
+          "mean": float(np.mean(vals[valid])) if valid.any() else float("nan"),
+          "std":  float(np.std(vals[valid]))  if valid.any() else float("nan"),
+          "n":    int(valid.sum()),
+      }
+
+    pairwise = {}
+    for i, left in enumerate(arm_names):
+      for right in arm_names[i + 1:]:
+        valid = np.isfinite(values[left]) & np.isfinite(values[right])
+        diff = values[left][valid] - values[right][valid]
+        pairwise[f"{left}_vs_{right}"] = {
+            "left": left,
+            "right": right,
+            "diff_mean": float(np.mean(diff)) if valid.any() else float("nan"),
+            "diff_std":  float(np.std(diff))  if valid.any() else float("nan"),
+            "n": int(valid.sum()),
+        }
+
+    summary[name] = {
+        "arms": arm_summary,
+        "pairwise": pairwise,
+    }
+    # Preserve the original field names for old two-arm callers and make the
+    # direct tree the historical `tree` arm in the expanded experiment.
+    reference_arm = "tree" if "tree" in arm_summary else (
+        "direct" if "direct" in arm_summary else arm_names[0]
+    )
+    control_arm = "control" if "control" in arm_summary else None
+    if control_arm is not None:
+      pair = pairwise.get(f"{reference_arm}_vs_{control_arm}")
+      if pair is None:
+        pair = pairwise.get(f"{control_arm}_vs_{reference_arm}")
+        if pair is not None:
+          pair = {
+              **pair,
+              "diff_mean": -pair["diff_mean"],
+          }
+      summary[name].update({
+          "tree_mean": arm_summary[reference_arm]["mean"],
+          "control_mean": arm_summary[control_arm]["mean"],
+          "diff_mean": pair["diff_mean"] if pair is not None else float("nan"),
+          "diff_std": pair["diff_std"] if pair is not None else float("nan"),
+          "n": pair["n"] if pair is not None else 0,
+      })
 
   # --- per-PC PCA spectrum: elementwise mean/std across replicates ---
-  for arm_name in ("tree", "control"):
+  for arm_name in arm_names:
     key = "pca_size_normalized_standardized_explained_variance_ratio"
     arrays = []
     for rep in replicates:
@@ -3625,7 +3790,7 @@ def _summarize_mr_tree_experiment(replicates: list) -> dict:
       }
 
   # --- top distance terms: mean weighted contribution per key per arm ---
-  for arm_name in ("tree", "control"):
+  for arm_name in arm_names:
     term_accum: dict = {}
     n_reps_with_terms = 0
     for rep in replicates:
@@ -3659,6 +3824,7 @@ def run_mr_tree_experiment(
     seed_base:               int         = 0,
     mr_rate_low:             float | None = None,
     mr_rate_high:            float | None = None,
+    mr_tree_path_decay:      float | None = None,
     stats_n_pca_components:  int | None  = None,
     stats_n_structure_genes: int | None  = None,
     stats_percentiles:       tuple | None = None,
@@ -3668,25 +3834,22 @@ def run_mr_tree_experiment(
     verbose:                 bool        = True,
 ) -> dict:
   """
-  Paired experiment comparing sample_mr_state_from_tree's tree-correlated
-  MR states (test arm, tree_strength=`tree_strength`) against its own
-  tree_strength=0.0 control arm, holding every other simulation input
-  fixed.
+  Paired experiment comparing three tree constructions against an iid
+  control: direct-target Jaccard, transitive hard reachability, and
+  transitive shortest-path-decayed weighted reachability. All three trees
+  are built from one fixed generated GRN and every arm is simulated with the
+  same per-replicate configuration.
 
-  For a *single*, fixed GRN (built once from `config` -- exactly one call
-  to generate_sergio_grn_from_reference / build_mr_overlap_tree in this
-  whole function, shared by every replicate and both arms): runs
-  `n_replicates` paired (tree, control) make_synthetic_data6 simulations,
-  each pair sharing the same per-replicate state/simulation seed (so the
-  MR-state draw and every other simulation randomness source -- cluster
-  sizing, SERGIO's own stochastic simulation, technical noise -- are as
-  comparable as possible between the pair; the *only* difference between
-  a pair's two arms is tree_strength itself, via sample_mr_state_from_
-  tree's own derivation), computes compute_summary_stats() on each of the
-  2 * n_replicates resulting matrices (missing_rate=0.0, matching how
+  For a *single*, fixed GRN (built once from `config`), runs
+  `n_replicates` paired simulations for each tree arm and the iid control.
+  Each replicate shares its state/simulation seed across arms, so cluster
+  sizing, SERGIO stochastic simulation, and technical noise are as
+  comparable as possible; the tree construction is the intended arm
+  difference. It computes compute_summary_stats() on each resulting matrix
+  (missing_rate=0.0, matching how
   target_stats_path's own reference statistics are generated -- see
   compute_summary_stats' module-level usage note), and returns everything
-  needed for a paired comparison (see _summarize_mr_tree_experiment).
+  needed for paired comparisons (see _summarize_mr_tree_experiment).
 
   Args:
     config:          path to a tune_synthetic_data.py-style JSON config
@@ -3702,14 +3865,14 @@ def run_mr_tree_experiment(
                       mr_rate_low/mr_rate_high/stats_* keyword arguments
                       below, or pass the original tuning config instead,
                       to override its gaps explicitly.
-    n_replicates:    number of paired (tree, control) datasets to
-                      generate from the one fixed GRN/tree.
+    n_replicates:    number of paired four-arm datasets to generate from
+                       the one fixed GRN.
     n_states:        number of MR-state rows per make_synthetic_data6
                       call, i.e. its `n_clusters` -- defaults to
                       config["n_clusters"] (None means "use the config's
                       own value unchanged").
-    tree_strength:   sample_mr_state_from_tree's tree_strength for the
-                      test arm (the control arm always uses 0.0).
+    tree_strength:   sample_mr_state_from_tree's tree_strength for each tree
+                       arm (the control arm always uses 0.0).
     root_variance:   sample_mr_state_from_tree's root_variance, shared by
                       both arms.
     seed_base:       replicate r's paired state/sim seed is
@@ -3720,8 +3883,11 @@ def run_mr_tree_experiment(
                       ["mr_rate_high"] (not captured by a tuned-result
                       config's "_meta" -- see _load_mr_tree_experiment_
                       config). None (default) uses the resolved config
-                      value (tune_synthetic_data's plain defaults, 1.0/
-                      5.0, if `config` doesn't set them either).
+                       value (tune_synthetic_data's plain defaults, 1.0/
+                       5.0, if `config` doesn't set them either).
+    mr_tree_path_decay: path decay used only by the transitive-soft tree;
+                       defaults to 0.9 and is separate from the GRN
+                       coherency mechanism's `path_decay`.
     stats_n_pca_components, stats_n_structure_genes, stats_percentiles,
     stats_seed:      override the corresponding config["stats_*"] entry
                       (also not captured by a tuned-result config's
@@ -3749,10 +3915,13 @@ def run_mr_tree_experiment(
     "mr_ids":            list[int], the GRN's master-regulator gene ids
                          (== tree.mr_ids).
     "gene_id_to_symbol": dict[int, str], from generate_sergio_grn_from_reference.
-    "tree":              the single MRTree built and reused for every
-                         replicate.
-    "mr_target_sets":    dict[mr_id, frozenset[int]] used to build the
-                         tree (see build_mr_target_sets).
+    "tree":              compatibility alias for the direct-target tree.
+    "trees":             dict containing direct, transitive_hard, and
+                          transitive_soft MRTree objects.
+    "tree_profiles":     dict of the (n_mrs, n_genes) profiles used by
+                          those three trees.
+    "mr_target_sets":    direct target sets used by the direct tree (see
+                          build_mr_target_sets).
     "grn_diagnostics":   dict populated by generate_sergio_grn_from_
                          reference's own `diagnostics` parameter --
                          contains "tgt_ids", "winner_mr", "vote_margin",
@@ -3763,25 +3932,15 @@ def run_mr_tree_experiment(
                          docstring for full per-field semantics). Use
                          this to check whether canalization/balancing
                          produced sensible winner assignments, and
-                         whether those assignments align with the
-                         Jaccard-overlap-based tree structure.
-    "tree_correlation_matrix": (n_mrs, n_mrs) ndarray, the theoretical
-                         MR-MR correlation matrix implied by the tree
-                         under the Brownian-motion model with the given
-                         root_variance (see mr_tree_correlation_matrix).
-                         Compare to each arm's per-replicate empirical
-                         "mr_mr_correlation" to verify the sampler's
-                         fidelity, and inspect directly to confirm that
-                         MRs with more target-gene overlap have higher
-                         implied correlation.
-    "jaccard_similarity_offdiag": 1D ndarray of all upper-triangle
-                         pairwise Jaccard similarities (= 1 - Jaccard
-                         distance) among the n_mrs MR target sets --
-                         the raw overlap distribution the tree is built
-                         from. If this distribution is concentrated near
-                         0 (all MRs have nearly disjoint target sets),
-                         the tree will be nearly flat and tree_strength
-                         will have little effect.
+                          whether those assignments align with the tree
+                          profile structures.
+    "tree_diagnostics": dict per tree with theoretical MR-MR correlation,
+                          profile-similarity distribution, and profile
+                          support sizes.
+    "tree_correlation_matrix": compatibility alias for the direct tree's
+                          theoretical MR-MR correlation matrix.
+    "jaccard_similarity_offdiag": compatibility alias for the direct tree's
+                          profile-similarity distribution.
     "target_set_sizes":  list[int], direct target-gene count per MR
                          (parallel to mr_ids) -- quick check for whether
                          MRs actually regulate enough genes to produce
@@ -3791,7 +3950,8 @@ def run_mr_tree_experiment(
                          loadable, else None.
     "replicates": list (len n_replicates) of per-replicate dicts, each:
         "seed": this replicate's paired state/sim seed.
-        "tree" and "control": per-arm dicts, each containing:
+        "direct", "transitive_hard", "transitive_soft", and "control":
+        per-arm dicts, each containing:
             "mr_state":       (n_states, n_mrs) ndarray of sampled
                               basal production rates.
             "cluster_labels": (n_cells,) int64 ndarray from
@@ -3813,10 +3973,9 @@ def run_mr_tree_experiment(
             "mr_mr_correlation": (n_mrs, n_mrs) ndarray, empirical MR-
                               MR correlation matrix from the sampled
                               mr_state rows. Compare to
-                              "tree_correlation_matrix" (theoretical) to
-                              verify fidelity; compare tree vs. control
-                              arms to confirm tree_strength has the
-                              intended effect at this n_states.
+                               the corresponding tree_diagnostics entry to
+                               verify fidelity; compare every tree arm to
+                               control at this n_states.
             "mr_state_participation_ratio": float, effective rank of
                               the mr_state matrix (participation ratio
                               of its mean-centered singular-value
@@ -3851,6 +4010,14 @@ def run_mr_tree_experiment(
   if stats_n_structure_genes is not None: cfg["stats_n_structure_genes"] = stats_n_structure_genes
   if stats_percentiles       is not None: cfg["stats_percentiles"]       = stats_percentiles
   if stats_seed              is not None: cfg["stats_seed"]              = stats_seed
+
+  tree_path_decay = (
+      float(cfg.get("mr_tree_path_decay", 0.9))
+      if mr_tree_path_decay is None else float(mr_tree_path_decay)
+  )
+  assert 0.0 <= tree_path_decay <= 1.0, (
+      f"mr_tree_path_decay must be in [0, 1], got {tree_path_decay}"
+  )
 
   n_states = cfg["n_clusters"] if n_states is None else n_states
   device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -3913,21 +4080,57 @@ def run_mr_tree_experiment(
 
   try:
     mr_target_sets = build_mr_target_sets(grn_path, mr_ids)
-    tree = build_mr_overlap_tree(grn_path, mr_ids, target_sets=mr_target_sets)
+    direct_tree = build_mr_overlap_tree(grn_path, mr_ids, target_sets=mr_target_sets)
+
+    # Build hard and path-decayed transitive profiles from the same final DAG.
+    n_genes, _ = _parse_sergio_targets_file(grn_path)
+    direct_profiles = np.zeros((len(mr_ids), n_genes), dtype=np.float64)
+    for mr_index, mr_id in enumerate(mr_ids):
+      direct_profiles[mr_index, list(mr_target_sets[mr_id])] = 1.0
+    transitive_hard_profiles, transitive_soft_profiles = build_mr_transitive_profiles(
+        grn_path, mr_ids, path_decay=tree_path_decay
+    )
+    transitive_hard_tree = build_mr_profile_tree(
+        mr_ids, transitive_hard_profiles, weighted=False
+    )
+    transitive_soft_tree = build_mr_profile_tree(
+        mr_ids, transitive_soft_profiles, weighted=True
+    )
+    trees = {
+        "direct": direct_tree,
+        "transitive_hard": transitive_hard_tree,
+        "transitive_soft": transitive_soft_tree,
+    }
+    profiles = {
+        "direct": direct_profiles,
+        "transitive_hard": transitive_hard_profiles,
+        "transitive_soft": transitive_soft_profiles,
+    }
 
     # GRN-level instrumentation (computed once, shared across all replicates).
-    tree_correlation_matrix = mr_tree_correlation_matrix(tree)
-    R_offdiag = tree_correlation_matrix[np.triu_indices(tree.n_mrs, k=1)]
+    tree_diagnostics = {}
     target_set_sizes = [len(mr_target_sets[mr]) for mr in mr_ids]
-    dist_matrix = _jaccard_distance_matrix([mr_target_sets[mr] for mr in mr_ids])
-    jaccard_sim_offdiag = (1.0 - dist_matrix)[np.triu_indices(tree.n_mrs, k=1)]
+    offdiag = np.triu_indices(len(mr_ids), k=1)
+    for tree_name, tree in trees.items():
+      profile_distance = _profile_distance_matrix(
+          profiles[tree_name], weighted=(tree_name == "transitive_soft")
+      )
+      tree_correlation = mr_tree_correlation_matrix(tree, root_variance)
+      tree_diagnostics[tree_name] = {
+          "tree_correlation_matrix": tree_correlation,
+          "profile_similarity_offdiag": (1.0 - profile_distance)[offdiag],
+          "profile_support_sizes": np.count_nonzero(profiles[tree_name] > 0.0, axis=1),
+      }
 
     if verbose:
-      print(f"[run_mr_tree_experiment] built MR overlap tree over "
-            f"{tree.n_mrs} MRs | target-set sizes min/median/max = "
+      profile_means = ", ".join(
+          f"{name}={float(np.mean(info['profile_similarity_offdiag'])):.3f}"
+          for name, info in tree_diagnostics.items()
+      )
+      print(f"[run_mr_tree_experiment] built 3 MR trees over "
+            f"{direct_tree.n_mrs} MRs | direct target-set sizes min/median/max = "
             f"{min(target_set_sizes)}/{int(np.median(target_set_sizes))}/{max(target_set_sizes)} | "
-            f"Jaccard similarity off-diag mean={float(np.mean(jaccard_sim_offdiag)):.3f} | "
-            f"R_tree off-diag mean={float(np.mean(R_offdiag)):.3f} ...")
+            f"profile-similarity means={profile_means} ...")
 
     replicates = []
     for r in range(n_replicates):
@@ -3937,9 +4140,14 @@ def run_mr_tree_experiment(
               f"(seed={replicate_seed}) ...")
 
       arms = {}
-      for arm_name, strength in (("tree", tree_strength), ("control", 0.0)):
+      arm_specs = [
+          (tree_name, trees[tree_name], tree_strength)
+          for tree_name in ("direct", "transitive_hard", "transitive_soft")
+      ]
+      arm_specs.append(("control", direct_tree, 0.0))
+      for arm_name, arm_tree, strength in arm_specs:
         mr_state_np = sample_mr_state_from_tree(
-            tree, n_states=n_states,
+            arm_tree, n_states=n_states,
             low=cfg["mr_rate_low"], high=cfg["mr_rate_high"],
             seed=replicate_seed, tree_strength=strength, root_variance=root_variance,
         )
@@ -3990,10 +4198,6 @@ def run_mr_tree_experiment(
           }
 
         # Per-arm instrumentation.
-        mr_state_corr = (
-            np.corrcoef(mr_state_np, rowvar=True)  # (n_states, n_states) -- rows as obs
-            if mr_state_np.shape[0] >= 2 else np.full((1, 1), float("nan"))
-        )
         # MR-MR empirical correlation (columns as variables).
         mr_mr_corr = (
             np.corrcoef(mr_state_np, rowvar=False)  # (n_mrs, n_mrs)
@@ -4008,6 +4212,7 @@ def run_mr_tree_experiment(
         )
 
         arms[arm_name] = {
+            "tree_name":                    arm_name,
             "mr_state":                    mr_state_np,
             "cluster_labels":              cluster_labels,
             "stats":                       stats,
@@ -4020,26 +4225,39 @@ def run_mr_tree_experiment(
             "within_minus_across":         gene_mod_corr["within_minus_across"],
         }
 
-      replicates.append({"seed": replicate_seed, "tree": arms["tree"], "control": arms["control"]})
+      # Keep the historical `tree` arm as an alias for the direct tree.
+      replicates.append({
+          "seed": replicate_seed,
+          "direct": arms["direct"],
+          "transitive_hard": arms["transitive_hard"],
+          "transitive_soft": arms["transitive_soft"],
+          "control": arms["control"],
+          "tree": arms["direct"],
+      })
   finally:
     if grn_output_path is None and os.path.exists(grn_path):
       os.remove(grn_path)
 
-  summary = _summarize_mr_tree_experiment(replicates)
+  arm_names = ("direct", "transitive_hard", "transitive_soft", "control")
+  summary = _summarize_mr_tree_experiment(replicates, arm_names=arm_names)
 
   return {
       "config":            cfg,
       "tree_strength":     tree_strength,
       "root_variance":     root_variance,
+      "mr_tree_path_decay": tree_path_decay,
       "n_states":          n_states,
       "n_replicates":      n_replicates,
       "mr_ids":            mr_ids,
       "gene_id_to_symbol": gene_id_to_symbol,
-      "tree":              tree,
+      "tree":              direct_tree,
+      "trees":             trees,
+      "tree_profiles":     profiles,
       "mr_target_sets":    mr_target_sets,
       "grn_diagnostics":   grn_diagnostics,
-      "tree_correlation_matrix":        tree_correlation_matrix,
-      "jaccard_similarity_offdiag":     jaccard_sim_offdiag,
+      "tree_diagnostics":  tree_diagnostics,
+      "tree_correlation_matrix": tree_diagnostics["direct"]["tree_correlation_matrix"],
+      "jaccard_similarity_offdiag": tree_diagnostics["direct"]["profile_similarity_offdiag"],
       "target_set_sizes":               target_set_sizes,
       "target_stats":      target_stats,
       "replicates":        replicates,
@@ -4050,8 +4268,8 @@ def run_mr_tree_experiment(
 def main(argv=None) -> dict:
   parser = argparse.ArgumentParser(
       description=(
-          "Compare tree-correlated vs. i.i.d. master-regulator mr_state "
-          "sampling (build_mr_overlap_tree / sample_mr_state_from_tree) "
+          "Compare direct, transitive-hard, transitive-soft, and i.i.d. "
+          "master-regulator mr_state sampling "
           "via run_mr_tree_experiment."
       ),
       formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -4068,6 +4286,7 @@ def main(argv=None) -> dict:
   parser.add_argument("--seed-base", type=int, default=0)
   parser.add_argument("--mr-rate-low", type=float, default=None)
   parser.add_argument("--mr-rate-high", type=float, default=None)
+  parser.add_argument("--mr-tree-path-decay", type=float, default=None)
   parser.add_argument("--stats-n-pca-components", type=int, default=None)
   parser.add_argument("--grn-output-path", default=None)
   parser.add_argument(
@@ -4086,6 +4305,7 @@ def main(argv=None) -> dict:
       seed_base=args.seed_base,
       mr_rate_low=args.mr_rate_low,
       mr_rate_high=args.mr_rate_high,
+      mr_tree_path_decay=args.mr_tree_path_decay,
       stats_n_pca_components=args.stats_n_pca_components,
       grn_output_path=args.grn_output_path,
   )
@@ -4094,15 +4314,17 @@ def main(argv=None) -> dict:
     pickle.dump(result, f)
   print(f"\nSaved full result to {args.output!r}")
 
-  print(f"\nPaired tree-vs-control summary (tree_strength={args.tree_strength}, "
+  print(f"\nPaired multi-tree summary (tree_strength={args.tree_strength}, "
         f"n_replicates={args.n_replicates}):")
   for name, s in result["summary"].items():
-    print(f"  {name}: tree={s['tree_mean']:.4f}  control={s['control_mean']:.4f}  "
-          f"diff={s['diff_mean']:.4f} +/- {s['diff_std']:.4f}  (n={s['n']})")
+    arm_means = ", ".join(
+        f"{arm}={values['mean']:.4f}"
+        for arm, values in s.get("arms", {}).items()
+    )
+    print(f"  {name}: {arm_means}")
 
   return result
 
 
 if __name__ == "__main__":
   main()
-

@@ -1888,41 +1888,51 @@ def run(config_path: str) -> optuna.Study:
     finally:
         signal.signal(signal.SIGINT, prev_sigint)
         signal.signal(signal.SIGTERM, prev_sigterm)
-    elapsed = time.monotonic() - start
-    print(
-        f"=== done in {elapsed / 60:.1f}m -- "
-        f"best_value={study.best_value:.6f} best_params={study.best_params} ==="
-    )
 
-    summary = {
-        "best_value":            study.best_value,
-        "best_params":           study.best_params,
-        "best_resolved_params":  study.best_trial.user_attrs.get("resolved_params"),
-        "n_mrs":                 study.best_trial.user_attrs.get("n_mrs"),
-        "_meta": {
-            "reference_h5ad_path": config.get("reference_h5ad_path"),
-            "target_stats_path":   config["target_stats_path"],
-            "reference_grn_path":  config["reference_grn_path"],
-            "n_clusters":          config["n_clusters"],
-            "n_genes":             config["n_genes"],
-            "n_cells":             config["n_cells"],
-            "mr_state_method":     config.get("mr_state_method", "random"),
-            "n_candidate_states":  config.get("n_candidate_states"),
-            "n_selected_states":   config.get("n_selected_states"),
-            "candidate_design":    config.get("candidate_design"),
-            "selection_n_restarts": config.get("selection_n_restarts"),
-            "selection_swap_passes": config.get("selection_swap_passes"),
-            "selection_variance_weight": config.get("selection_variance_weight"),
-            "sampling_state":      config["sampling_state"],
-            "shared_coop_state":   config["shared_coop_state"],
-            "grn_seed":            config["grn_seed"],
-            "sim_seed":            config["sim_seed"],
-        },
-    }
-    out_path = Path(config["output"])
-    with open(out_path, "w") as f:
-        json.dump(summary, f, indent=2)
-    print(f"\nWrote tuned synthetic-data config summary to {out_path}")
+
+    elapsed = time.monotonic() - start
+    completed_trials = study.get_trials(states=[optuna.trial.TrialState.COMPLETE])
+    if len(completed_trials) > 0:
+        # Study completed after at least one successful (non-pruned) trial
+        print(
+            f"=== done in {elapsed / 60:.1f}m -- "
+            f"best_value={study.best_value:.6f} best_params={study.best_params} ==="
+        )
+
+        summary = {
+            "best_value":            study.best_value,
+            "best_params":           study.best_params,
+            "best_resolved_params":  study.best_trial.user_attrs.get("resolved_params"),
+            "n_mrs":                 study.best_trial.user_attrs.get("n_mrs"),
+            "_meta": {
+                "reference_h5ad_path": config.get("reference_h5ad_path"),
+                "target_stats_path":   config["target_stats_path"],
+                "reference_grn_path":  config["reference_grn_path"],
+                "n_clusters":          config["n_clusters"],
+                "n_genes":             config["n_genes"],
+                "n_cells":             config["n_cells"],
+                "mr_state_method":     config.get("mr_state_method", "random"),
+                "n_candidate_states":  config.get("n_candidate_states"),
+                "n_selected_states":   config.get("n_selected_states"),
+                "candidate_design":    config.get("candidate_design"),
+                "selection_n_restarts": config.get("selection_n_restarts"),
+                "selection_swap_passes": config.get("selection_swap_passes"),
+                "selection_variance_weight": config.get("selection_variance_weight"),
+                "sampling_state":      config["sampling_state"],
+                "shared_coop_state":   config["shared_coop_state"],
+                "grn_seed":            config["grn_seed"],
+                "sim_seed":            config["sim_seed"],
+            },
+        }
+        out_path = Path(config["output"])
+        with open(out_path, "w") as f:
+            json.dump(summary, f, indent=2)
+        print(f"\nWrote tuned synthetic-data config summary to {out_path}")
+
+    else:
+        # Study completed without at least one successful (non-pruned) trial
+        print(f"=== done without any successful trials in {elapsed / 60:.1f}m -- ")
+
 
     return study
 

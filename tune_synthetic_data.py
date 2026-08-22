@@ -24,7 +24,8 @@ Optuna study where each trial:
   2. regenerates the SERGIO GRN-structure file from config["reference_grn_path"]
      (e.g. TRRUST) via generate_sergio_grn_from_reference, with the trial's
      suggested K/Hill-coefficient distribution and unknown_mode_repressor_prob;
-  3. samples an mr_state (master-regulator basal production rate) matrix;
+  3. samples an mr_state (master-regulator basal production rate) matrix,
+     either iid or by spectral selection from a larger candidate pool;
   4. runs make_synthetic_data6(..., missing_rate=0.0) to produce a candidate
      synthetic matrix;
   5. computes compute_summary_stats() on the candidate and scores it against
@@ -49,12 +50,13 @@ from top-level config keys -- they are not part of search_space. So are:
     generate_sergio_grn_from_reference always writes per-edge Hill/coop
     coefficients into the GRN file, which make_synthetic_data6 only reads
     when shared_coop_state <= 0 (see that function's docstring).
-  - mr_rate_low/mr_rate_high: the Uniform(low, high) range mr_state is
-    drawn from (see _sample_mr_state) is fixed, not tuned -- aggregate
-    compute_summary_stats() targets don't depend on cluster *identity*
-    (cluster_labels is explicitly ignored by that function), so there's
-    little to gain from spending search budget on mr_state's own range
-    versus the technical-noise/GRN-edge parameters below.
+  - mr_rate_low/mr_rate_high: the Uniform(low, high) range used to construct
+    the MR-state candidate pool is fixed, not tuned.
+  - mr_state_method and the n_candidate_states/n_selected_states/
+    candidate_design/selection_* settings: fixed study configuration, not
+    entries in search_space. ``random`` preserves the historical iid sampler;
+    ``spectral`` selects the configured number of rows using the DAG/Hill
+    surrogate. Spectral selection requires n_selected_states == n_clusters.
   - grn_seed: fixes which reference-subgraph topology/DAG-order is sampled
     from reference_grn_path, so every trial shares the exact same GRN
     *structure* -- only the K-magnitude/Hill-coefficient/repressor-sign
@@ -327,9 +329,9 @@ See synthetic_tuning_config.example.json for a full example. Notable keys
                                 select_gene_symbols = list(gene_id_to_symbol.values())
 
                                 # n_pca_components here MUST match this config's own
-                                # "stats_n_pca_components" (20 by default as of the
-                                # coherency/canalization studies -- see that key's own
-                                # entry below) -- pca_tail_participation_ratio's value
+                                 # "stats_n_pca_components" (15 in the current
+                                 # spectral-selection tuning round -- see that key's
+                                 # own entry below) -- pca_tail_participation_ratio's value
                                 # depends on how many tail PCs it was computed over, so
                                 # a target computed at a different depth than candidates
                                 # silently compares two different quantities (this bit
@@ -357,12 +359,12 @@ See synthetic_tuning_config.example.json for a full example. Notable keys
                                 # for that particular pickle, but the recipe itself is
                                 # fixed here for future regenerations.
                                 stats_list = [
-                                    compute_summary_stats(
-                                        load_reference_h5ad(
-                                            path, select_gene_symbols=select_gene_symbols,
-                                            n_cells_subsample=600, seed=i,
-                                        )[0],
-                                        n_pca_components=20,
+                                     compute_summary_stats(
+                                         load_reference_h5ad(
+                                             path, select_gene_symbols=select_gene_symbols,
+                                             n_cells_subsample=600, seed=i,
+                                         )[0],
+                                         n_pca_components=15,
                                     )
                                     for i in range(20)
                                 ]
@@ -418,6 +420,14 @@ See synthetic_tuning_config.example.json for a full example. Notable keys
     add_dropout/convert_to_umi_counts : fixed make_synthetic_data6 shape/
                             toggle parameters, forwarded unchanged to every
                             trial.
+    mr_state_method            : "random" or "spectral"; fixed per study.
+    n_candidate_states         : spectral candidate-pool size.
+    n_selected_states          : spectral output row count; must equal
+                                 n_clusters for spectral mode.
+    candidate_design           : "random" or "sobol" candidate pool design.
+    selection_n_restarts/
+    selection_swap_passes/
+    selection_variance_weight  : fixed spectral selector settings.
     mr_rate_low/mr_rate_high : fixed mr_state sampling range (see
                             "Fixed vs tunable parameters" above).
     grn_seed/sim_seed      : fixed seeds (see "Fixed vs tunable parameters").
@@ -634,7 +644,9 @@ from synthetic_data import (
     compute_summary_stats,
     generate_sergio_grn_from_reference,
     load_reference_h5ad,
+    load_sergio_dag,
     make_synthetic_data6,
+    sample_mr_state_from_spectral_subset,
 )
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -707,6 +719,15 @@ _CONFIG_DEFAULTS = {
     # mr_state range -- fixed, not tuned (see module docstring)
     "mr_rate_low":  1.0,
     "mr_rate_high": 5.0,
+    # MR-state selection -- fixed per study, not part of search_space. The
+    # historical default remains iid; spectral studies opt in explicitly.
+    "mr_state_method":       "random",
+    "n_candidate_states":    200,
+    "n_selected_states":     15,
+    "candidate_design":      "random",
+    "selection_n_restarts":  1,
+    "selection_swap_passes": 0,
+    "selection_variance_weight": 0.05,
 
     # fixed seeds -- see module docstring's "Fixed vs tunable parameters"
     "grn_seed": 42,
@@ -742,7 +763,7 @@ _CONFIG_DEFAULTS = {
     "reference_seed":              0,
 
     # compute_summary_stats config -- applied identically to target & every candidate
-    "stats_n_pca_components": 10,
+    "stats_n_pca_components": 15,
     "stats_n_structure_genes": 500,
     "stats_percentiles":      [5, 25, 50, 75, 95],
     "stats_seed":             0,
@@ -825,6 +846,40 @@ def load_config(path: str) -> dict:
 
     if config["reference_n_top_genes"] is None:
         config["reference_n_top_genes"] = config["n_genes"]
+
+    if config["mr_state_method"] not in ("random", "spectral"):
+        raise ValueError(
+            f"Unsupported mr_state_method {config['mr_state_method']!r}; "
+            "expected 'random' or 'spectral'"
+        )
+    if (not isinstance(config["n_candidate_states"], int)
+            or config["n_candidate_states"] < 2):
+        raise ValueError("n_candidate_states must be an integer >= 2")
+    if (not isinstance(config["n_selected_states"], int)
+            or not 2 <= config["n_selected_states"] <= config["n_candidate_states"]):
+        raise ValueError(
+            "n_selected_states must be an integer in [2, n_candidate_states]"
+        )
+    if config["candidate_design"] not in ("random", "sobol"):
+        raise ValueError(
+            f"Unsupported candidate_design {config['candidate_design']!r}; "
+            "expected 'random' or 'sobol'"
+        )
+    if (not isinstance(config["selection_n_restarts"], int)
+            or config["selection_n_restarts"] < 1):
+        raise ValueError("selection_n_restarts must be an integer >= 1")
+    if (not isinstance(config["selection_swap_passes"], int)
+            or config["selection_swap_passes"] < 0):
+        raise ValueError("selection_swap_passes must be an integer >= 0")
+    if config["selection_variance_weight"] < 0:
+        raise ValueError("selection_variance_weight must be >= 0")
+    if (config["mr_state_method"] == "spectral"
+            and config["n_selected_states"] != config["n_clusters"]):
+        raise ValueError(
+            "spectral MR-state selection must produce exactly n_clusters rows: "
+            f"n_selected_states={config['n_selected_states']} vs. "
+            f"n_clusters={config['n_clusters']}"
+        )
 
     if config["sampler"] not in _SAMPLERS:
         raise ValueError(f"Unsupported sampler {config['sampler']!r}. Supported: {list(_SAMPLERS)}")
@@ -1116,7 +1171,12 @@ def _prune(trial: optuna.Trial, reason: str, message: str = "") -> None:
     raise optuna.TrialPruned(message or reason)
 
 
-def run_trial(trial: optuna.Trial, config: dict, target_stats: dict) -> float:
+def run_trial(
+    trial: optuna.Trial,
+    config: dict,
+    target_stats: dict,
+    mr_state_cache: dict | None = None,
+) -> float:
     """Build one synthetic candidate from suggested/fixed simulation
     parameters, score it against target_stats via compute_stats_distance,
     and return that scalar distance (to minimize). See module docstring
@@ -1177,12 +1237,54 @@ def run_trial(trial: optuna.Trial, config: dict, target_stats: dict) -> float:
         with open(archive_dir / f"trial{trial.number}.diagnostics.json", "w") as f:
             json.dump(grn_diagnostics, f)
 
+    mr_state_diagnostics = {}
     try:
-        mr_state_np = _sample_mr_state(
-            config["n_clusters"], len(mr_ids),
-            config["mr_rate_low"], config["mr_rate_high"],
-            seed=config["sim_seed"],
-        )
+        if config.get("mr_state_method", "random") == "spectral":
+            dag = load_sergio_dag(
+                grn_path,
+                shared_coop_state=config["shared_coop_state"],
+                mr_gene_ids=mr_ids,
+            )
+            mr_state_np = sample_mr_state_from_spectral_subset(
+                dag=dag,
+                n_selected_states=config["n_selected_states"],
+                low=config["mr_rate_low"],
+                high=config["mr_rate_high"],
+                n_candidate_states=config["n_candidate_states"],
+                candidate_design=config["candidate_design"],
+                decays=sim_kwargs["decays"],
+                n_restarts=config["selection_n_restarts"],
+                swap_passes=config["selection_swap_passes"],
+                seed=config["sim_seed"],
+                variance_weight=config["selection_variance_weight"],
+                cache=mr_state_cache,
+                diagnostics=mr_state_diagnostics,
+            )
+        else:
+            mr_state_np = _sample_mr_state(
+                config["n_clusters"], len(mr_ids),
+                config["mr_rate_low"], config["mr_rate_high"],
+                seed=config["sim_seed"],
+            )
+            mr_state_diagnostics = {"method": "random"}
+        trial.set_user_attr("mr_state_method", mr_state_diagnostics["method"])
+        if mr_state_diagnostics["method"] == "spectral":
+            trial.set_user_attr(
+                "mr_state_selection_cache_hit",
+                mr_state_diagnostics["selection_cache_hit"],
+            )
+            trial.set_user_attr(
+                "mr_state_candidate_pool_cache_hit",
+                mr_state_diagnostics["candidate_pool_cache_hit"],
+            )
+            trial.set_user_attr(
+                "mr_state_spectral_score",
+                mr_state_diagnostics["selected_metrics"]["score"],
+            )
+            trial.set_user_attr(
+                "mr_state_spectral_participation_ratio",
+                mr_state_diagnostics["selected_metrics"]["participation_ratio"],
+            )
         mr_state = torch.tensor(mr_state_np, dtype=torch.float32, device=device)
 
         X_sim, cluster_labels = make_synthetic_data6(
@@ -1312,6 +1414,7 @@ def run_trial(trial: optuna.Trial, config: dict, target_stats: dict) -> float:
     _save_if_best_artifact(
         config, trial, distance, X_sim, cluster_labels, mr_state_np,
         mr_ids, gene_id_to_symbol, resolved, candidate_stats,
+        mr_state_metadata=mr_state_diagnostics,
     )
 
     return distance
@@ -1320,7 +1423,8 @@ def run_trial(trial: optuna.Trial, config: dict, target_stats: dict) -> float:
 def _save_if_best_artifact(config: dict, trial: optuna.Trial, distance: float,
                             X_sim: torch.Tensor, cluster_labels: np.ndarray,
                             mr_state_np: np.ndarray, mr_ids: list, gene_id_to_symbol: dict,
-                            resolved: dict, candidate_stats: dict) -> None:
+                            resolved: dict, candidate_stats: dict,
+                            mr_state_metadata: dict | None = None) -> None:
     """If *distance* improves on the best distance among this trial's own
     study's completed trials so far, overwrite {artifact_dir}/best.pt with
     this trial's full synthetic dataset/metadata.
@@ -1370,6 +1474,13 @@ def _save_if_best_artifact(config: dict, trial: optuna.Trial, distance: float,
         "candidate_stats":   candidate_stats,
         "params":            trial.params,
         "trial_number":      trial.number,
+        "mr_state_method":   (mr_state_metadata or {}).get(
+            "method", config.get("mr_state_method", "random")),
+        "mr_state_selection": mr_state_metadata or {
+            "method": config.get("mr_state_method", "random"),
+        },
+        "mr_state_grn_seed":  config.get("grn_seed"),
+        "mr_state_sim_seed":  config.get("sim_seed"),
     }, path)
     tqdm.write(f"  [artifact] new best distance={distance:.6f} -> {path}")
 
@@ -1761,11 +1872,14 @@ def run(config_path: str) -> optuna.Study:
     )
     print(f"\n=== Tuning synthetic_data6 against {target_desc!r} ({budget_desc}) ===")
 
+    mr_state_cache = {}
     prev_sigint, prev_sigterm = _install_graceful_stop_handler(study)
     start = time.monotonic()
     try:
         study.optimize(
-            lambda trial: run_trial(trial, config, target_stats),
+            lambda trial: run_trial(
+                trial, config, target_stats, mr_state_cache=mr_state_cache
+            ),
             n_trials=config["n_trials"],
             timeout=config["timeout"],
             show_progress_bar=True,
@@ -1792,6 +1906,13 @@ def run(config_path: str) -> optuna.Study:
             "n_clusters":          config["n_clusters"],
             "n_genes":             config["n_genes"],
             "n_cells":             config["n_cells"],
+            "mr_state_method":     config.get("mr_state_method", "random"),
+            "n_candidate_states":  config.get("n_candidate_states"),
+            "n_selected_states":   config.get("n_selected_states"),
+            "candidate_design":    config.get("candidate_design"),
+            "selection_n_restarts": config.get("selection_n_restarts"),
+            "selection_swap_passes": config.get("selection_swap_passes"),
+            "selection_variance_weight": config.get("selection_variance_weight"),
             "sampling_state":      config["sampling_state"],
             "shared_coop_state":   config["shared_coop_state"],
             "grn_seed":            config["grn_seed"],
@@ -1806,6 +1927,73 @@ def run(config_path: str) -> optuna.Study:
     return study
 
 
+def _load_matching_mr_state_artifact(
+    config: dict,
+    resolved: dict,
+    method: str,
+    n_mrs: int,
+) -> np.ndarray | None:
+    """Load a best artifact's MR state when it matches this replay request."""
+    path = Path(config["artifact_dir"]) / "best.pt"
+    if not path.exists():
+        return None
+    try:
+        try:
+            artifact = torch.load(path, map_location="cpu", weights_only=False)
+        except TypeError:
+            artifact = torch.load(path, map_location="cpu")
+    except Exception:
+        return None
+
+    if artifact.get("mr_state_method") != method:
+        return None
+    if artifact.get("mr_state_grn_seed") != config.get("grn_seed"):
+        return None
+    if artifact.get("mr_state_sim_seed") != config.get("sim_seed"):
+        return None
+    stored_resolved = artifact.get("resolved_params")
+    if not isinstance(stored_resolved, dict):
+        return None
+    for key, value in resolved.items():
+        stored_value = stored_resolved.get(key)
+        if isinstance(value, (int, float)) and isinstance(stored_value, (int, float)):
+            if not math.isclose(float(value), float(stored_value), rel_tol=0.0, abs_tol=1e-12):
+                return None
+        elif value != stored_value:
+            return None
+
+    if method == "spectral":
+        stored_selection = artifact.get("mr_state_selection")
+        expected_selection = {
+            "method": "spectral",
+            "n_candidate_states": config["n_candidate_states"],
+            "n_selected_states": config["n_selected_states"],
+            "candidate_design": config["candidate_design"],
+            "seed": config["sim_seed"],
+            "n_restarts": config["selection_n_restarts"],
+            "swap_passes": config["selection_swap_passes"],
+            "variance_weight": config["selection_variance_weight"],
+        }
+        if not isinstance(stored_selection, dict):
+            return None
+        for key, value in expected_selection.items():
+            stored_value = stored_selection.get(key)
+            if isinstance(value, (int, float)) and isinstance(stored_value, (int, float)):
+                if not math.isclose(float(value), float(stored_value), rel_tol=0.0, abs_tol=1e-12):
+                    return None
+            elif value != stored_value:
+                return None
+
+    state = artifact.get("mr_state")
+    if state is None:
+        return None
+    state = np.asarray(state, dtype=np.float32)
+    expected_rows = config["n_selected_states"] if method == "spectral" else config["n_clusters"]
+    if state.shape != (expected_rows, n_mrs):
+        return None
+    return state.copy()
+
+
 def regenerate_best(study_or_params, config: dict, final_missing_rate: float | None = None,
                      seed: int | None = None, output_path: str | None = None,
                      diagnostics: dict | None = None):
@@ -1815,7 +2003,9 @@ def regenerate_best(study_or_params, config: dict, final_missing_rate: float | N
     the best synthetic dataset". Unlike tuning during the study itself,
     missing_rate defaults to config["final_missing_rate"] (not 0.0), since
     the point here is to materialize an actual usable dataset rather than
-    a fair-comparison candidate.
+    a fair-comparison candidate. If a matching spectral best.pt exists, its
+    exact selected mr_state is reused; otherwise the configured sampler is
+    run again.
 
     diagnostics: optional dict, forwarded to generate_sergio_grn_from_
                  reference's own `diagnostics` parameter (populated in-
@@ -1861,13 +2051,41 @@ def regenerate_best(study_or_params, config: dict, final_missing_rate: float | N
         **grn_coherency_kwargs,
     )
 
-    # Test replacing the i.i.d mr_state vectors with orthogonal vectors, shifted to the MR activator range (~1-5)
-    offset = 0.3
-    scale  = 6.5
-    random_matrix = torch.randn(len(mr_ids), config["n_clusters"])
-    Q, R = torch.linalg.qr(random_matrix)
-    mr_state = ((Q.T + offset) * scale).clip(min=0.0)
-    mr_state_np = mr_state.cpu().detach().numpy()
+    mr_state_method = config.get("mr_state_method", "random")
+    mr_state_cache = {}
+    mr_state_np = _load_matching_mr_state_artifact(
+        config, resolved, mr_state_method, len(mr_ids)
+    )
+    mr_state_diagnostics = {"method": mr_state_method, "artifact_cache_hit": mr_state_np is not None}
+    if mr_state_np is None:
+        if mr_state_method == "spectral":
+            dag = load_sergio_dag(
+                grn_path,
+                shared_coop_state=config["shared_coop_state"],
+                mr_gene_ids=mr_ids,
+            )
+            mr_state_np = sample_mr_state_from_spectral_subset(
+                dag=dag,
+                n_selected_states=config["n_selected_states"],
+                low=config["mr_rate_low"],
+                high=config["mr_rate_high"],
+                n_candidate_states=config["n_candidate_states"],
+                candidate_design=config["candidate_design"],
+                decays=sim_kwargs["decays"],
+                n_restarts=config["selection_n_restarts"],
+                swap_passes=config["selection_swap_passes"],
+                seed=config["sim_seed"],
+                variance_weight=config["selection_variance_weight"],
+                cache=mr_state_cache,
+                diagnostics=mr_state_diagnostics,
+            )
+        else:
+            mr_state_np = _sample_mr_state(
+                config["n_clusters"], len(mr_ids),
+                config["mr_rate_low"], config["mr_rate_high"],
+                seed=config["sim_seed"],
+            )
+    mr_state = torch.tensor(mr_state_np, dtype=torch.float32, device=device)
 
     missing_rate = config["final_missing_rate"] if final_missing_rate is None else final_missing_rate
     sim_seed = config["sim_seed"] if seed is None else seed

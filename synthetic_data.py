@@ -6,6 +6,7 @@ import os
 import pickle
 import re
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -708,6 +709,511 @@ def _parse_sergio_targets_file(path: str) -> tuple[int, list[int]]:
       f"as required by SERGIO's build_graph."
   )
   return n_genes, mr_ids
+
+
+@dataclass(frozen=True)
+class SergioDAG:
+  """Parsed, upstream-to-downstream view of a SERGIO targets file."""
+
+  n_genes: int
+  mr_ids: tuple[int, ...]
+  parents: tuple[tuple[tuple[int, float, float], ...], ...]
+  target_order: tuple[int, ...]
+
+
+def load_sergio_dag(
+    input_file_targets: str,
+    shared_coop_state: float = 0.0,
+    mr_gene_ids: list[int] | None = None,
+) -> SergioDAG:
+  """Parse a SERGIO targets CSV for deterministic forward evaluation.
+
+  Each parent tuple is ``(regulator_id, signed_K, hill_coefficient)``.  The
+  returned target order is a topological order from master regulators toward
+  terminal genes.  This intentionally parses the already-DAG-ified SERGIO
+  file rather than the original reference network.
+  """
+  n_genes, inferred_mr_ids = _parse_sergio_targets_file(input_file_targets)
+  inferred_mr_ids = tuple(inferred_mr_ids)
+  if mr_gene_ids is None:
+    mr_ids = inferred_mr_ids
+  else:
+    mr_ids = tuple(mr_gene_ids)
+    assert set(mr_ids) == set(inferred_mr_ids), (
+        f"mr_gene_ids {sorted(mr_ids)} does not match the GRN's inferred "
+        f"master regulators {sorted(inferred_mr_ids)}"
+    )
+
+  parents = [[] for _ in range(n_genes)]
+  children = [[] for _ in range(n_genes)]
+  indegree = np.zeros(n_genes, dtype=np.int64)
+  seen_targets = set()
+
+  with open(input_file_targets, 'r') as f:
+    reader = csv.reader(f, delimiter=',')
+    for raw_row in reader:
+      row = [c.strip() for c in raw_row if c.strip() != '']
+      if not row:
+        continue
+      target = int(float(row[0]))
+      n_regs = int(float(row[1]))
+      assert 0 <= target < n_genes
+      assert target not in seen_targets, (
+          f"target gene {target} appears more than once in {input_file_targets}"
+      )
+      seen_targets.add(target)
+
+      reg_ids = [int(float(v)) for v in row[2 : 2 + n_regs]]
+      k_values = [float(v) for v in row[2 + n_regs : 2 + 2 * n_regs]]
+      if shared_coop_state > 0:
+        coop_values = [float(shared_coop_state)] * n_regs
+      else:
+        coop_values = [
+            float(v) for v in row[2 + 2 * n_regs : 2 + 3 * n_regs]
+        ]
+      assert len(reg_ids) == len(k_values) == len(coop_values) == n_regs, (
+          f"malformed SERGIO row for target {target}: expected {n_regs} "
+          "regulator, K, and cooperativity values"
+      )
+
+      for reg_id, k_value, coop_value in zip(reg_ids, k_values, coop_values):
+        assert 0 <= reg_id < n_genes
+        assert reg_id != target, "self-regulation is not supported by this DAG surrogate"
+        assert coop_value >= 0.0, "SERGIO Hill coefficients must be non-negative"
+        parents[target].append((reg_id, k_value, coop_value))
+        children[reg_id].append(target)
+        indegree[target] += 1
+
+  # Kahn's algorithm makes this robust to files whose integer ids are not
+  # already in topological order.  Sorting only breaks ties deterministically.
+  available = sorted(np.flatnonzero(indegree == 0).tolist())
+  order = []
+  while available:
+    node = available.pop(0)
+    order.append(node)
+    for child in sorted(children[node]):
+      indegree[child] -= 1
+      if indegree[child] == 0:
+        available.append(child)
+        available.sort()
+
+  assert len(order) == n_genes, (
+      f"{input_file_targets} contains a cycle; the DAG surrogate cannot "
+      "evaluate it without an iterative solver"
+  )
+  mr_set = set(mr_ids)
+  actual_mr_set = set(range(n_genes)) - seen_targets
+  assert mr_set == actual_mr_set, (
+      f"the supplied/inferred MR ids do not match the targets file: "
+      f"expected {sorted(actual_mr_set)}, got {sorted(mr_set)}"
+  )
+  target_order = tuple(node for node in order if node not in mr_set)
+
+  return SergioDAG(
+      n_genes=n_genes,
+      mr_ids=mr_ids,
+      parents=tuple(tuple(row) for row in parents),
+      target_order=target_order,
+  )
+
+
+def _sergio_hill_response(
+    regulator_concentration: np.ndarray,
+    half_response: float,
+    coop_state: float,
+    repressive: bool,
+) -> np.ndarray:
+  """Vectorized equivalent of SERGIO's scalar ``hill_`` implementation."""
+  u = np.asarray(regulator_concentration, dtype=np.float64)
+  assert np.all(u >= 0.0), "SERGIO concentrations must be non-negative"
+  result = np.empty_like(u)
+  zero = (u == 0.0)
+  result[zero] = 1.0 if repressive else 0.0
+
+  nonzero = ~zero
+  if np.any(nonzero):
+    u_nonzero = u[nonzero]
+    u_power = np.power(u_nonzero, coop_state)
+    h_power = np.power(float(half_response), coop_state)
+    response = u_power / (h_power + u_power)
+    result[nonzero] = 1.0 - response if repressive else response
+  return result
+
+
+def sergio_dag_hill_forward(
+    mr_state: np.ndarray | torch.Tensor,
+    dag: SergioDAG,
+    decays: float | list | np.ndarray = 0.8,
+    half_responses: dict[tuple[int, int], float] | None = None,
+    return_half_responses: bool = False,
+) -> np.ndarray | tuple[np.ndarray, dict[tuple[int, int], float]]:
+  """Evaluate SERGIO's deterministic, zero-noise steady-state mapping.
+
+  Args:
+    mr_state: ``(n_bins, n_mrs)`` basal MR production rates, ordered as
+              ``dag.mr_ids``.
+    dag:      parsed SERGIO DAG from :func:`load_sergio_dag`.
+    decays:   scalar or one decay value per gene.
+    half_responses: optional fixed ``(target_id, regulator_id)`` -> half-
+                    response mapping. If omitted, SERGIO's batch-dependent
+                    mean-upstream-expression rule is recomputed for each
+                    target and batch.
+    return_half_responses: return the half-response values used, useful for
+                           comparing the batch-aware and frozen variants.
+
+  Returns:
+    ``(n_bins, n_genes)`` raw continuous concentrations, before SERGIO's
+    technical-noise pipeline and before the wrapper's log1p transform.
+  """
+  if isinstance(mr_state, torch.Tensor):
+    state = mr_state.detach().cpu().numpy()
+  else:
+    state = np.asarray(mr_state)
+  assert state.ndim == 2
+  assert state.shape[1] == len(dag.mr_ids), (
+      f"mr_state has {state.shape[1]} columns but the DAG has "
+      f"{len(dag.mr_ids)} master regulators"
+  )
+  assert np.all(np.isfinite(state)) and np.all(state >= 0.0)
+
+  if np.isscalar(decays):
+    decay = np.full(dag.n_genes, float(decays), dtype=np.float64)
+  else:
+    decay = np.asarray(decays, dtype=np.float64)
+    assert decay.shape == (dag.n_genes,)
+  assert np.all(np.isfinite(decay)) and np.all(decay > 0.0)
+
+  expression = np.zeros((state.shape[0], dag.n_genes), dtype=np.float64)
+  expression[:, list(dag.mr_ids)] = state / decay[list(dag.mr_ids)]
+  used_half_responses = {}
+
+  for target in dag.target_order:
+    production = np.zeros(state.shape[0], dtype=np.float64)
+    for regulator, k_value, coop_state in dag.parents[target]:
+      key = (target, regulator)
+      if half_responses is not None and key in half_responses:
+        half_response = float(half_responses[key])
+      else:
+        # This is SERGIO's calculate_half_response_ rule: the threshold is
+        # the mean expression of the upstream regulator across current bins.
+        half_response = float(expression[:, regulator].mean())
+      used_half_responses[key] = half_response
+      response = _sergio_hill_response(
+          expression[:, regulator], half_response, coop_state, k_value < 0.0)
+      production += abs(k_value) * response
+    expression[:, target] = production / decay[target]
+
+  if return_half_responses:
+    return expression, used_half_responses
+  return expression
+
+
+def sample_sergio_mr_states(
+    n_states: int,
+    n_mrs: int,
+    low: float,
+    high: float,
+    design: str = "random",
+    seed: int = 0,
+) -> np.ndarray:
+  """Sample bounded MR-state rows with either iid or scrambled-Sobol design."""
+  assert n_states >= 1 and n_mrs >= 1
+  assert high >= low
+  if design == "random":
+    unit = np.random.default_rng(seed).random((n_states, n_mrs))
+  elif design == "sobol":
+    engine = torch.quasirandom.SobolEngine(
+        dimension=n_mrs, scramble=True, seed=seed)
+    unit = engine.draw(n_states).cpu().numpy()
+  else:
+    raise ValueError(f"unknown MR-state design {design!r}")
+  return (low + (high - low) * unit).astype(np.float32)
+
+
+def sergio_spectral_metrics(
+    expression: np.ndarray,
+    reference_trace: float | None = None,
+    variance_weight: float = 0.05,
+) -> tuple[float, dict]:
+  """Score how flat and non-degenerate a row-wise PCA spectrum is.
+
+  The normalized entropy is one for a perfectly flat nonzero spectrum and
+  zero for a rank-one spectrum. A small trace term prevents a trivially tiny
+  cloud from winning solely because its normalized spectrum is flat.
+  """
+  x = np.asarray(expression, dtype=np.float64)
+  if x.ndim != 2 or x.shape[0] < 2:
+    return float("-inf"), {"score": float("-inf")}
+
+  centered = x - x.mean(axis=0, keepdims=True)
+  singular_values = np.linalg.svd(centered, compute_uv=False)
+  n_components = min(x.shape[0] - 1, x.shape[1])
+  eigenvalues = np.square(singular_values[:n_components])
+  total = float(eigenvalues.sum())
+  if not np.isfinite(total) or total <= 0.0:
+    return float("-inf"), {"score": float("-inf"), "trace": total}
+
+  proportions = eigenvalues / total
+  positive = proportions > 0.0
+  entropy = float(
+      -np.sum(proportions[positive] * np.log(proportions[positive]))
+      / np.log(len(proportions))
+  ) if len(proportions) > 1 else 0.0
+  participation_ratio = float(1.0 / np.sum(np.square(proportions)))
+  trace = total / max(x.shape[0] - 1, 1)
+  variance_ratio = (
+      1.0 if reference_trace is None
+      else trace / max(float(reference_trace), 1e-12)
+  )
+  score = entropy + variance_weight * np.log(max(variance_ratio, 1e-12))
+  metrics = {
+      "score": float(score),
+      "spectral_entropy_normalized": entropy,
+      "participation_ratio": participation_ratio,
+      "participation_ratio_normalized": participation_ratio / len(proportions),
+      "trace": trace,
+      "variance_ratio_to_reference": variance_ratio,
+      "explained_variance_ratio": proportions.tolist(),
+  }
+  return float(score), metrics
+
+
+def select_sergio_spectral_subset(
+    mr_state: np.ndarray,
+    dag: SergioDAG,
+    decays: float | list | np.ndarray = 0.8,
+    subset_size: int = 10,
+    n_restarts: int = 8,
+    swap_passes: int = 10,
+    seed: int = 0,
+    variance_weight: float = 0.05,
+) -> tuple[list[int], dict, dict]:
+  """Select MR-state rows using batch-aware DAG/Hill spectral optimization.
+
+  The objective is evaluated on the selected batch itself, so SERGIO's
+  batch-dependent half-response thresholds are recomputed after every
+  candidate addition or swap. The returned diagnostics expose search cost and
+  per-restart improvement trajectories for comparing this method with random
+  selection.
+  """
+  states = np.asarray(mr_state)
+  n_states = states.shape[0]
+  assert states.ndim == 2 and 2 <= subset_size <= n_states
+  rng = np.random.default_rng(seed)
+
+  full_raw = sergio_dag_hill_forward(states, dag, decays=decays)
+  _, full_metrics = sergio_spectral_metrics(full_raw)
+  reference_trace = full_metrics["trace"]
+  scale = np.std(full_raw, axis=0)
+  scale[scale < 1e-12] = 1.0
+  scaled_response = full_raw / scale
+  cache = {}
+
+  def evaluate(indices: list[int]) -> tuple[float, dict]:
+    key = tuple(sorted(indices))
+    if key not in cache:
+      raw = sergio_dag_hill_forward(states[list(key)], dag, decays=decays)
+      cache[key] = sergio_spectral_metrics(
+          raw, reference_trace=reference_trace,
+          variance_weight=variance_weight)
+    return cache[key]
+
+  best_indices = None
+  best_score = float("-inf")
+  best_metrics = None
+  restart_diagnostics = []
+  total_swap_evaluations = 0
+
+  for restart in range(n_restarts):
+    first = int(rng.integers(n_states))
+    distances = np.linalg.norm(scaled_response - scaled_response[first], axis=1)
+    distances[first] = -np.inf
+    selected = [first, int(np.argmax(distances))]
+    greedy_scores = [evaluate(selected)[0]]
+
+    while len(selected) < subset_size:
+      selected_set = set(selected)
+      candidates = [i for i in range(n_states) if i not in selected_set]
+      candidate_scores = [
+          evaluate(selected + [candidate])[0] for candidate in candidates
+      ]
+      selected.append(candidates[int(np.argmax(candidate_scores))])
+      greedy_scores.append(max(candidate_scores))
+
+    swap_improvements = []
+    for _ in range(swap_passes):
+      selected_set = set(selected)
+      unselected = [i for i in range(n_states) if i not in selected_set]
+      current_score = evaluate(selected)[0]
+      improving_swap = None
+      improving_score = current_score
+
+      for out in selected:
+        for inc in unselected:
+          total_swap_evaluations += 1
+          trial = [inc if value == out else value for value in selected]
+          trial_score = evaluate(trial)[0]
+          if trial_score > improving_score + 1e-12:
+            improving_score = trial_score
+            improving_swap = (out, inc)
+
+      if improving_swap is None:
+        break
+      out, inc = improving_swap
+      selected[selected.index(out)] = inc
+      swap_improvements.append(float(improving_score - current_score))
+
+    score, metrics = evaluate(selected)
+    restart_diagnostics.append({
+        "restart": restart,
+        "initial_pair": [first, int(np.argmax(distances))],
+        "greedy_scores": greedy_scores,
+        "swap_improvements": swap_improvements,
+        "final_score": float(score),
+        "final_indices": sorted(selected),
+    })
+    if score > best_score:
+      best_score = score
+      best_indices = sorted(selected)
+      best_metrics = metrics
+
+  assert best_indices is not None and best_metrics is not None
+  diagnostics = {
+      "n_states": n_states,
+      "subset_size": subset_size,
+      "n_restarts": n_restarts,
+      "swap_passes": swap_passes,
+      "variance_weight": variance_weight,
+      "n_surrogate_evaluations": len(cache),
+      "n_swap_evaluations": total_swap_evaluations,
+      "candidate_metrics": full_metrics,
+      "restart_diagnostics": restart_diagnostics,
+  }
+  return best_indices, dict(best_metrics), diagnostics
+
+
+def sample_mr_state_from_spectral_subset(
+    dag: SergioDAG,
+    n_selected_states: int,
+    low: float,
+    high: float,
+    n_candidate_states: int = 200,
+    candidate_design: str = "random",
+    decays: float | list | np.ndarray = 0.8,
+    n_restarts: int = 1,
+    swap_passes: int = 0,
+    seed: int = 0,
+    variance_weight: float = 0.05,
+    cache: dict | None = None,
+    diagnostics: dict | None = None,
+) -> np.ndarray:
+  """Sample an MR-state matrix by selecting a spectral subset.
+
+  A candidate pool is sampled once per cache key, then
+  :func:`select_sergio_spectral_subset` chooses the requested number of rows
+  using the deterministic DAG/Hill surrogate. The cache is caller-owned so a
+  tuning run can reuse both candidate pools and exact selections without
+  introducing process-global state.
+
+  Args:
+    dag: parsed SERGIO DAG whose parameters define the spectral objective.
+    n_selected_states: number of rows in the returned ``mr_state`` matrix.
+    low, high: bounds for the candidate MR production rates.
+    n_candidate_states: size of the candidate pool before selection.
+    candidate_design: ``"random"`` or ``"sobol"`` candidate design.
+    decays: scalar or one decay value per gene for surrogate evaluation.
+    n_restarts, swap_passes, variance_weight: selector settings.
+    seed: candidate-pool seed; the selector uses ``seed + 1``.
+    cache: optional mutable cache shared by the caller across invocations.
+    diagnostics: optional dict populated in place with cache and selector
+                 summaries.
+
+  Returns:
+    ``(n_selected_states, n_mrs)`` float32 MR-state rates ordered according to
+    ``dag.mr_ids``.
+  """
+  assert n_candidate_states >= 2
+  assert 2 <= n_selected_states <= n_candidate_states
+  assert high > low
+  if candidate_design not in ("random", "sobol"):
+    raise ValueError(f"unknown candidate_design {candidate_design!r}")
+
+  if np.isscalar(decays):
+    decays_key = ("scalar", float(decays))
+  else:
+    decays_array = np.asarray(decays, dtype=np.float64)
+    decays_key = ("array", tuple(float(value) for value in decays_array.ravel()))
+
+  cache = {} if cache is None else cache
+  candidate_key = (
+      "candidate_pool", n_candidate_states, len(dag.mr_ids),
+      float(low), float(high), candidate_design, int(seed),
+  )
+  candidate_pool_cache_hit = candidate_key in cache
+  if candidate_pool_cache_hit:
+    candidate_states = cache[candidate_key]
+  else:
+    candidate_states = sample_sergio_mr_states(
+        n_states=n_candidate_states,
+        n_mrs=len(dag.mr_ids),
+        low=low,
+        high=high,
+        design=candidate_design,
+        seed=seed,
+    )
+    cache[candidate_key] = candidate_states.copy()
+
+  selection_key = (
+      "spectral_selection", candidate_key, dag, decays_key,
+      n_selected_states, n_restarts, swap_passes,
+      float(variance_weight), int(seed + 1),
+  )
+  selection_cache_hit = selection_key in cache
+  if selection_cache_hit:
+    selected_states, selected_metrics, selected_indices, selector_diagnostics = cache[selection_key]
+  else:
+    selected_indices, selected_metrics, selector_diagnostics = \
+        select_sergio_spectral_subset(
+            candidate_states,
+            dag,
+            decays=decays,
+            subset_size=n_selected_states,
+            n_restarts=n_restarts,
+            swap_passes=swap_passes,
+            seed=seed + 1,
+            variance_weight=variance_weight,
+        )
+    selected_states = candidate_states[selected_indices].astype(np.float32, copy=True)
+    cache[selection_key] = (
+        selected_states.copy(),
+        dict(selected_metrics),
+        list(selected_indices),
+        dict(selector_diagnostics),
+    )
+
+  if diagnostics is not None:
+    diagnostics.update({
+        "method": "spectral",
+        "candidate_pool_cache_hit": bool(candidate_pool_cache_hit),
+        "selection_cache_hit": bool(selection_cache_hit),
+        "n_candidate_states": int(n_candidate_states),
+        "n_selected_states": int(n_selected_states),
+        "candidate_design": candidate_design,
+        "seed": int(seed),
+        "n_restarts": int(n_restarts),
+        "swap_passes": int(swap_passes),
+        "variance_weight": float(variance_weight),
+        "selected_metrics": dict(selected_metrics),
+        "selected_indices": list(selected_indices),
+        "n_surrogate_evaluations": int(
+            selector_diagnostics.get("n_surrogate_evaluations", 0)
+        ),
+        "n_swap_evaluations": int(
+            selector_diagnostics.get("n_swap_evaluations", 0)
+        ),
+    })
+
+  return np.asarray(selected_states, dtype=np.float32).copy()
 
 
 def _write_sergio_regs_file(mr_state: torch.Tensor, mr_ids: list[int]) -> str:
@@ -1469,6 +1975,7 @@ def make_synthetic_data6(
     missing_rate:           float = 0.1,
     seed:                   int|None = 42,
     device:                 str|None = None,
+    diagnostics:            dict|None = None,
 ) -> tuple[torch.Tensor, np.ndarray]:
   """
   SERGIO-backed synthetic gene-expression data: sample cells from n_clusters
@@ -1583,6 +2090,17 @@ def make_synthetic_data6(
   counts = _sample_cluster_sizes(
       n_cells, n_clusters, cluster_conc, min_cells_per_cluster, rng)
   number_sc = int(counts.max())
+  requested_sampling_state = int(sampling_state)
+  assert requested_sampling_state >= 1, "sampling_state must be at least 1"
+  # Classic SERGIO stores one initial concentration before its CLE loop and
+  # removes a gene only when len(Conc) reaches sampling_state * number_sc.
+  # The combination sampling_state=1, number_sc=1 therefore can never finish:
+  # the first update changes len(Conc) from 1 to 2, overshooting the target.
+  # Use one actual update in this degenerate one-cell case while retaining the
+  # caller's requested value in diagnostics.
+  effective_sampling_state = requested_sampling_state
+  if effective_sampling_state * number_sc < 2:
+    effective_sampling_state = 2
 
   if seed is not None:
     # SERGIO's own methods (simulate/dropout_indicator/convert_to_UMIcounts/
@@ -1599,6 +2117,10 @@ def make_synthetic_data6(
   np.int, np.float = int, float
 
   regs_path = _write_sergio_regs_file(mr_state, mr_ids)
+  print(
+      f'Calling sergio: number_genes={n_genes} number_bins={n_clusters} '
+      f'number_sc={number_sc} sampling_state={effective_sampling_state}'
+  )
   try:
     sim = sergio(
         number_genes=n_genes,
@@ -1608,10 +2130,32 @@ def make_synthetic_data6(
         noise_type=noise_type,
         decays=decays,
         dynamics=False,
-        sampling_state=sampling_state,
+         sampling_state=effective_sampling_state,
         dt=dt,
     )
     sim.build_graph(input_file_targets, regs_path, shared_coop_state)
+    if diagnostics is not None:
+      level_sizes = [
+          len(sim.level2verts_[level])
+          for level in range(sim.maxLevels_ + 1)
+      ]
+      diagnostics.update({
+          "n_cells": int(n_cells),
+          "n_clusters": int(n_clusters),
+          "number_sc": int(number_sc),
+          "requested_sampling_state": requested_sampling_state,
+          "sampling_state": effective_sampling_state,
+          "max_levels": int(sim.maxLevels_ + 1),
+          "level_sizes": level_sizes,
+          "max_level_size": int(max(level_sizes, default=0)),
+          "total_level_gene_visits": int(sum(level_sizes)),
+      })
+      print(
+          f"[make_synthetic_data6] graph before simulate: "
+          f"n_cells={n_cells} n_clusters={n_clusters} number_sc={number_sc} "
+          f"sampling_state={sampling_state} levels={sim.maxLevels_ + 1} "
+          f"max_level_size={max(level_sizes, default=0)}"
+      )
     sim.simulate()
     expr = sim.getExpressions()   # (n_clusters, n_genes, number_sc)
 
@@ -4265,14 +4809,428 @@ def run_mr_tree_experiment(
   }
 
 
+# --------------------------------------------------------------------------
+# MR-choice experiment: surrogate-selected states vs. iid control.
+# --------------------------------------------------------------------------
+
+def _summarize_mr_choice_diagnostics(replicates: list[dict]) -> dict:
+  """Summarize paired spectral-selector versus random-choice diagnostics."""
+  metric_names = (
+      "score", "spectral_entropy_normalized", "participation_ratio",
+      "participation_ratio_normalized", "trace", "variance_ratio_to_reference",
+  )
+  summary = {}
+  for name in metric_names:
+    values = {}
+    for arm in ("spectral", "control"):
+      values[arm] = np.array([
+          float(rep[arm]["surrogate_spectral_metrics"].get(name, float("nan")))
+          for rep in replicates
+      ], dtype=np.float64)
+    valid = np.isfinite(values["spectral"]) & np.isfinite(values["control"])
+    diff = values["spectral"][valid] - values["control"][valid]
+    summary[name] = {
+        "spectral": {
+            "mean": float(np.nanmean(values["spectral"])) if np.isfinite(values["spectral"]).any() else float("nan"),
+            "std":  float(np.nanstd(values["spectral"]))  if np.isfinite(values["spectral"]).any() else float("nan"),
+            "n":    int(np.isfinite(values["spectral"]).sum()),
+        },
+        "control": {
+            "mean": float(np.nanmean(values["control"])) if np.isfinite(values["control"]).any() else float("nan"),
+            "std":  float(np.nanstd(values["control"]))  if np.isfinite(values["control"]).any() else float("nan"),
+            "n":    int(np.isfinite(values["control"]).sum()),
+        },
+        "paired_spectral_minus_control": {
+            "mean": float(np.mean(diff)) if diff.size else float("nan"),
+            "std":  float(np.std(diff))  if diff.size else float("nan"),
+            "n":    int(diff.size),
+        },
+    }
+
+  scalar_names = (
+      "selection_seconds", "n_surrogate_evaluations", "n_swap_evaluations",
+      "surrogate_seconds", "sergio_seconds", "stats_seconds",
+      "spectral_score", "control_score", "score_gain",
+      "cluster_mean_rmse", "cluster_mean_max_abs_error",
+  )
+  selection_summary = {}
+  for name in scalar_names:
+    vals = np.array([
+        float(rep["selection_diagnostics"].get(name, float("nan")))
+        for rep in replicates
+    ], dtype=np.float64)
+    finite = np.isfinite(vals)
+    selection_summary[name] = {
+        "mean": float(np.mean(vals[finite])) if finite.any() else float("nan"),
+        "std":  float(np.std(vals[finite]))  if finite.any() else float("nan"),
+        "n":    int(finite.sum()),
+    }
+  summary["selection"] = selection_summary
+  return summary
+
+
+def run_mr_choice_experiment(
+    config:                  str | dict,
+    n_replicates:            int         = 20,
+    n_candidate_states:      int         = 200,
+    n_selected_states:       int         = 10,
+    candidate_design:        str         = "random",
+    selection_n_restarts:    int         = 8,
+    selection_swap_passes:   int         = 10,
+    selection_variance_weight: float     = 0.05,
+    seed_base:               int         = 0,
+    mr_rate_low:             float | None = None,
+    mr_rate_high:            float | None = None,
+    grn_n_genes:             int | None  = None,
+    sim_n_cells:             int | None  = None,
+    clean_simulation:        bool        = True,
+    validate_sergio:         bool        = True,
+    stats_n_pca_components:  int | None  = None,
+    stats_n_structure_genes: int | None  = None,
+    stats_percentiles:       tuple | None = None,
+    stats_seed:              int | None  = None,
+    grn_tmp_dir:             str | None  = None,
+    grn_output_path:         str | None  = None,
+    verbose:                 bool        = True,
+) -> dict:
+  """Compare spectral subset selection against paired iid-uniform choice.
+
+  Each replicate generates one fixed GRN state and an iid-uniform candidate
+  pool. The ``spectral`` arm selects ``n_selected_states`` rows using the
+  batch-aware DAG/Hill surrogate. The ``control`` arm samples the same number
+  of rows uniformly from that same pool. Both arms are then evaluated with the
+  surrogate and, optionally, with the real SERGIO simulator.
+
+  By default this is the clean experiment discussed in the accompanying
+  design: one cell per selected state, zero CLE noise, and all technical-noise
+  stages disabled. Set ``clean_simulation=False`` and ``sim_n_cells`` to use
+  the resolved config's ordinary stochastic/technical pipeline instead.
+
+  The returned ``replicates`` retain candidate states, selected indices,
+  surrogate spectral metrics, selection-search diagnostics, simulator-vs-
+  surrogate errors, distributional stats, distance breakdowns, and MR-state
+  correlation instrumentation for post-hoc analysis.
+  """
+  _tsd = _import_tune_synthetic_data()
+  cfg = _load_mr_tree_experiment_config(config)
+  if mr_rate_low is not None:
+    cfg["mr_rate_low"] = mr_rate_low
+  if mr_rate_high is not None:
+    cfg["mr_rate_high"] = mr_rate_high
+  if stats_n_pca_components is not None:
+    cfg["stats_n_pca_components"] = stats_n_pca_components
+  if stats_n_structure_genes is not None:
+    cfg["stats_n_structure_genes"] = stats_n_structure_genes
+  if stats_percentiles is not None:
+    cfg["stats_percentiles"] = stats_percentiles
+  if stats_seed is not None:
+    cfg["stats_seed"] = stats_seed
+  if candidate_design not in ("random", "sobol"):
+    raise ValueError(f"unknown candidate_design {candidate_design!r}")
+  if n_selected_states < 2 or n_selected_states > n_candidate_states:
+    raise ValueError(
+        f"need 2 <= n_selected_states <= n_candidate_states, got "
+        f"{n_selected_states} and {n_candidate_states}"
+    )
+
+  n_genes = cfg["n_genes"] if grn_n_genes is None else int(grn_n_genes)
+  sim_kwargs, grn_k_dist, hill_coeff_dist, unknown_mode_repressor_prob, grn_coherency_kwargs = \
+      _tsd._split_resolved(cfg)
+  decays = sim_kwargs["decays"]
+  n_sim_cells = n_selected_states if sim_n_cells is None else int(sim_n_cells)
+  if clean_simulation and n_sim_cells < n_selected_states:
+    raise ValueError(
+        "clean_simulation requires sim_n_cells >= n_selected_states"
+    )
+  if verbose:
+    print(
+        f"[run_mr_choice_experiment] candidates={n_candidate_states}, "
+        f"selected={n_selected_states}, sim_n_cells={n_sim_cells}, "
+        f"clean_simulation={clean_simulation}, validate_sergio={validate_sergio}, "
+        f"sampling_state={'2' if clean_simulation else cfg['sampling_state']}"
+    )
+
+  target_stats = None
+  if cfg.get("target_stats_path"):
+    with open(cfg["target_stats_path"], "rb") as f:
+      target_stats = pickle.load(f)
+    _augment_candidate_stats(target_stats, _tsd)
+
+  device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+  grn_tmp_dir = grn_tmp_dir or cfg.get("grn_tmp_dir") or tempfile.gettempdir()
+  Path(grn_tmp_dir).mkdir(parents=True, exist_ok=True)
+  grn_path = grn_output_path or os.path.join(
+      grn_tmp_dir, f"sergio_grn_mr_choice_experiment_{os.getpid()}.csv")
+
+  if verbose:
+    print(f"[run_mr_choice_experiment] generating GRN ({n_genes} genes, "
+          f"grn_seed={cfg['grn_seed']}) -> {grn_path!r} ...")
+  grn_diagnostics: dict = {}
+  _, mr_ids, gene_id_to_symbol = generate_sergio_grn_from_reference(
+      reference_grn_path=cfg["reference_grn_path"],
+      n_genes=n_genes,
+      output_path=grn_path,
+      delimiter=cfg["grn_delimiter"],
+      regulator_col=cfg["grn_regulator_col"],
+      target_col=cfg["grn_target_col"],
+      mode_col=cfg["grn_mode_col"],
+      activation_labels=cfg["grn_activation_labels"],
+      repression_labels=cfg["grn_repression_labels"],
+      unknown_mode_repressor_prob=unknown_mode_repressor_prob,
+      k_dist=grn_k_dist,
+      hill_coeff_dist=hill_coeff_dist,
+      max_seed_attempts=cfg["grn_max_seed_attempts"],
+      seed=cfg["grn_seed"],
+      diagnostics=grn_diagnostics,
+      **grn_coherency_kwargs,
+  )
+  dag = load_sergio_dag(
+      grn_path,
+      shared_coop_state=cfg["shared_coop_state"],
+      mr_gene_ids=mr_ids,
+  )
+  winner_mr_by_gene = (
+      (grn_diagnostics.get("tgt_ids", []), grn_diagnostics.get("winner_mr", []))
+      if grn_diagnostics.get("winner_mr") else None
+  )
+
+  try:
+    mr_target_sets = build_mr_target_sets(grn_path, mr_ids)
+    target_set_sizes = [len(mr_target_sets[mr]) for mr in mr_ids]
+    replicates = []
+    for r in range(n_replicates):
+      replicate_seed = seed_base + r
+      if verbose:
+        print(f"[run_mr_choice_experiment] replicate {r + 1}/{n_replicates} "
+              f"(seed={replicate_seed}) ...")
+
+      candidate_states = sample_sergio_mr_states(
+          n_states=n_candidate_states,
+          n_mrs=len(mr_ids),
+          low=cfg["mr_rate_low"],
+          high=cfg["mr_rate_high"],
+          design=candidate_design,
+          seed=replicate_seed,
+      )
+      selection_start = time.perf_counter()
+      selected_indices, selected_surrogate_metrics, selector_diagnostics = \
+          select_sergio_spectral_subset(
+              candidate_states, dag, decays=decays,
+              subset_size=n_selected_states,
+              n_restarts=selection_n_restarts,
+              swap_passes=selection_swap_passes,
+              seed=replicate_seed + 1,
+              variance_weight=selection_variance_weight,
+          )
+      selection_seconds = time.perf_counter() - selection_start
+      control_indices = np.random.default_rng(replicate_seed + 2).choice(
+          n_candidate_states, size=n_selected_states, replace=False).tolist()
+
+      arms = {
+          "spectral": (selected_indices, selected_surrogate_metrics),
+          "control": (sorted(int(i) for i in control_indices), None),
+      }
+      for arm_name, (indices, precomputed_metrics) in arms.items():
+        arm_state = candidate_states[indices]
+        surrogate_start = time.perf_counter()
+        surrogate_raw = sergio_dag_hill_forward(arm_state, dag, decays=decays)
+        surrogate_log = np.log1p(np.maximum(surrogate_raw, 0.0))
+        surrogate_seconds = time.perf_counter() - surrogate_start
+        if precomputed_metrics is None:
+          _, surrogate_metrics = sergio_spectral_metrics(
+              surrogate_raw,
+              reference_trace=selector_diagnostics["candidate_metrics"]["trace"],
+              variance_weight=selection_variance_weight,
+          )
+        else:
+          surrogate_metrics = precomputed_metrics
+
+        if validate_sergio:
+          sim_kwargs_local = dict(sim_kwargs)
+          if clean_simulation:
+            sim_kwargs_local["noise_params"] = 0.0
+          sergio_diagnostics = {}
+          sergio_start = time.perf_counter()
+          X_sim, cluster_labels = make_synthetic_data6(
+              mr_state=torch.tensor(arm_state, dtype=torch.float32, device=device),
+              input_file_targets=grn_path,
+              n_cells=n_sim_cells if clean_simulation else (sim_n_cells or cfg["n_cells"]),
+              mr_gene_ids=mr_ids,
+              shared_coop_state=cfg["shared_coop_state"],
+              noise_type=cfg["noise_type"],
+              sampling_state=2 if clean_simulation else cfg["sampling_state"],
+              dt=cfg["dt"],
+              min_cells_per_cluster=1 if clean_simulation else cfg["min_cells_per_cluster"],
+              add_outlier_genes=False if clean_simulation else cfg["add_outlier_genes"],
+              add_lib_size_effect=False if clean_simulation else cfg["add_lib_size_effect"],
+              add_dropout=False if clean_simulation else cfg["add_dropout"],
+              convert_to_umi_counts=False if clean_simulation else cfg["convert_to_umi_counts"],
+              missing_rate=0.0,
+              seed=replicate_seed,
+              device=device,
+              diagnostics=sergio_diagnostics,
+              **sim_kwargs_local,
+          )
+          sergio_seconds = time.perf_counter() - sergio_start
+          if verbose:
+            print(
+                f"[run_mr_choice_experiment] {arm_name} SERGIO shape: "
+                f"n_cells={sergio_diagnostics['n_cells']} "
+                f"n_clusters={sergio_diagnostics['n_clusters']} "
+                f"number_sc={sergio_diagnostics['number_sc']} "
+                f"levels={sergio_diagnostics['max_levels']} "
+                f"max_level_size={sergio_diagnostics['max_level_size']}"
+            )
+          X_np = X_sim.detach().cpu().numpy()
+          cluster_labels = np.asarray(cluster_labels)
+          cluster_means = np.stack([
+              X_np[cluster_labels == i].mean(axis=0)
+              for i in range(n_selected_states)
+          ])
+          cluster_error = np.abs(cluster_means - surrogate_log)
+          cluster_error_info = {
+              "rmse": float(np.sqrt(np.mean(np.square(cluster_error)))),
+              "max_abs_error": float(cluster_error.max()),
+          }
+          stats_input = X_sim
+        else:
+          cluster_labels = np.arange(n_selected_states, dtype=np.int64)
+          sergio_seconds = float("nan")
+          cluster_error_info = {"rmse": float("nan"), "max_abs_error": float("nan")}
+          stats_input = torch.tensor(surrogate_log, dtype=torch.float32)
+          sergio_diagnostics = {}
+
+        stats_start = time.perf_counter()
+        stats = compute_summary_stats(
+            stats_input,
+            n_pca_components=cfg["stats_n_pca_components"],
+            n_structure_genes=cfg["stats_n_structure_genes"],
+            percentiles=tuple(cfg["stats_percentiles"]),
+            seed=cfg["stats_seed"],
+        )
+        stats_seconds = time.perf_counter() - stats_start
+        _augment_candidate_stats(stats, _tsd)
+        distance = None
+        distance_breakdown = None
+        if target_stats is not None:
+          distance, breakdown = _tsd.compute_stats_distance(
+              target_stats, stats, weights=cfg.get("weights"),
+              eps=cfg.get("distance_eps", 1e-6),
+              eps_frac=cfg.get("distance_eps_frac", 0.05),
+              eps_abs_floor=cfg.get("distance_eps_abs_floor", 0.02),
+          )
+          distance_breakdown = {
+              "terms": breakdown["terms"],
+              "skipped": breakdown["skipped"],
+              "weights": dict(cfg.get("weights") or {}),
+          }
+
+        mr_state_pr = _mr_state_participation_ratio(arm_state)
+        mr_mr_corr = (
+            np.corrcoef(arm_state, rowvar=False)
+            if arm_state.shape[0] >= 2
+            else np.full((arm_state.shape[1],) * 2, float("nan"))
+        )
+        gene_mod_corr = _gene_module_correlations(
+            stats_input, cluster_labels, winner_mr_by_gene, mr_ids,
+            gene_id_to_symbol,
+            n_structure_genes=cfg["stats_n_structure_genes"],
+            seed=cfg["stats_seed"],
+        )
+        arms[arm_name] = {
+            "selection_type": arm_name,
+            "selected_indices": indices,
+            "mr_state": arm_state,
+            "cluster_labels": cluster_labels,
+            "stats": stats,
+            "distance": distance,
+            "distance_breakdown": distance_breakdown,
+            "surrogate_spectral_metrics": surrogate_metrics,
+            "surrogate_seconds": surrogate_seconds,
+            "sergio_seconds": sergio_seconds,
+            "sergio_diagnostics": sergio_diagnostics,
+            "stats_seconds": stats_seconds,
+            "surrogate_cluster_mean_error": cluster_error_info,
+            "mr_mr_correlation": mr_mr_corr,
+            "mr_state_participation_ratio": mr_state_pr,
+            "within_module_mean_abs_corr": gene_mod_corr["within_module_mean_abs_corr"],
+            "across_module_mean_abs_corr": gene_mod_corr["across_module_mean_abs_corr"],
+            "within_minus_across": gene_mod_corr["within_minus_across"],
+        }
+
+      control_metrics = arms["control"]["surrogate_spectral_metrics"]
+      replicates.append({
+          "seed": replicate_seed,
+          "candidate_mr_state": candidate_states,
+          "candidate_design": candidate_design,
+          "spectral": arms["spectral"],
+          "control": arms["control"],
+          "selection_diagnostics": {
+              "selection_seconds": float(selection_seconds),
+              "n_surrogate_evaluations": selector_diagnostics["n_surrogate_evaluations"],
+              "n_swap_evaluations": selector_diagnostics["n_swap_evaluations"],
+              "surrogate_seconds": (
+                  arms["spectral"]["surrogate_seconds"]
+                  + arms["control"]["surrogate_seconds"]
+              ),
+              "sergio_seconds": (
+                  arms["spectral"]["sergio_seconds"]
+                  + arms["control"]["sergio_seconds"]
+                  if validate_sergio else float("nan")
+              ),
+              "stats_seconds": (
+                  arms["spectral"]["stats_seconds"]
+                  + arms["control"]["stats_seconds"]
+              ),
+              "spectral_score": selected_surrogate_metrics["score"],
+              "control_score": control_metrics["score"],
+              "score_gain": selected_surrogate_metrics["score"] - control_metrics["score"],
+              "cluster_mean_rmse": arms["spectral"]["surrogate_cluster_mean_error"]["rmse"],
+              "cluster_mean_max_abs_error": arms["spectral"]["surrogate_cluster_mean_error"]["max_abs_error"],
+              "selector": selector_diagnostics,
+          },
+      })
+  finally:
+    if grn_output_path is None and os.path.exists(grn_path):
+      os.remove(grn_path)
+
+  summary = _summarize_mr_tree_experiment(
+      replicates, arm_names=("spectral", "control"))
+  summary["choice_diagnostics"] = _summarize_mr_choice_diagnostics(replicates)
+  return {
+      "config": cfg,
+      "n_genes": n_genes,
+      "n_candidate_states": n_candidate_states,
+      "n_selected_states": n_selected_states,
+      "candidate_design": candidate_design,
+      "selection_n_restarts": selection_n_restarts,
+      "selection_swap_passes": selection_swap_passes,
+      "selection_variance_weight": selection_variance_weight,
+      "seed_base": seed_base,
+      "clean_simulation": clean_simulation,
+      "validate_sergio": validate_sergio,
+      "mr_ids": mr_ids,
+      "gene_id_to_symbol": gene_id_to_symbol,
+      "dag": dag,
+      "grn_diagnostics": grn_diagnostics,
+      "target_set_sizes": target_set_sizes,
+      "target_stats": target_stats,
+      "replicates": replicates,
+      "summary": summary,
+  }
+
+
 def main(argv=None) -> dict:
   parser = argparse.ArgumentParser(
       description=(
-          "Compare direct, transitive-hard, transitive-soft, and i.i.d. "
-          "master-regulator mr_state sampling "
-          "via run_mr_tree_experiment."
+          "Run MR-state comparison experiments: tree-correlated sampling "
+          "or DAG/Hill spectral subset selection versus an iid control."
       ),
       formatter_class=argparse.RawDescriptionHelpFormatter,
+  )
+  parser.add_argument(
+      "--experiment", choices=("tree", "choice"), default="tree",
+      help="Experiment harness to run (default: tree).",
   )
   parser.add_argument(
       "--config", required=True,
@@ -4281,6 +5239,16 @@ def main(argv=None) -> dict:
   )
   parser.add_argument("--n-replicates", type=int, default=20)
   parser.add_argument("--n-states", type=int, default=None)
+  parser.add_argument("--n-candidate-states", type=int, default=200)
+  parser.add_argument("--n-selected-states", type=int, default=10)
+  parser.add_argument("--grn-n-genes", type=int, default=None)
+  parser.add_argument("--candidate-design", choices=("random", "sobol"), default="random")
+  parser.add_argument("--selection-n-restarts", type=int, default=8)
+  parser.add_argument("--selection-swap-passes", type=int, default=10)
+  parser.add_argument("--selection-variance-weight", type=float, default=0.05)
+  parser.add_argument("--sim-n-cells", type=int, default=None)
+  parser.add_argument("--no-clean-simulation", action="store_true")
+  parser.add_argument("--no-sergio-validation", action="store_true")
   parser.add_argument("--tree-strength", type=float, default=1.0)
   parser.add_argument("--root-variance", type=float, default=0.0)
   parser.add_argument("--seed-base", type=int, default=0)
@@ -4291,30 +5259,50 @@ def main(argv=None) -> dict:
   parser.add_argument("--grn-output-path", default=None)
   parser.add_argument(
       "--output", default="mr_tree_experiment_result.pickle",
-      help="Where to pickle the full result dict (see run_mr_tree_"
-           "experiment's return-value docstring).",
+      help="Where to pickle the full result dict.",
   )
   args = parser.parse_args(argv)
 
-  result = run_mr_tree_experiment(
-      args.config,
-      n_replicates=args.n_replicates,
-      n_states=args.n_states,
-      tree_strength=args.tree_strength,
-      root_variance=args.root_variance,
-      seed_base=args.seed_base,
-      mr_rate_low=args.mr_rate_low,
-      mr_rate_high=args.mr_rate_high,
-      mr_tree_path_decay=args.mr_tree_path_decay,
-      stats_n_pca_components=args.stats_n_pca_components,
-      grn_output_path=args.grn_output_path,
-  )
+  if args.experiment == "tree":
+    result = run_mr_tree_experiment(
+        args.config,
+        n_replicates=args.n_replicates,
+        n_states=args.n_states,
+        tree_strength=args.tree_strength,
+        root_variance=args.root_variance,
+        seed_base=args.seed_base,
+        mr_rate_low=args.mr_rate_low,
+        mr_rate_high=args.mr_rate_high,
+        mr_tree_path_decay=args.mr_tree_path_decay,
+        stats_n_pca_components=args.stats_n_pca_components,
+        grn_output_path=args.grn_output_path,
+    )
+  else:
+    result = run_mr_choice_experiment(
+        args.config,
+        n_replicates=args.n_replicates,
+        n_candidate_states=args.n_candidate_states,
+        n_selected_states=args.n_selected_states,
+        candidate_design=args.candidate_design,
+        selection_n_restarts=args.selection_n_restarts,
+        selection_swap_passes=args.selection_swap_passes,
+        selection_variance_weight=args.selection_variance_weight,
+        seed_base=args.seed_base,
+        mr_rate_low=args.mr_rate_low,
+        mr_rate_high=args.mr_rate_high,
+        grn_n_genes=args.grn_n_genes,
+        sim_n_cells=args.sim_n_cells,
+        clean_simulation=not args.no_clean_simulation,
+        validate_sergio=not args.no_sergio_validation,
+        stats_n_pca_components=args.stats_n_pca_components,
+        grn_output_path=args.grn_output_path,
+    )
 
   with open(args.output, "wb") as f:
     pickle.dump(result, f)
   print(f"\nSaved full result to {args.output!r}")
 
-  print(f"\nPaired multi-tree summary (tree_strength={args.tree_strength}, "
+  print(f"\nExperiment summary ({args.experiment}, "
         f"n_replicates={args.n_replicates}):")
   for name, s in result["summary"].items():
     arm_means = ", ".join(

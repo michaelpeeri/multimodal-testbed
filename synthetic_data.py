@@ -3292,6 +3292,79 @@ def pca_participation_ratio(ratio: np.ndarray, skip_leading: int = 1) -> float:
   return float((tail.sum() ** 2) / np.sum(tail ** 2))
 
 
+def _split_half_pca_stability(
+    X: np.ndarray,
+    n_components: int,
+    seed: int | None = 0,
+) -> tuple[float, float]:
+  """Compare PCA loading subspaces and spectra across two cell halves.
+
+  The loading-subspace score is the mean squared cosine of the principal
+  angles between the two half-dataset PCA subspaces. It is one when the
+  subspaces agree exactly and approaches the random-subspace baseline when
+  the leading directions are unstable. The spectrum score is the cosine
+  similarity of the two halves' explained-variance-ratio vectors. Both
+  scores use the same transformed matrix supplied by the caller; each half
+  is centered independently before its SVD.
+
+  This is intended to distinguish a flat but noise-dominated spectrum from
+  reproducible multi-axis structure. With an odd number of cells, the one
+  unused cell is ignored so both halves have the same size. Returns two NaNs
+  when there are too few cells/features or either half has zero variance.
+  """
+  matrix = np.asarray(X, dtype=np.float64)
+  if matrix.ndim != 2 or matrix.shape[0] < 4 or matrix.shape[1] < 1:
+    return float("nan"), float("nan")
+
+  half = matrix.shape[0] // 2
+  rng = np.random.default_rng(seed)
+  order = rng.permutation(matrix.shape[0])[: 2 * half]
+  left = matrix[order[:half]]
+  right = matrix[order[half:]]
+
+  left_centered = left - left.mean(axis=0, keepdims=True)
+  right_centered = right - right.mean(axis=0, keepdims=True)
+  _, left_singular, left_vectors = np.linalg.svd(
+      left_centered, full_matrices=False, compute_uv=True
+  )
+  _, right_singular, right_vectors = np.linalg.svd(
+      right_centered, full_matrices=False, compute_uv=True
+  )
+  left_var = left_singular ** 2
+  right_var = right_singular ** 2
+  left_total = float(left_var.sum())
+  right_total = float(right_var.sum())
+  if not (np.isfinite(left_total) and np.isfinite(right_total)) or \
+      left_total <= 0.0 or right_total <= 0.0:
+    return float("nan"), float("nan")
+
+  k = min(
+      int(n_components),
+      left_vectors.shape[0],
+      right_vectors.shape[0],
+      left_vectors.shape[1],
+      right_vectors.shape[1],
+  )
+  if k < 1:
+    return float("nan"), float("nan")
+
+  left_basis = left_vectors[:k].T
+  right_basis = right_vectors[:k].T
+  principal_cosines = np.linalg.svd(
+      left_basis.T @ right_basis, compute_uv=False
+  )
+  subspace_stability = float(np.mean(np.square(principal_cosines)))
+
+  left_ratio = left_var[:k] / left_total
+  right_ratio = right_var[:k] / right_total
+  spectrum_norm = np.linalg.norm(left_ratio) * np.linalg.norm(right_ratio)
+  spectrum_similarity = (
+      float(left_ratio @ right_ratio / spectrum_norm)
+      if spectrum_norm > 0.0 else float("nan")
+  )
+  return subspace_stability, spectrum_similarity
+
+
 def compute_summary_stats(
     X:                  torch.Tensor,
     n_pca_components:   int      = 10,
@@ -3439,6 +3512,21 @@ def compute_summary_stats(
       pca_size_normalized_standardized_tail_participation_ratio:
         pca_tail_participation_ratio's counterpart computed from
         pca_size_normalized_standardized_explained_variance_ratio.
+      pca_split_half_subspace_stability:
+        mean squared principal-angle cosine between the top PCA loading
+        subspaces of two random cell halves, using the raw PCA matrix.
+        Values near one indicate reproducible directions; values near the
+        random-subspace baseline indicate unstable directions.
+      pca_split_half_spectrum_similarity:
+        cosine similarity between the two halves' explained-variance-ratio
+        vectors, using the raw PCA matrix.
+      pca_standardized_split_half_subspace_stability and
+      pca_standardized_split_half_spectrum_similarity:
+        the same two split-half metrics for the per-gene-standardized PCA.
+      pca_size_normalized_standardized_split_half_subspace_stability and
+      pca_size_normalized_standardized_split_half_spectrum_similarity:
+        the same two split-half metrics for the size-normalized,
+        per-gene-standardized PCA.
   """
   assert X.dim() == 2, f"expected a 2D (n_cells, n_genes) tensor, got shape {tuple(X.shape)}"
   n_cells, n_genes = X.shape
@@ -3582,9 +3670,23 @@ def compute_summary_stats(
     total_z = explained_var_z.sum()
     ratio_z = explained_var_z / total_z if total_z > 0 else np.zeros_like(explained_var_z)
     stats["pca_standardized_explained_variance_ratio"] = ratio_z[:k]
+
+    split_seed = None if seed is None else int(seed) + 1
+    (
+        stats["pca_split_half_subspace_stability"],
+        stats["pca_split_half_spectrum_similarity"],
+    ) = _split_half_pca_stability(X_struct, k, seed=split_seed)
+    (
+        stats["pca_standardized_split_half_subspace_stability"],
+        stats["pca_standardized_split_half_spectrum_similarity"],
+    ) = _split_half_pca_stability(Xz, k, seed=split_seed)
   else:
     stats["pca_explained_variance_ratio"] = np.array([])
     stats["pca_standardized_explained_variance_ratio"] = np.array([])
+    stats["pca_split_half_subspace_stability"] = float("nan")
+    stats["pca_split_half_spectrum_similarity"] = float("nan")
+    stats["pca_standardized_split_half_subspace_stability"] = float("nan")
+    stats["pca_standardized_split_half_spectrum_similarity"] = float("nan")
   stats["pca_tail_participation_ratio"] = pca_participation_ratio(stats["pca_explained_variance_ratio"])
   stats["pca_standardized_tail_participation_ratio"] = pca_participation_ratio(
       stats["pca_standardized_explained_variance_ratio"])
@@ -3677,8 +3779,14 @@ def compute_summary_stats(
     total_zn = explained_var_zn.sum()
     ratio_zn = explained_var_zn / total_zn if total_zn > 0 else np.zeros_like(explained_var_zn)
     stats["pca_size_normalized_standardized_explained_variance_ratio"] = ratio_zn[:k]
+    (
+        stats["pca_size_normalized_standardized_split_half_subspace_stability"],
+        stats["pca_size_normalized_standardized_split_half_spectrum_similarity"],
+    ) = _split_half_pca_stability(Xzn, k, seed=split_seed)
   else:
     stats["pca_size_normalized_standardized_explained_variance_ratio"] = np.array([])
+    stats["pca_size_normalized_standardized_split_half_subspace_stability"] = float("nan")
+    stats["pca_size_normalized_standardized_split_half_spectrum_similarity"] = float("nan")
   stats["pca_size_normalized_standardized_tail_participation_ratio"] = pca_participation_ratio(
       stats["pca_size_normalized_standardized_explained_variance_ratio"])
 

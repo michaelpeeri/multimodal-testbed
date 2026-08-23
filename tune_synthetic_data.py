@@ -253,6 +253,10 @@ mean_var_log_* family (16 keys) out of config["weights"] doesn't exclude
 them, it silently scores them at weight 1.0 each (confirmed in practice to
 end up ~25% of the total objective, unintentionally, across the
 20260811.* studies) -- explicitly set any key you don't want scored to 0.0.
+The split-half PCA diagnostics added later are the deliberate exception:
+they are skipped unless explicitly named in config["weights"], so regenerating
+a target pickle with those extra diagnostics cannot silently change an
+existing objective.
 
 Hard guards against degenerate candidates
 --------------------------------------------
@@ -689,6 +693,18 @@ TUNABLE_KEYS = frozenset(_SIM_KWARG_DEFAULTS) | frozenset(_GRN_KWARG_DEFAULTS)
 # structural (not distributional) entries, not stats to be matched.
 _EXCLUDED_STATS_KEYS = frozenset({"n_cells", "n_genes", "dropout_curve_bin_edges"})
 
+# Split-half PCA diagnostics are useful for post-hoc structure analysis, but
+# are opt-in objective terms. Silently assigning them the default weight of
+# 1.0 would change existing objectives when a target pickle is regenerated.
+_OPT_IN_STATS_KEYS = frozenset({
+    "pca_split_half_subspace_stability",
+    "pca_split_half_spectrum_similarity",
+    "pca_standardized_split_half_subspace_stability",
+    "pca_standardized_split_half_spectrum_similarity",
+    "pca_size_normalized_standardized_split_half_subspace_stability",
+    "pca_size_normalized_standardized_split_half_spectrum_similarity",
+})
+
 _SAMPLERS = {
     "tpe": lambda: optuna.samplers.TPESampler(seed=0),
 }
@@ -1124,6 +1140,9 @@ def compute_stats_distance(target_stats: dict, candidate_stats: dict,
 
     for key, target_value in target_stats.items():
         if key in _EXCLUDED_STATS_KEYS:
+            continue
+        if key in _OPT_IN_STATS_KEYS and key not in weights:
+            skipped.append(key)
             continue
         if key not in candidate_stats:
             skipped.append(key)

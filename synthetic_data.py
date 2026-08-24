@@ -908,6 +908,89 @@ def sergio_dag_hill_forward(
   return expression
 
 
+def sergio_dag_hill_forward_batched(
+    mr_states: np.ndarray,
+    dag: SergioDAG,
+    decays: float | list | np.ndarray = 0.8,
+) -> np.ndarray:
+  """Evaluate multiple MR-state batches in one vectorized forward pass.
+
+  Args:
+    mr_states: ``(n_batches, n_bins, n_mrs)`` basal MR production rates.
+    dag: parsed SERGIO DAG from :func:`load_sergio_dag`.
+    decays: scalar or one decay value per gene.
+
+  Returns:
+    ``(n_batches, n_bins, n_genes)`` raw continuous concentrations.
+
+  The batch dimension is the collection of candidate subsets.  Half-response
+  thresholds are therefore computed independently for every candidate batch,
+  preserving :func:`sergio_dag_hill_forward`'s batch-aware semantics.  The
+  topological target loop remains sequential because downstream targets depend
+  on upstream expression, but all bins, candidate batches, and parents of a
+  target are evaluated with array operations.
+  """
+  states = np.asarray(mr_states)
+  assert states.ndim == 3
+  assert states.shape[2] == len(dag.mr_ids), (
+      f"mr_states has {states.shape[2]} columns but the DAG has "
+      f"{len(dag.mr_ids)} master regulators"
+  )
+  assert np.all(np.isfinite(states)) and np.all(states >= 0.0)
+
+  if np.isscalar(decays):
+    decay = np.full(dag.n_genes, float(decays), dtype=np.float64)
+  else:
+    decay = np.asarray(decays, dtype=np.float64)
+    assert decay.shape == (dag.n_genes,)
+  assert np.all(np.isfinite(decay)) and np.all(decay > 0.0)
+
+  n_batches, n_bins = states.shape[:2]
+  expression = np.zeros((n_batches, n_bins, dag.n_genes), dtype=np.float64)
+  mr_ids = np.asarray(dag.mr_ids, dtype=np.int64)
+  expression[..., mr_ids] = states / decay[mr_ids]
+
+  for target in dag.target_order:
+    target_parents = dag.parents[target]
+    if not target_parents:
+      continue
+
+    regulators = np.asarray([parent[0] for parent in target_parents], dtype=np.int64)
+    k_values = np.asarray([parent[1] for parent in target_parents], dtype=np.float64)
+    coop_states = np.asarray([parent[2] for parent in target_parents], dtype=np.float64)
+    repressive = k_values < 0.0
+
+    upstream = np.take(expression, regulators, axis=2)
+    half_response = upstream.mean(axis=1, keepdims=True)
+    u_power = np.power(upstream, coop_states[None, None, :])
+    h_power = np.power(half_response, coop_states[None, None, :])
+    denominator = h_power + u_power
+    response = np.divide(
+        u_power,
+        denominator,
+        out=np.zeros_like(u_power),
+        where=denominator != 0.0,
+    )
+    response = np.where(
+        repressive[None, None, :],
+        1.0 - response,
+        response,
+    )
+    zero_upstream = upstream == 0.0
+    response = np.where(
+        zero_upstream,
+        np.where(repressive[None, None, :], 1.0, 0.0),
+        response,
+    )
+    production = np.sum(
+        np.abs(k_values)[None, None, :] * response,
+        axis=2,
+    )
+    expression[..., target] = production / decay[target]
+
+  return expression
+
+
 def sample_sergio_mr_states(
     n_states: int,
     n_mrs: int,
@@ -1085,6 +1168,199 @@ def select_sergio_spectral_subset(
       "swap_passes": swap_passes,
       "variance_weight": variance_weight,
       "n_surrogate_evaluations": len(cache),
+      "n_swap_evaluations": total_swap_evaluations,
+      "candidate_metrics": full_metrics,
+      "restart_diagnostics": restart_diagnostics,
+  }
+  return best_indices, dict(best_metrics), diagnostics
+
+
+def sergio_spectral_scores_batched(
+    expression: np.ndarray,
+    reference_trace: float,
+    variance_weight: float = 0.05,
+) -> np.ndarray:
+  """Return spectral scores for ``(batch, rows, genes)`` expressions.
+
+  This is the score-only counterpart to :func:`sergio_spectral_metrics` used
+  while searching.  NumPy's stacked SVD avoids entering Python once per
+  candidate subset; detailed metrics are still computed with the existing
+  scalar function for the final selected subset.
+  """
+  x = np.asarray(expression, dtype=np.float64)
+  assert x.ndim == 3
+  if x.shape[1] < 2:
+    return np.full(x.shape[0], -np.inf, dtype=np.float64)
+
+  centered = x - x.mean(axis=1, keepdims=True)
+  singular_values = np.linalg.svd(centered, compute_uv=False)
+  n_components = min(x.shape[1] - 1, x.shape[2])
+  eigenvalues = np.square(singular_values[..., :n_components])
+  total = eigenvalues.sum(axis=1)
+  valid = np.isfinite(total) & (total > 0.0)
+  safe_total = np.where(valid, total, 1.0)
+  proportions = eigenvalues / safe_total[:, None]
+
+  if n_components > 1:
+    positive = proportions > 0.0
+    safe_proportions = np.where(positive, proportions, 1.0)
+    entropy = (
+        -np.sum(
+            np.where(positive, proportions * np.log(safe_proportions), 0.0),
+            axis=1,
+        ) / np.log(n_components)
+    )
+  else:
+    entropy = np.zeros(x.shape[0], dtype=np.float64)
+
+  trace = total / max(x.shape[1] - 1, 1)
+  variance_ratio = trace / max(float(reference_trace), 1e-12)
+  scores = np.full(x.shape[0], -np.inf, dtype=np.float64)
+  finite_score = valid & np.isfinite(entropy) & np.isfinite(variance_ratio)
+  scores[finite_score] = (
+      entropy[finite_score]
+      + variance_weight * np.log(np.maximum(variance_ratio[finite_score], 1e-12))
+  )
+  return scores
+
+
+def select_sergio_spectral_subset_vectorized(
+    mr_state: np.ndarray,
+    dag: SergioDAG,
+    decays: float | list | np.ndarray = 0.8,
+    subset_size: int = 10,
+    n_restarts: int = 8,
+    swap_passes: int = 10,
+    seed: int = 0,
+    variance_weight: float = 0.05,
+    evaluation_batch_size: int | None = None,
+) -> tuple[list[int], dict, dict]:
+  """Select MR-state rows using batched DAG/Hill spectral optimization.
+
+  This has the same search and objective semantics as
+  :func:`select_sergio_spectral_subset`, but evaluates all missing candidate
+  additions or swaps at a search step together.  ``evaluation_batch_size``
+  optionally chunks those candidates to limit peak memory.  The original
+  selector remains available for bit-for-bit/reference comparisons.
+  """
+  states = np.asarray(mr_state)
+  n_states = states.shape[0]
+  assert states.ndim == 2 and 2 <= subset_size <= n_states
+  if evaluation_batch_size is not None:
+    assert evaluation_batch_size >= 1
+  rng = np.random.default_rng(seed)
+
+  full_raw = sergio_dag_hill_forward(states, dag, decays=decays)
+  _, full_metrics = sergio_spectral_metrics(full_raw)
+  reference_trace = full_metrics["trace"]
+  scale = np.std(full_raw, axis=0)
+  scale[scale < 1e-12] = 1.0
+  scaled_response = full_raw / scale
+  score_cache = {}
+
+  def evaluate_many(keys: list[tuple[int, ...]]) -> np.ndarray:
+    missing = [key for key in keys if key not in score_cache]
+    if missing:
+      chunk_size = evaluation_batch_size or len(missing)
+      for start in range(0, len(missing), chunk_size):
+        chunk = missing[start : start + chunk_size]
+        batch_states = np.stack([states[list(key)] for key in chunk], axis=0)
+        batch_raw = sergio_dag_hill_forward_batched(
+            batch_states, dag, decays=decays)
+        batch_scores = sergio_spectral_scores_batched(
+            batch_raw,
+            reference_trace=reference_trace,
+            variance_weight=variance_weight,
+        )
+        for key, score in zip(chunk, batch_scores):
+          score_cache[key] = float(score)
+    return np.asarray([score_cache[key] for key in keys], dtype=np.float64)
+
+  def evaluate_one(indices: list[int]) -> float:
+    key = tuple(sorted(indices))
+    return float(evaluate_many([key])[0])
+
+  best_indices = None
+  best_score = float("-inf")
+  best_metrics = None
+  restart_diagnostics = []
+  total_swap_evaluations = 0
+
+  for restart in range(n_restarts):
+    first = int(rng.integers(n_states))
+    distances = np.linalg.norm(scaled_response - scaled_response[first], axis=1)
+    distances[first] = -np.inf
+    second = int(np.argmax(distances))
+    selected = [first, second]
+    greedy_scores = [evaluate_one(selected)]
+
+    while len(selected) < subset_size:
+      selected_set = set(selected)
+      candidates = [i for i in range(n_states) if i not in selected_set]
+      candidate_keys = [tuple(sorted(selected + [candidate])) for candidate in candidates]
+      candidate_scores = evaluate_many(candidate_keys)
+      choice = int(np.argmax(candidate_scores))
+      selected.append(candidates[choice])
+      greedy_scores.append(float(candidate_scores[choice]))
+
+    swap_improvements = []
+    for _ in range(swap_passes):
+      selected_set = set(selected)
+      unselected = [i for i in range(n_states) if i not in selected_set]
+      current_score = evaluate_one(selected)
+      swap_pairs = [(out, inc) for out in selected for inc in unselected]
+      swap_keys = [
+          tuple(sorted(inc if value == out else value for value in selected))
+          for out, inc in swap_pairs
+      ]
+      total_swap_evaluations += len(swap_keys)
+      swap_scores = evaluate_many(swap_keys)
+
+      improving_swap = None
+      improving_score = current_score
+      # Keep the original nested-loop order and strict improvement rule so
+      # ties resolve identically to select_sergio_spectral_subset.
+      for (out, inc), trial_score in zip(swap_pairs, swap_scores):
+        if trial_score > improving_score + 1e-12:
+          improving_score = float(trial_score)
+          improving_swap = (out, inc)
+
+      if improving_swap is None:
+        break
+      out, inc = improving_swap
+      selected[selected.index(out)] = inc
+      swap_improvements.append(float(improving_score - current_score))
+
+    final_key = tuple(sorted(selected))
+    score = float(evaluate_many([final_key])[0])
+    final_raw = sergio_dag_hill_forward(states[list(final_key)], dag, decays=decays)
+    _, metrics = sergio_spectral_metrics(
+        final_raw,
+        reference_trace=reference_trace,
+        variance_weight=variance_weight,
+    )
+    restart_diagnostics.append({
+        "restart": restart,
+        "initial_pair": [first, second],
+        "greedy_scores": greedy_scores,
+        "swap_improvements": swap_improvements,
+        "final_score": score,
+        "final_indices": list(final_key),
+    })
+    if score > best_score:
+      best_score = score
+      best_indices = list(final_key)
+      best_metrics = metrics
+
+  assert best_indices is not None and best_metrics is not None
+  diagnostics = {
+      "n_states": n_states,
+      "subset_size": subset_size,
+      "n_restarts": n_restarts,
+      "swap_passes": swap_passes,
+      "variance_weight": variance_weight,
+      "evaluation_batch_size": evaluation_batch_size,
+      "n_surrogate_evaluations": len(score_cache),
       "n_swap_evaluations": total_swap_evaluations,
       "candidate_metrics": full_metrics,
       "restart_diagnostics": restart_diagnostics,

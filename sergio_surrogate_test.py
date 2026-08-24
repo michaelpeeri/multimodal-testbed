@@ -27,7 +27,9 @@ from synthetic_data import (
     make_synthetic_data6,
     sample_sergio_mr_states,
     select_sergio_spectral_subset,
+    select_sergio_spectral_subset_vectorized,
     sergio_dag_hill_forward,
+    sergio_dag_hill_forward_batched,
     sergio_spectral_metrics,
 )
 
@@ -64,6 +66,28 @@ def _clean_sergio_output(
   return x[order]
 
 
+def _compare_selection_to_sergio(
+    states: np.ndarray,
+    selected_indices: list[int],
+    dag,
+    grn_path: str,
+    mr_ids: list[int],
+    decays: float,
+    seed: int,
+) -> dict:
+  """Compare one selected subset's surrogate output against full SERGIO."""
+  selected_states = states[selected_indices]
+  selected_raw = sergio_dag_hill_forward(selected_states, dag, decays=decays)
+  selected_sergio_log = _clean_sergio_output(
+      selected_states, grn_path, mr_ids, decays, seed)
+  selected_surrogate_log = np.log1p(np.maximum(selected_raw, 0.0))
+  error = np.abs(selected_sergio_log - selected_surrogate_log)
+  return {
+      "rmse": float(np.sqrt(np.mean(np.square(error)))),
+      "max_abs_error": float(error.max()),
+  }
+
+
 def main() -> None:
   parser = argparse.ArgumentParser(description=__doc__)
   parser.add_argument(
@@ -79,10 +103,15 @@ def main() -> None:
   parser.add_argument("--n-restarts", type=int, default=8)
   parser.add_argument("--swap-passes", type=int, default=10)
   parser.add_argument("--variance-weight", type=float, default=0.05)
+  parser.add_argument(
+      "--compare-vectorized", action="store_true",
+      help="also run the batched selector and compare its selection with SERGIO",
+  )
   parser.add_argument("--skip-sergio", action="store_true")
   args = parser.parse_args()
 
   with tempfile.TemporaryDirectory(prefix="sergio_surrogate_test_") as temp_dir:
+    print(f'-- generate_sergio_grn_from_reference() --')
     grn_path = str(Path(temp_dir) / "targets.csv")
     _, mr_ids, _ = generate_sergio_grn_from_reference(
         reference_grn_path=args.reference_grn,
@@ -93,15 +122,30 @@ def main() -> None:
         seed=args.seed,
     )
     dag = load_sergio_dag(grn_path, shared_coop_state=0.0, mr_gene_ids=mr_ids)
+    print(f'-- sample_sergio_mr_states() --')
     states = sample_sergio_mr_states(
         args.n_states, len(mr_ids), args.mr_low, args.mr_high,
         args.design, args.seed)
 
+    print(f'-- sergio_dag_hill_forward() --')
     raw = sergio_dag_hill_forward(states, dag, decays=args.decays)
+    print(f'-- sergio_spectral_metrics() --')
     _, full_metrics = sergio_spectral_metrics(raw)
+    print(f'-- select_sergio_spectral_subset() --')
     selected, selected_metrics, _ = select_sergio_spectral_subset(
         states, dag, args.decays, args.subset_size, args.n_restarts,
         args.swap_passes, args.seed + 1, args.variance_weight)
+    vectorized_selected = None
+    vectorized_metrics = None
+    if args.compare_vectorized:
+      print(f'-- select_sergio_spectral_subset_vectorized() --')
+      vectorized_selected, vectorized_metrics, _ = \
+          select_sergio_spectral_subset_vectorized(
+              states, dag, args.decays, args.subset_size, args.n_restarts,
+              args.swap_passes, args.seed + 1, args.variance_weight)
+      print(f'-- sergio_dag_hill_forward_batched() --')
+      vectorized_raw = sergio_dag_hill_forward_batched(
+          states[None, ...], dag, decays=args.decays)[0]
 
     result = {
         "n_genes": dag.n_genes,
@@ -112,6 +156,16 @@ def main() -> None:
         "selected_indices": selected,
         "selected_surrogate_spectrum": selected_metrics,
     }
+    if args.compare_vectorized:
+      result["vectorized_selected_indices"] = vectorized_selected
+      result["vectorized_surrogate_spectrum"] = vectorized_metrics
+      result["vectorized_forward_comparison"] = {
+          "max_abs_difference": float(np.max(np.abs(vectorized_raw - raw))),
+      }
+      result["selector_comparison"] = {
+          "same_indices": selected == vectorized_selected,
+          "n_differing_indices": len(set(selected) ^ set(vectorized_selected)),
+      }
 
     if not args.skip_sergio:
       try:
@@ -124,17 +178,13 @@ def main() -> None:
             "max_abs_error": float(full_error.max()),
         }
 
-        selected_states = states[selected]
-        selected_raw = sergio_dag_hill_forward(
-            selected_states, dag, decays=args.decays)
-        selected_sergio_log = _clean_sergio_output(
-            selected_states, grn_path, list(dag.mr_ids), args.decays, args.seed)
-        selected_surrogate_log = np.log1p(np.maximum(selected_raw, 0.0))
-        selected_error = np.abs(selected_sergio_log - selected_surrogate_log)
-        result["selected_sergio_comparison"] = {
-            "rmse": float(np.sqrt(np.mean(np.square(selected_error)))),
-            "max_abs_error": float(selected_error.max()),
-        }
+        result["selected_sergio_comparison"] = _compare_selection_to_sergio(
+            states, selected, dag, grn_path, list(dag.mr_ids), args.decays,
+            args.seed)
+        if args.compare_vectorized:
+          result["vectorized_sergio_comparison"] = _compare_selection_to_sergio(
+              states, vectorized_selected, dag, grn_path, list(dag.mr_ids),
+              args.decays, args.seed)
       except ImportError as exc:
         result["sergio_error"] = str(exc)
 

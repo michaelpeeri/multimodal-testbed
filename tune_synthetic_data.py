@@ -645,6 +645,8 @@ import torch
 from tqdm.auto import tqdm
 
 from synthetic_data import (
+    add_pca_derived_stats,
+    add_nonzero_frac_stat,
     compute_summary_stats,
     generate_sergio_grn_from_reference,
     load_reference_h5ad,
@@ -1000,11 +1002,13 @@ def _add_pca_pc2_9_key(
     scree plot, ever actually matching. This key lets compute_stats_distance
     score that magnitude directly, orthogonal to the tail-evenness question
     pca_tail_participation_ratio asks. Called once per PCA family (raw and
-    standardized) at each of this module's two call sites (run()/run_trial())
-    -- see the 20260816 AGENTS.md entry for why both families exist."""
-    pca = stats.get(src_key)
-    if pca is not None and len(pca) >= 9:
-        stats[dst_key] = np.asarray(pca[1:9], dtype=np.float64)
+    standardized and size-normalized-standardized families) at each of this
+    module's two call sites (run()/run_trial()) -- see the 20260816/20260820
+    AGENTS.md entries for why all families exist."""
+    # Compatibility shim for existing callers and older target pickles. New
+    # compute_summary_stats() results already contain this key; the shared
+    # helper simply re-derives it from the same stored PCA vector when needed.
+    add_pca_derived_stats(stats, src_key=src_key, dst_key=dst_key)
 
 
 def _add_nonzero_frac_key(
@@ -1041,9 +1045,7 @@ def _add_nonzero_frac_key(
     nonzero_frac instead of zero_frac, matching the pca_standardized_*/
     gene_corr_abs_normalized_* precedent of retargeting a weight at a
     corrected metric rather than the original raw one)."""
-    val = stats.get(src_key)
-    if val is not None:
-        stats[dst_key] = 1.0 - float(val)
+    add_nonzero_frac_stat(stats, src_key=src_key, dst_key=dst_key)
 
 
 def _jsonify_stats(stats: dict) -> dict:

@@ -1,0 +1,78 @@
+{
+  "_comment_pilot": "Minimum viable pilot: three candidate/selection arms, three paired replicates, and clean 60-cell SERGIO runs. This is for construction and loading-stability screening, not final target-distance tuning.",
+  "base_config": "synthetic_tuning_20260821.00/tuned_synthetic_config.20260821.00.json",
+  "base_overrides": {
+    "stats_n_pca_components": 20,
+    "stats_n_structure_genes": 500,
+    "stats_percentiles": [5, 25, 50, 75, 95],
+    "weights": {
+      "log_lib_size_mean": 3.0,
+      "log_lib_size_std": 3.0,
+      "log_lib_size_p5": 3.0,
+      "log_lib_size_p25": 3.0,
+      "log_lib_size_p50": 3.0,
+      "log_lib_size_p75": 3.0,
+      "log_lib_size_p95": 3.0,
+      "gene_mean_mean": 1.0,
+      "gene_mean_std": 1.0,
+      "gene_var_mean": 1.0,
+      "gene_var_std": 1.0,
+      "gene_corr_abs_normalized_mean": 3.0,
+      "gene_corr_abs_normalized_p50": 3.0,
+      "gene_corr_abs_normalized_std": 3.0,
+      "gene_corr_abs_normalized_p90": 3.0,
+      "dropout_curve_zero_frac": 3.0,
+      "nonzero_frac": 3.0,
+      "pca_size_normalized_standardized_pc2_9_explained_variance_ratio": 6.0
+    }
+  },
+  "baseline": "iid_random",
+  "arms": [
+    {
+      "name": "iid_random",
+      "candidate_method": "iid",
+      "candidate_params": {
+        "n_candidate_states": 64
+      },
+      "selection_method": "random",
+      "selection_params": {
+        "n_selected_states": 15
+      }
+    },
+    {
+      "name": "sobol_random",
+      "candidate_method": "sobol",
+      "candidate_params": {
+        "n_candidate_states": 64
+      },
+      "selection_method": "random",
+      "selection_params": {
+        "n_selected_states": 15
+      }
+    },
+    {
+      "name": "sobol_spectral",
+      "candidate_method": "sobol",
+      "candidate_params": {
+        "n_candidate_states": 64
+      },
+      "selection_method": "spectral",
+      "selection_params": {
+        "n_selected_states": 15,
+        "n_restarts": 1,
+        "swap_passes": 0,
+        "variance_weight": 0.05
+      }
+    }
+  ],
+  "n_replicates": 12,
+  "seed_base": 0,
+  "include_sergio": true,
+  "clean_simulation": false,
+  "n_cells": 200,
+  "mr_jitter_std": 0.0,
+  "store_candidate_pools": false,
+  "verbose": true,
+  "output": "mr_state_comparison.pickle",
+  "plot": "mr_state_comparison.png"
+}

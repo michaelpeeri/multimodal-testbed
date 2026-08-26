@@ -17,6 +17,7 @@ import torch.optim as optim
 import torch.autograd as autograd
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
+from tqdm import tqdm
 
 # Synthetic data for gene expression imputation
 def make_synthetic_data(
@@ -1107,7 +1108,7 @@ def select_sergio_spectral_subset(
   restart_diagnostics = []
   total_swap_evaluations = 0
 
-  for restart in range(n_restarts):
+  for restart in tqdm(range(n_restarts)):
     first = int(rng.integers(n_states))
     distances = np.linalg.norm(scaled_response - scaled_response[first], axis=1)
     distances[first] = -np.inf
@@ -3568,6 +3569,59 @@ def pca_participation_ratio(ratio: np.ndarray, skip_leading: int = 1) -> float:
   return float((tail.sum() ** 2) / np.sum(tail ** 2))
 
 
+def add_pca_derived_stats(
+    stats: dict,
+    src_key: str | None = None,
+    dst_key: str | None = None,
+    start: int = 1,
+    stop: int = 9,
+) -> None:
+  """Add canonical PCA slice statistics to a summary-statistics dict.
+
+  The derived PC2--PC9 arrays are kept here, next to the PCA calculations in
+  :func:`compute_summary_stats`, so every caller uses exactly the same
+  convention.  ``src_key``/``dst_key`` can be supplied for compatibility with
+  callers that want to augment an older saved stats pickle one PCA family at a
+  time.  With neither supplied, all currently supported PCA families are
+  augmented.
+
+  This mutates ``stats`` in place and is a no-op when a source vector is absent
+  or shorter than ``stop``.  It deliberately only rearranges an already
+  computed explained-variance vector; it does not run another PCA.
+  """
+  if (src_key is None) != (dst_key is None):
+    raise ValueError("src_key and dst_key must be supplied together")
+  families = (
+      (src_key, dst_key),
+  ) if src_key is not None else (
+      ("pca_explained_variance_ratio", "pca_pc2_9_explained_variance_ratio"),
+      ("pca_standardized_explained_variance_ratio",
+       "pca_standardized_pc2_9_explained_variance_ratio"),
+      ("pca_size_normalized_standardized_explained_variance_ratio",
+       "pca_size_normalized_standardized_pc2_9_explained_variance_ratio"),
+  )
+  for source, destination in families:
+    ratio = stats.get(source)
+    if ratio is not None and len(ratio) >= stop:
+      stats[destination] = np.asarray(ratio[start:stop], dtype=np.float64)
+
+
+def add_nonzero_frac_stat(
+    stats: dict,
+    src_key: str = "zero_frac",
+    dst_key: str = "nonzero_frac",
+) -> None:
+  """Add the nonzero complement of an existing zero-fraction statistic.
+
+  This is a derived statistic rather than a second measurement.  Keeping the
+  helper here lets tuning, comparison, and legacy target-pickle loading use
+  the same convention.
+  """
+  value = stats.get(src_key)
+  if value is not None:
+    stats[dst_key] = 1.0 - float(value)
+
+
 def _split_half_pca_stability(
     X: np.ndarray,
     n_components: int,
@@ -3711,6 +3765,8 @@ def compute_summary_stats(
         a degenerate/collapsed draw that log_lib_size's percentiles only
         catch incidentally.
       zero_frac: overall fraction of observed entries that are exactly 0.
+      nonzero_frac: complement of zero_frac, representing the fraction of
+        observed entries that carry nonzero expression.
       dropout_curve_bin_edges: bin edges (over per-gene mean log1p
         expression) used for the binned dropout curve below.
       dropout_curve_zero_frac: mean per-gene zero-fraction within each bin
@@ -3743,6 +3799,10 @@ def compute_summary_stats(
         in tension as tuning objectives).
       pca_standardized_tail_participation_ratio: pca_tail_participation_ratio's
         counterpart computed from pca_standardized_explained_variance_ratio.
+      pca_pc2_9_explained_variance_ratio and corresponding standardized and
+        size-normalized-standardized variants: the PC2..PC9 slices of their
+        respective explained-variance vectors. These are derived here from
+        the already-computed PCA vectors; no second PCA is run.
       gene_corr_abs_{mean,std,p50,p90}: distribution summary of |pairwise
         gene-gene Pearson correlation| (upper triangle, off-diagonal),
         computed on the same up-to-n_structure_genes genes as PCA above.
@@ -3865,6 +3925,7 @@ def compute_summary_stats(
   stats["zero_frac"] = (
       float(np.sum((X_np == 0) & obs_mask) / n_obs) if n_obs > 0 else float('nan')
   )
+  add_nonzero_frac_stat(stats)
 
   # --- binned dropout curve: per-gene zero-frac vs per-gene mean expression ---
   gene_obs_count = obs_mask.sum(axis=0)
@@ -4065,6 +4126,11 @@ def compute_summary_stats(
     stats["pca_size_normalized_standardized_split_half_spectrum_similarity"] = float("nan")
   stats["pca_size_normalized_standardized_tail_participation_ratio"] = pca_participation_ratio(
       stats["pca_size_normalized_standardized_explained_variance_ratio"])
+
+  # Keep all PCA-derived vector slices in the common summary-statistics
+  # function.  Tuning and comparison callers can therefore use identical
+  # keys without implementing their own PCA conventions.
+  add_pca_derived_stats(stats)
 
   return stats
 

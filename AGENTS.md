@@ -1,6 +1,6 @@
 # VAE Gene Expression Imputation
 
-Single-file PyTorch research script (`vae-test.py`). No tests, no package structure. Modules not installable in this environment, so tests beyond syntax checking should not be run. Source control is also managed manually by user.
+Several single-file research scripts, with locally shared code. No tests, no package structure. Modules not installable in this environment, so tests beyond syntax checking should not be run. Source control is also managed manually by user. No relevant files are outside /home/michael/src/vae-test.
 
 ## Known Issues
 - `generate_sergio_grn_from_reference` (synthetic_data.py) gained four new

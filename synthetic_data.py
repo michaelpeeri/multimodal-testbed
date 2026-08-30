@@ -3695,6 +3695,97 @@ def _split_half_pca_stability(
   return subspace_stability, spectrum_similarity
 
 
+def standardized_split_half_subspace_stability_batched(
+    X: np.ndarray,
+    n_components: int,
+    n_structure_genes: int | None = 500,
+    seed: int | None = 0,
+) -> np.ndarray:
+  """Compute standardized split-half subspace stability for a batch.
+
+  ``X`` must be a batch of log1p-scale matrices with shape
+  ``(n_batches, n_cells, n_genes)``. This intentionally mirrors the
+  standardized PCA branch of :func:`compute_summary_stats`, but computes only
+  ``pca_standardized_split_half_subspace_stability``. The same gene subset and
+  cell split are used for every batch item, making the result suitable for
+  common-random-number comparisons during optimization.
+
+  The batched SVDs avoid entering Python once per candidate. Invalid or
+  zero-variance candidates receive NaN, matching the scalar helper's
+  degenerate-input behavior.
+  """
+  matrix = np.asarray(X, dtype=np.float64)
+  if matrix.ndim != 3:
+    raise ValueError(
+        f"expected a 3D batch (n_batches, n_cells, n_genes), got {matrix.shape}"
+    )
+  n_batches, n_cells, n_genes = matrix.shape
+  scores = np.full(n_batches, np.nan, dtype=np.float64)
+  if n_batches == 0 or n_cells < 4 or n_genes < 1 or int(n_components) < 1:
+    return scores
+
+  # Match compute_summary_stats' NaN-aware per-gene mean imputation.
+  observed = ~np.isnan(matrix)
+  observed_values = np.where(observed, matrix, 0.0)
+  observed_count = observed.sum(axis=1)
+  with np.errstate(invalid="ignore", divide="ignore"):
+    gene_mean = observed_values.sum(axis=1) / observed_count
+  gene_mean = np.where(observed_count > 0, gene_mean, 0.0)
+  filled = np.where(observed, matrix, gene_mean[:, None, :])
+
+  gene_rng = np.random.default_rng(seed)
+  if n_structure_genes is not None and n_genes > n_structure_genes:
+    gene_idx = np.sort(
+        gene_rng.choice(n_genes, size=int(n_structure_genes), replace=False)
+    )
+  else:
+    gene_idx = np.arange(n_genes)
+  structured = filled[:, :, gene_idx]
+  n_struct_genes = structured.shape[2]
+
+  half = n_cells // 2
+  k = min(int(n_components), half, n_struct_genes)
+  if k < 1:
+    return scores
+
+  structured_mean = structured.mean(axis=1, keepdims=True)
+  gene_std = np.clip(structured.std(axis=1, keepdims=True), 1e-6, None)
+  standardized = (structured - structured_mean) / gene_std
+
+  split_seed = None if seed is None else int(seed) + 1
+  split_rng = np.random.default_rng(split_seed)
+  order = split_rng.permutation(n_cells)[: 2 * half]
+  left = standardized[:, order[:half], :]
+  right = standardized[:, order[half:], :]
+  left -= left.mean(axis=1, keepdims=True)
+  right -= right.mean(axis=1, keepdims=True)
+
+  left_vectors, left_singular, left_basis = np.linalg.svd(
+      left, full_matrices=False, compute_uv=True
+  )
+  right_vectors, right_singular, right_basis = np.linalg.svd(
+      right, full_matrices=False, compute_uv=True
+  )
+  del left_vectors, right_vectors
+
+  left_total = np.square(left_singular).sum(axis=1)
+  right_total = np.square(right_singular).sum(axis=1)
+  valid = (
+      np.isfinite(left_total)
+      & np.isfinite(right_total)
+      & (left_total > 0.0)
+      & (right_total > 0.0)
+  )
+
+  left_basis = np.swapaxes(left_basis[:, :k, :], 1, 2)
+  right_basis = np.swapaxes(right_basis[:, :k, :], 1, 2)
+  overlap = np.einsum("bsk,bsl->bkl", left_basis, right_basis)
+  principal_cosines = np.linalg.svd(overlap, compute_uv=False)
+  scores[valid] = np.mean(np.square(principal_cosines[valid]), axis=1)
+  scores[~np.isfinite(scores)] = np.nan
+  return scores
+
+
 def compute_summary_stats(
     X:                  torch.Tensor,
     n_pca_components:   int      = 10,

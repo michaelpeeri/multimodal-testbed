@@ -1,11 +1,42 @@
 import json
+import hashlib
+import math
 import os
+import pickle
+from pathlib import Path
+
 import numpy as np
 from synthetic_data import (
+    add_pca_derived_stats,
     generate_sergio_grn_from_reference, load_sergio_dag, sample_sergio_mr_states,
     sergio_dag_hill_forward_batched,
-    standardized_split_half_subspace_stability_batched,
+    _sample_cluster_sizes,
 )
+
+
+# OUTSTANDING ISSUES / LIMITATIONS
+# - The inner objective is a stochastic Hill surrogate, not full SERGIO. Its
+#   cell-level MR perturbation model is an approximation and needs calibration
+#   against independent full-SERGIO validation runs.
+# - Each run still uses one fixed GRN. Results do not establish robustness to
+#   GRN topology or parameter variation.
+# - MR columns are positional. Optimizer artifacts must be checked against the
+#   exact ordered MR list and GRN fingerprint before reuse.
+# - Cluster rows are exchangeable for the expression objective, but the search
+#   operators still carry row-position symmetry that can reduce efficiency.
+# - DE uses a target-free intrinsic program objective: cluster-level log-Hill
+#   response entropy/participation, a PC1-dominance penalty, and split-half
+#   stability. These are scale-free structural proxies; program amplitude,
+#   target-like expression statistics, modularity, and technical/noise fit are
+#   not guaranteed and require separate validation or outer tuning.
+# - GA retains the older target-aware PCA surrogate objective. Reference-PCA
+#   matching is intentionally excluded from DE because it can make MR states
+#   compensate for unresolved GRN/SERGIO or technical-stage behavior.
+# - DE/rand/1 mutation is fitness-independent, so DE replacement uses only
+#   rotating score replicates; it does not perform a diagnostic-only train
+#   evaluation. The final all-replicate score is validation, not a permanently
+#   untouched holdout.
+# - Generation checkpoints are opt-in and should be enabled for long runs.
 
 
 class MRStateGAOptimizer:
@@ -13,18 +44,20 @@ class MRStateGAOptimizer:
                                           choice                          offspring                              fitness
     The process is (n_candidates,n_mrs) ---------->  (n_clusters,n_mrs) -------------> (n_clusters*10,n_genes) -----------> (1,)
     The unit of selection is (n_clusters, n_mrs)
-    n_replicates: Independent split/subsampling seeds used to evaluate feature
-                   stability. Set ``replicate_grns`` in the config to request
-                   separate GRNs instead.
+    n_replicates: independent stochastic Hill-surrogate realizations used for
+                    rotating train/score evaluation in GA and score evaluation
+                    in DE. Set ``replicate_grns`` in the config to request
+                    separate GRNs instead.
     
     """
     def __init__(
         self,
         base_cfg: str,
         n_population: int = 200,
-        n_replicates: int = 1,
+        n_replicates: int = 4,
         n_clusters: int = 15,
         seed: int = 0,
+        objective_mode: str | None = None,
     ):
         with open(base_cfg, 'rt') as f:
             self.cfg = json.load(f)
@@ -40,6 +73,15 @@ class MRStateGAOptimizer:
         self.n_replicates = n_replicates
         self.n_clusters   = n_clusters
         self.seed = int(seed)
+        self.objective_mode = str(
+            objective_mode
+            if objective_mode is not None
+            else self.cfg.get('surrogate_objective', 'target_pca')
+        )
+        if self.objective_mode not in ('target_pca', 'intrinsic'):
+            raise ValueError(
+                "objective_mode must be 'target_pca' or 'intrinsic'"
+            )
         seed_sequence = np.random.SeedSequence(seed)
         init_seed, selection_seed, crossover_seed, mutation_seed = seed_sequence.spawn(4)
         self.initialization_rng = np.random.default_rng(init_seed)
@@ -66,6 +108,12 @@ class MRStateGAOptimizer:
             raise ValueError("mr_rate_high must be greater than mr_rate_low")
 
         self.decays = setting('decays', 0.8)
+        self.cluster_conc = float(setting('cluster_conc', 10.0))
+        self.min_cells_per_cluster = int(
+            base.get('min_cells_per_cluster', self.cfg.get('min_cells_per_cluster', 1))
+        )
+        if self.cluster_conc <= 0.0 or self.min_cells_per_cluster < 1:
+            raise ValueError('cluster_conc must be positive and min_cells_per_cluster must be positive')
         self.stats_n_pca_components = int(
             base.get('stats_n_pca_components', self.cfg.get('stats_n_pca_components', 20))
         )
@@ -78,24 +126,132 @@ class MRStateGAOptimizer:
         self.stats_seed = int(
             base.get('stats_seed', self.cfg.get('stats_seed', 42))
         )
-        default_repeats = max(
-            1,
-            int(round(float(base.get('n_cells', self.n_clusters * 20)) / self.n_clusters)),
+        self.surrogate_n_cells = int(
+            self.cfg.get(
+                'surrogate_n_cells',
+                base.get('n_cells', self.cfg.get('n_cells', self.n_clusters * 20)),
+            )
         )
-        self.surrogate_repeats = int(
-            self.cfg.get('surrogate_cells_per_cluster', default_repeats)
+        if self.surrogate_n_cells < max(4, self.n_clusters):
+            raise ValueError(
+                'surrogate_n_cells must be at least max(4, n_clusters)'
+            )
+        self.surrogate_mr_jitter_std = float(
+            self.cfg.get('surrogate_mr_jitter_std', 0.05)
         )
-        if self.surrogate_repeats < 1:
-            raise ValueError("surrogate_cells_per_cluster must be positive")
+        if not math.isfinite(self.surrogate_mr_jitter_std) or self.surrogate_mr_jitter_std < 0.0:
+            raise ValueError('surrogate_mr_jitter_std must be finite and non-negative')
+        self.surrogate_seed_base = int(self.cfg.get('surrogate_seed_base', 100_000))
+        self.surrogate_n_components = int(
+            self.cfg.get('surrogate_n_pca_components', self.stats_n_pca_components)
+        )
+        if self.surrogate_n_components < 1:
+            raise ValueError('surrogate_n_pca_components must be positive')
+        self.rank_tolerance = float(self.cfg.get('surrogate_rank_tolerance', 1e-6))
+        if not math.isfinite(self.rank_tolerance) or self.rank_tolerance <= 0.0:
+            raise ValueError('surrogate_rank_tolerance must be finite and positive')
+        self.validation_risk_weight = float(
+            self.cfg.get('surrogate_validation_risk_weight', 0.25)
+        )
+        if not math.isfinite(self.validation_risk_weight) or self.validation_risk_weight < 0.0:
+            raise ValueError(
+                'surrogate_validation_risk_weight must be finite and non-negative'
+            )
+        self.score_replicates_per_generation = int(
+            self.cfg.get('surrogate_score_replicates_per_generation', 2)
+        )
+        if self.score_replicates_per_generation < 1:
+            raise ValueError(
+                'surrogate_score_replicates_per_generation must be positive'
+            )
+        if self.score_replicates_per_generation > self.n_replicates:
+            raise ValueError(
+                'n_replicates must be at least surrogate_score_replicates_per_generation'
+            )
+        if (
+            self.objective_mode == 'target_pca'
+            and self.n_replicates <= self.score_replicates_per_generation
+        ):
+            raise ValueError(
+                'target_pca mode requires n_replicates to exceed '
+                'surrogate_score_replicates_per_generation'
+            )
+        self.canonicalize_cluster_rows = bool(
+            self.cfg.get('canonicalize_cluster_rows', True)
+        )
+        self.target_objective_weights = {
+            'shape': float(self.cfg.get('surrogate_shape_weight', 1.0)),
+            'tail': float(self.cfg.get('surrogate_tail_weight', 0.5)),
+            'stability': float(self.cfg.get('surrogate_stability_weight', 1.0)),
+            'rank': float(self.cfg.get('surrogate_rank_weight', 0.5)),
+            'degeneracy': float(self.cfg.get('surrogate_degeneracy_weight', 2.0)),
+        }
+        self.intrinsic_objective_weights = {
+            'entropy': float(self.cfg.get('surrogate_program_entropy_weight', 1.0)),
+            'participation': float(
+                self.cfg.get('surrogate_program_participation_weight', 1.0)
+            ),
+            'stability': float(
+                self.cfg.get('surrogate_program_stability_weight', 1.0)
+            ),
+            'pc1': float(self.cfg.get('surrogate_program_pc1_weight', 2.0)),
+        }
+        self.program_max_pc1_fraction = float(
+            self.cfg.get('surrogate_program_max_pc1_fraction', 0.25)
+        )
+        if any(
+            not math.isfinite(value) or value < 0.0
+            for value in (
+                list(self.target_objective_weights.values())
+                + list(self.intrinsic_objective_weights.values())
+            )
+        ):
+            raise ValueError('surrogate objective weights must be finite and non-negative')
+        if not 0.0 < self.program_max_pc1_fraction < 1.0:
+            raise ValueError(
+                'surrogate_program_max_pc1_fraction must be in (0, 1)'
+            )
         self.selection_temperature = float(self.cfg.get('selection_temperature', 0.05))
         if self.selection_temperature <= 0:
             raise ValueError("selection_temperature must be positive")
         self.replicate_grns = bool(self.cfg.get('replicate_grns', False))
-        self.fitness_batch_size = self.cfg.get('fitness_batch_size')
+        self.fitness_batch_size = self.cfg.get('fitness_batch_size', 16)
         if self.fitness_batch_size is not None:
             self.fitness_batch_size = int(self.fitness_batch_size)
             if self.fitness_batch_size < 1:
                 raise ValueError('fitness_batch_size must be positive')
+        target_path = base.get('target_stats_path', self.cfg.get('target_stats_path'))
+        self.target_stats = None
+        if self.objective_mode == 'target_pca' and target_path:
+            with open(target_path, 'rb') as f:
+                self.target_stats = pickle.load(f)
+            add_pca_derived_stats(self.target_stats)
+        target_key = (
+            self.cfg.get(
+                'surrogate_target_pca_key',
+                'pca_size_normalized_standardized_explained_variance_ratio',
+            )
+            if self.objective_mode == 'target_pca'
+            else None
+        )
+        target_ratio = None if self.target_stats is None else self.target_stats.get(target_key)
+        if target_ratio is not None:
+            target_ratio = np.asarray(target_ratio, dtype=np.float64)
+            target_ratio = target_ratio[np.isfinite(target_ratio)]
+            if target_ratio.size < 3:
+                raise ValueError(
+                    f'target PCA key {target_key!r} must contain at least 3 finite values'
+                )
+        self.target_pca_ratio = target_ratio
+        self.target_pca_key = target_key
+        self.target_tail_participation = None
+        if target_ratio is not None:
+            tail = target_ratio[1:]
+            if tail.size >= 2 and np.any(tail > 0.0):
+                self.target_tail_participation = float(
+                    (tail.sum() ** 2) / np.sum(tail ** 2)
+                )
+        self._surrogate_replicates = []
         self.last_eval_diagnostics = {}
         self.last_operator_diagnostics = {}
         self.last_crossover_slots = np.array([], dtype=int)
@@ -176,13 +332,110 @@ class MRStateGAOptimizer:
                     )
 
         # A single fixed DAG avoids changing the MR universe between
-        # replicate evaluations. Replicates still differ through the
-        # statistics split/subsampling seed; separate DAGs are opt-in and are
+        # surrogate replicate evaluations. Separate DAGs are opt-in and are
         # accepted only when their ordered MR universes match exactly.
         dags = dags * self.n_replicates if not self.replicate_grns else dags
                     
         self.grns = grns
         self.dags = dags
+        self.grn_metadata = []
+        for seed, temp_path, mr_ids, gene_id_to_symbol in grns:
+            digest = hashlib.sha256()
+            with open(temp_path, 'rb') as f:
+                for block in iter(lambda: f.read(1 << 20), b''):
+                    digest.update(block)
+            self.grn_metadata.append({
+                'seed': int(seed),
+                'sha256': digest.hexdigest(),
+                'mr_ids': list(mr_ids),
+                'gene_id_to_symbol': gene_id_to_symbol,
+            })
+        self._build_surrogate_replicates()
+
+    def _build_surrogate_replicates(self) -> None:
+        """Precompute common-random-number stochastic surrogate replicates.
+
+        A replicate is a fixed cell-cluster assignment, cell-level MR jitter
+        field, and PCA split.  Every candidate evaluated on that replicate
+        sees exactly the same random realization; different replicate IDs are
+        independent.  This keeps comparisons paired while preventing the
+        optimizer from treating repeated copies of one deterministic cluster
+        response as 600 independent cells.
+        """
+        if not getattr(self, 'grns', None):
+            raise RuntimeError('generate_tree() must create a GRN first')
+        base = self.cfg.get('_meta', self.cfg)
+        n_mrs = len(self.grns[0][2])
+        count_rng = np.random.default_rng(self.surrogate_seed_base)
+        counts = _sample_cluster_sizes(
+            self.surrogate_n_cells,
+            self.n_clusters,
+            self.cluster_conc,
+            self.min_cells_per_cluster,
+            count_rng,
+        ).astype(np.int64)
+
+        gene_rng = np.random.default_rng(self.stats_seed)
+        n_genes = int(base.get('n_genes', self.cfg.get('n_genes', 800)))
+        n_structure_genes = self.stats_n_structure_genes
+        if n_structure_genes is None or n_genes <= int(n_structure_genes):
+            gene_idx = np.arange(n_genes, dtype=np.int64)
+        else:
+            gene_idx = np.sort(gene_rng.choice(
+                n_genes, size=int(n_structure_genes), replace=False
+            ))
+        half = self.surrogate_n_cells // 2
+        k = min(
+            self.surrogate_n_components,
+            half - 1,
+            int(gene_idx.size),
+        )
+        if k < 1:
+            raise ValueError('surrogate dimensions do not permit PCA components')
+        self.surrogate_gene_idx = gene_idx
+        self.surrogate_k = int(k)
+        self._surrogate_replicates = []
+        span = self.mr_rate_high - self.mr_rate_low
+        for replicate in range(self.n_replicates):
+            rng = np.random.default_rng(self.surrogate_seed_base + replicate)
+            labels = np.repeat(np.arange(self.n_clusters), counts)
+            rng.shuffle(labels)
+            order = rng.permutation(self.surrogate_n_cells)[:2 * half]
+            self._surrogate_replicates.append({
+                'replicate': int(replicate),
+                'seed': int(self.surrogate_seed_base + replicate),
+                'cluster_labels': labels.astype(np.int64),
+                'mr_noise': rng.normal(0.0, 1.0, size=(self.surrogate_n_cells, n_mrs)),
+                'split_order': order.astype(np.int64),
+                'mr_jitter_scale': float(self.surrogate_mr_jitter_std * span),
+            })
+
+    def surrogate_metadata(self) -> dict:
+        """Return the stochastic surrogate contract stored with results."""
+        objective_weights = (
+            self.intrinsic_objective_weights
+            if self.objective_mode == 'intrinsic'
+            else self.target_objective_weights
+        )
+        return {
+            'objective_mode': self.objective_mode,
+            'n_replicates': int(self.n_replicates),
+            'seed_base': int(self.surrogate_seed_base),
+            'score_replicates_per_generation': int(self.score_replicates_per_generation),
+            'n_cells': int(self.surrogate_n_cells),
+            'cluster_conc': float(self.cluster_conc),
+            'min_cells_per_cluster': int(self.min_cells_per_cluster),
+            'n_components': int(self.surrogate_k),
+            'n_structure_genes': int(self.surrogate_gene_idx.size),
+            'mr_jitter_std': float(self.surrogate_mr_jitter_std),
+            'objective_weights': dict(objective_weights),
+            'program_max_pc1_fraction': float(self.program_max_pc1_fraction),
+            'target_pca_key': self.target_pca_key,
+            'target_pca_length': (
+                int(self.target_pca_ratio.size)
+                if self.target_pca_ratio is not None else None
+            ),
+        }
 
     def initialize_population(self) -> np.ndarray:
         """
@@ -202,7 +455,19 @@ class MRStateGAOptimizer:
                 seed=int(self.initialization_rng.integers(0, 2**32 - 1)),
             )
             candidates.append(new_candidates)
-        return np.stack(candidates)
+        population = np.stack(candidates)
+        return self.canonicalize_rows(population)
+
+    def canonicalize_rows(self, candidates: np.ndarray) -> np.ndarray:
+        """Canonicalize exchangeable cluster rows for permutation-invariant scoring."""
+        values = np.asarray(candidates, dtype=np.float32)
+        if not self.canonicalize_cluster_rows:
+            return values
+        output = values.copy()
+        for i in range(output.shape[0]):
+            keys = tuple(output[i, :, column] for column in range(output.shape[2] - 1, -1, -1))
+            output[i] = output[i][np.lexsort(keys)]
+        return output
 
     def population_diagnostics(self, candidates: np.ndarray) -> dict:
         """Return inexpensive diagnostics for population collapse and bounds."""
@@ -303,10 +568,276 @@ class MRStateGAOptimizer:
         }
 
 
-    def eval_candidates(self, candidates:np.ndarray):
-        """
-        """
+    def _evaluate_surrogate_batch(
+        self, candidates: np.ndarray, replicate_id: int
+    ) -> tuple[np.ndarray, dict]:
+        """Evaluate one candidate batch on one stochastic Hill replicate."""
+        replicate = self._surrogate_replicates[replicate_id]
+        labels = replicate['cluster_labels']
+        cell_states = candidates[:, labels, :].astype(np.float64, copy=False)
+        if replicate['mr_jitter_scale']:
+            cell_states = cell_states + replicate['mr_jitter_scale'] * replicate['mr_noise'][None, :, :]
+            cell_states = np.clip(
+                cell_states, self.mr_rate_low, self.mr_rate_high
+            )
 
+        raw = np.asarray(
+            sergio_dag_hill_forward_batched(
+                cell_states, self.dags[replicate_id], decays=self.decays
+            ),
+            dtype=np.float64,
+        )
+        if not np.isfinite(raw).all():
+            raise ValueError('stochastic Hill surrogate produced non-finite values')
+        raw = np.maximum(raw, 0.0)
+
+        program_metrics = {}
+        if self.objective_mode == 'intrinsic':
+            # Measure the programs induced by the cluster states directly.
+            # This deliberately does not use reference statistics: a
+            # high-entropy, high-participation response that survives
+            # replicate perturbations is the intrinsic DE objective, while
+            # target matching belongs downstream.
+            raw_log = np.log1p(raw)
+            program_expression = raw_log[:, :, self.surrogate_gene_idx]
+            cluster_programs = np.stack([
+                program_expression[:, labels == cluster, :].mean(axis=1)
+                for cluster in range(self.n_clusters)
+            ], axis=1)
+            cluster_programs -= cluster_programs.mean(axis=1, keepdims=True)
+            _, program_singular, _ = np.linalg.svd(
+                cluster_programs, full_matrices=False, compute_uv=True
+            )
+            program_k = min(
+                self.n_clusters - 1,
+                int(self.surrogate_gene_idx.size),
+                program_singular.shape[1],
+            )
+            program_variance = np.square(program_singular[:, :program_k])
+            program_total = program_variance.sum(axis=1)
+            program_ratios = np.divide(
+                program_variance,
+                np.maximum(program_total[:, None], 1e-12),
+            )
+            positive_program_ratios = program_ratios > 0.0
+            program_entropy = np.divide(
+                -np.sum(
+                    np.where(
+                        positive_program_ratios,
+                        program_ratios * np.log(np.maximum(program_ratios, 1e-12)),
+                        0.0,
+                    ),
+                    axis=1,
+                ),
+                np.log(program_k),
+                out=np.zeros(candidates.shape[0], dtype=np.float64),
+                where=program_k > 1,
+            )
+            program_participation = np.divide(
+                1.0,
+                np.sum(np.square(program_ratios), axis=1),
+                out=np.zeros(candidates.shape[0], dtype=np.float64),
+                where=program_total > 0.0,
+            )
+            program_participation_normalized = program_participation / max(program_k, 1)
+            program_pc1_fraction = program_ratios[:, 0] if program_k else np.zeros(
+                candidates.shape[0], dtype=np.float64
+            )
+            program_trace = program_total / max(program_k, 1)
+            program_metrics = {
+                'program_spectral_entropy': program_entropy,
+                'program_participation_ratio': program_participation,
+                'program_participation_ratio_normalized': program_participation_normalized,
+                'program_pc1_fraction': program_pc1_fraction,
+                'program_trace': program_trace,
+            }
+
+        library_size = np.maximum(raw.sum(axis=2), 1e-8)
+        median_library_size = np.median(library_size, axis=1, keepdims=True)
+        size_factor = median_library_size / library_size
+        normalized = np.log1p(raw * size_factor[:, :, None])
+        structured = normalized[:, :, self.surrogate_gene_idx]
+        structured -= structured.mean(axis=1, keepdims=True)
+        gene_std = np.clip(structured.std(axis=1, keepdims=True), 1e-6, None)
+        standardized = structured / gene_std
+
+        _, singular, _ = np.linalg.svd(
+            standardized, full_matrices=False, compute_uv=True
+        )
+        variance = np.square(singular)
+        total = variance.sum(axis=1)
+        ratios = variance[:, :self.surrogate_k] / np.maximum(total[:, None], 1e-12)
+        rank = np.sum(
+            singular > singular[:, :1] * self.rank_tolerance,
+            axis=1,
+        ).astype(np.float64)
+
+        order = replicate['split_order']
+        half = self.surrogate_n_cells // 2
+        left = standardized[:, order[:half], :].copy()
+        right = standardized[:, order[half:2 * half], :].copy()
+        left -= left.mean(axis=1, keepdims=True)
+        right -= right.mean(axis=1, keepdims=True)
+        _, left_singular, left_basis = np.linalg.svd(
+            left, full_matrices=False, compute_uv=True
+        )
+        _, right_singular, right_basis = np.linalg.svd(
+            right, full_matrices=False, compute_uv=True
+        )
+        left_rank = np.sum(
+            left_singular > left_singular[:, :1] * self.rank_tolerance,
+            axis=1,
+        )
+        right_rank = np.sum(
+            right_singular > right_singular[:, :1] * self.rank_tolerance,
+            axis=1,
+        )
+        stability = np.zeros(candidates.shape[0], dtype=np.float64)
+        for i in range(candidates.shape[0]):
+            local_k = min(
+                self.surrogate_k,
+                int(rank[i]),
+                int(left_rank[i]),
+                int(right_rank[i]),
+            )
+            if local_k:
+                left_subspace = left_basis[i, :local_k, :].T
+                right_subspace = right_basis[i, :local_k, :].T
+                cosines = np.linalg.svd(
+                    left_subspace.T @ right_subspace,
+                    compute_uv=False,
+                )
+                stability[i] = float(np.mean(np.square(cosines)))
+
+        tail = ratios[:, 1:]
+        tail_pr = np.divide(
+            np.square(tail.sum(axis=1)),
+            np.square(tail).sum(axis=1),
+            out=np.zeros(candidates.shape[0], dtype=np.float64),
+            where=np.square(tail).sum(axis=1) > 0.0,
+        )
+        shape_loss = np.zeros(candidates.shape[0], dtype=np.float64)
+        tail_loss = np.zeros(candidates.shape[0], dtype=np.float64)
+        rank_loss = np.zeros(candidates.shape[0], dtype=np.float64)
+        if self.objective_mode == 'target_pca' and self.target_pca_ratio is not None:
+            n_shape = min(
+                8,
+                self.surrogate_k - 1,
+                self.target_pca_ratio.size - 1,
+            )
+            target_shape = self.target_pca_ratio[1:1 + n_shape]
+            if n_shape:
+                denominator = np.maximum(
+                    np.abs(target_shape),
+                    max(0.02, 0.05 * float(np.max(np.abs(target_shape)))),
+                )
+                shape_loss = np.mean(
+                    np.square((ratios[:, 1:1 + n_shape] - target_shape) / denominator),
+                    axis=1,
+                )
+            if self.target_tail_participation is not None:
+                rank_loss = np.square(
+                    np.log((tail_pr + 1e-6) /
+                           (self.target_tail_participation + 1e-6))
+                )
+            n_tail = min(ratios.shape[1] - 1, self.target_pca_ratio.size - 1)
+            target_tail = self.target_pca_ratio[1:1 + n_tail]
+            if n_tail:
+                tail_denominator = max(
+                    0.02,
+                    0.05 * float(np.max(np.abs(target_tail))),
+                )
+                tail_loss = np.mean(
+                    np.square((ratios[:, 1:1 + n_tail] - target_tail) /
+                              (np.abs(target_tail) + tail_denominator)),
+                    axis=1,
+                )
+
+        null_stability = self.surrogate_k / max(self.surrogate_gene_idx.size, 1)
+        stability_score = np.clip(
+            (stability - null_stability) / max(1.0 - null_stability, 1e-12),
+            0.0,
+            1.0,
+        )
+        degeneracy = np.square(
+            np.maximum(0.0, 1.0 - rank / max(self.surrogate_k, 1))
+        )
+        if self.objective_mode == 'intrinsic':
+            weights = self.intrinsic_objective_weights
+            pc1_excess = np.maximum(
+                0.0,
+                program_pc1_fraction - self.program_max_pc1_fraction,
+            )
+            pc1_loss = np.square(
+                pc1_excess / max(1.0 - self.program_max_pc1_fraction, 1e-12)
+            )
+            loss = (
+                weights['entropy'] * (1.0 - program_entropy)
+                + weights['participation'] * (
+                    1.0 - program_participation_normalized
+                )
+                + weights['stability'] * (1.0 - stability_score)
+                + weights['pc1'] * pc1_loss
+            )
+        else:
+            weights = self.target_objective_weights
+            loss = (
+                weights['shape'] * shape_loss
+                + weights['tail'] * tail_loss
+                + weights['rank'] * rank_loss
+                + weights['stability'] * (1.0 - stability_score)
+                + weights['degeneracy'] * degeneracy
+            )
+        metrics = {
+            'shape_loss': shape_loss,
+            'tail_loss': tail_loss,
+            'rank_loss': rank_loss,
+            'tail_participation_ratio': tail_pr,
+            'effective_rank': rank,
+            'loading_stability': stability,
+            'stability_score': stability_score,
+            'degeneracy': degeneracy,
+            'loss': loss,
+        }
+        metrics.update(program_metrics)
+        return -loss, metrics
+
+    @staticmethod
+    def aggregate_fitness(fitness: np.ndarray, risk_weight: float = 0.0) -> np.ndarray:
+        """Aggregate replicate fitness, penalizing instability when requested."""
+        values = np.asarray(fitness, dtype=np.float64)
+        if values.ndim != 2 or values.shape[0] < 1:
+            raise ValueError(f'expected fitness with shape (n_replicates, n_candidates), got {values.shape}')
+        counts = np.isfinite(values).sum(axis=0)
+        means = np.divide(
+            np.nansum(values, axis=0),
+            counts,
+            out=np.full(values.shape[1], np.nan),
+            where=counts > 0,
+        )
+        if values.shape[0] == 1 or risk_weight == 0.0:
+            return means
+        std = np.nanstd(values, axis=0)
+        return means - float(risk_weight) * std
+
+    def generation_replicates(self, generation: int) -> tuple[list[int], list[int]]:
+        """Return rotating train and scoring replicate IDs for one generation."""
+        if self.objective_mode == 'target_pca' and self.n_replicates < 2:
+            raise ValueError('at least two surrogate replicates are required for train/score separation')
+        train = (
+            [] if self.objective_mode == 'intrinsic'
+            else [int(generation % self.n_replicates)]
+        )
+        score = [
+            int((generation + 1 + offset) % self.n_replicates)
+            for offset in range(self.score_replicates_per_generation)
+        ]
+        return train, score
+
+    def eval_candidates(
+        self, candidates: np.ndarray, replicate_ids=None
+    ):
+        """Evaluate candidates on explicit stochastic surrogate replicates."""
         if not getattr(self, 'dags', None):
             raise RuntimeError('generate_tree() must be called before evaluating candidates')
         candidates = np.asarray(candidates, dtype=np.float32)
@@ -332,62 +863,62 @@ class MRStateGAOptimizer:
                 f'candidate MR states must be within '
                 f'[{self.mr_rate_low}, {self.mr_rate_high}]'
             )
-
-        selected = np.repeat(candidates, repeats=self.surrogate_repeats, axis=1)
-        print(f'selected:{selected.shape}')
+        if replicate_ids is None:
+            replicate_ids = list(range(self.n_replicates))
+        replicate_ids = [int(rep) for rep in replicate_ids]
+        if not replicate_ids or any(
+            rep < 0 or rep >= self.n_replicates for rep in replicate_ids
+        ):
+            raise ValueError(f'invalid surrogate replicate IDs: {replicate_ids!r}')
 
         n_candidates = candidates.shape[0]
-        f = np.full((self.n_replicates, n_candidates), np.nan)
+        fitness = np.full((len(replicate_ids), n_candidates), np.nan)
+        replicate_diagnostics = []
         errors = []
-        for rep in range(self.n_replicates):
-            print(f'-- rep {rep+1}/{self.n_replicates} --')
-
-            batch_raw = sergio_dag_hill_forward_batched(
-                selected, self.dags[rep], decays=self.decays)
-            raw = np.asarray(batch_raw, dtype=np.float64)
-            finite_candidates = np.isfinite(raw).all(axis=(1, 2))
-            for i in np.flatnonzero(~finite_candidates):
-                errors.append({
-                    'replicate': int(rep),
-                    'candidate': int(i),
-                    'error': 'surrogate produced non-finite expression values',
-                })
-
-            valid_indices = np.flatnonzero(finite_candidates)
-            if valid_indices.size:
-                chunk_size = self.fitness_batch_size or valid_indices.size
-                for start in range(0, valid_indices.size, chunk_size):
-                    chunk_indices = valid_indices[start:start + chunk_size]
-                    log_expression = np.log1p(
-                        np.maximum(raw[chunk_indices], 0.0)
+        chunk_size = self.fitness_batch_size or n_candidates
+        for output_rep, replicate_id in enumerate(replicate_ids):
+            print(f'-- surrogate replicate {replicate_id + 1}/{self.n_replicates} --')
+            metric_chunks = {}
+            for start in range(0, n_candidates, chunk_size):
+                stop = min(start + chunk_size, n_candidates)
+                try:
+                    scores, metrics = self._evaluate_surrogate_batch(
+                        candidates[start:stop], replicate_id
                     )
-                    scores = standardized_split_half_subspace_stability_batched(
-                        log_expression,
-                        n_components=self.stats_n_pca_components,
-                        n_structure_genes=self.stats_n_structure_genes,
-                        seed=self.stats_seed + rep,
-                    )
-                    f[rep, chunk_indices] = scores
-                    for local_i in np.flatnonzero(~np.isfinite(scores)):
-                        errors.append({
-                            'replicate': int(rep),
-                            'candidate': int(chunk_indices[local_i]),
-                            'error': 'non-finite fitness score',
-                        })
+                except Exception as exc:
+                    errors.append({
+                        'replicate': int(replicate_id),
+                        'candidate_start': int(start),
+                        'candidate_stop': int(stop),
+                        'error': repr(exc),
+                    })
+                    continue
+                fitness[output_rep, start:stop] = scores
+                for key, values in metrics.items():
+                    metric_chunks.setdefault(key, []).append(values)
+            replicate_diagnostics.append({
+                key: {
+                    'mean': float(np.mean(np.concatenate(values))),
+                    'std': float(np.std(np.concatenate(values))),
+                }
+                for key, values in metric_chunks.items()
+            })
 
         self.last_eval_diagnostics = {
-            'selected_shape': [int(v) for v in selected.shape],
-            'n_replicates': int(self.n_replicates),
-            'surrogate_repeats': int(self.surrogate_repeats),
-            'fitness_batch_size': int(self.fitness_batch_size or n_candidates),
+            'replicate_ids': replicate_ids,
+            'n_replicates': len(replicate_ids),
+            'surrogate_n_cells': int(self.surrogate_n_cells),
+            'surrogate_mr_jitter_std': float(self.surrogate_mr_jitter_std),
+            'surrogate_pca_components': int(self.surrogate_k),
+            'fitness_batch_size': int(chunk_size),
+            'replicate_metrics': replicate_diagnostics,
             'errors': errors,
             'n_errors': int(len(errors)),
-            'fitness': self.fitness_diagnostics(f),
+            'fitness': self.fitness_diagnostics(fitness),
         }
+        return fitness
 
-        return f
-
-    def evaluate_last_crossover(self, candidates: np.ndarray) -> dict:
+    def evaluate_last_crossover(self, candidates: np.ndarray, replicate_ids=None) -> dict:
         """Optionally evaluate crossover children before and after mutation.
 
         This performs extra fitness evaluations only for the child slots
@@ -404,8 +935,14 @@ class MRStateGAOptimizer:
         post_mutation_candidates = population[slots]
         pre_mutation_fitness = self.last_pre_mutation_fitness
         if pre_mutation_fitness is None:
-            pre_mutation_fitness = self.eval_candidates(self.last_pre_mutation_candidates)
-        post_mutation_fitness = self.eval_candidates(post_mutation_candidates)
+            pre_mutation_fitness = self.eval_candidates(
+                self.last_pre_mutation_candidates,
+                replicate_ids=replicate_ids,
+            )
+        post_mutation_fitness = self.eval_candidates(
+            post_mutation_candidates,
+            replicate_ids=replicate_ids,
+        )
 
         def mean_scores(values):
             counts = np.isfinite(values).sum(axis=0)
@@ -460,14 +997,15 @@ class MRStateGAOptimizer:
         mutation_scale=0.1,
         n_elites=1,
         protect_crossover_fraction=0.0,
+        replicate_ids=None,
     ):
         candidates = np.asarray(candidates, dtype=np.float32)
         fitness = np.asarray(fitness, dtype=np.float64)
         if candidates.shape[0] != self.n_population:
             raise ValueError('candidate count does not match n_population')
-        if fitness.shape != (self.n_replicates, self.n_population):
+        if fitness.ndim != 2 or fitness.shape[0] < 1 or fitness.shape[1] != self.n_population:
             raise ValueError(
-                f'expected fitness shape {(self.n_replicates, self.n_population)}, '
+                f'expected fitness shape (n_replicates, {self.n_population}), '
                 f'got {fitness.shape}'
             )
         if not 0.0 <= p_crossover <= 1.0:
@@ -569,7 +1107,10 @@ class MRStateGAOptimizer:
         if crossed_slots.size and protect_crossover_fraction:
             # Score crossover children before mutation so strong recombinations
             # can be carried forward unchanged.
-            pre_mutation_fitness = self.eval_candidates(self.last_pre_mutation_candidates)
+            pre_mutation_fitness = self.eval_candidates(
+                self.last_pre_mutation_candidates,
+                replicate_ids=replicate_ids,
+            )
             self.last_pre_mutation_fitness = pre_mutation_fitness
             pre_counts = np.isfinite(pre_mutation_fitness).sum(axis=0)
             pre_scores = np.divide(
@@ -684,7 +1225,7 @@ class MRStateGAOptimizer:
             },
         }
 
-        return next_candidates
+        return self.canonicalize_rows(next_candidates)
 
 
     def next_generation_de(
@@ -779,7 +1320,19 @@ class MRStateGAOptimizer:
                 (unrepaired < low) | (unrepaired > high)
             )),
         }
-        return trials
+        return self.canonicalize_rows(trials)
+
+
+def _save_optimizer_checkpoint(path: str | None, payload: dict) -> None:
+    """Atomically persist an optimizer checkpoint when a path is configured."""
+    if not path:
+        return
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_suffix(destination.suffix + '.tmp')
+    with open(temporary, 'wb') as f:
+        pickle.dump(payload, f)
+    os.replace(temporary, destination)
 
 
 def evo_loop(
@@ -799,68 +1352,90 @@ def evo_loop(
     ga.generate_tree()
     candidates = ga.initialize_population()
     print(candidates.shape)
+    checkpoint_path = ga.cfg.get('optimizer_checkpoint_path')
 
     evo_log = []
     best_candidate = None
     best_fitness = -np.inf
     for i in range(max_generations):
         print(f'=== gen {i+1}/{max_generations} ===')
+        train_ids, score_ids = ga.generation_replicates(i)
         population_before = ga.population_diagnostics(candidates)
-        f = ga.eval_candidates(candidates)
-        finite_counts = np.isfinite(f).sum(axis=0)
-        mean_fitness = np.divide(
-            np.nansum(f, axis=0),
-            finite_counts,
-            out=np.full(f.shape[1], np.nan),
-            where=finite_counts > 0,
-        )
-        valid = np.isfinite(mean_fitness)
+        train_fitness = ga.eval_candidates(candidates, replicate_ids=train_ids)
+        train_scores = ga.aggregate_fitness(train_fitness)
+        valid = np.isfinite(train_scores)
         if not valid.any():
             raise ValueError(f'generation {i} produced no finite fitness values')
-        generation_best_idx = int(np.nanargmax(mean_fitness))
-        generation_best = float(mean_fitness[generation_best_idx])
-        if generation_best > best_fitness:
-            best_fitness = generation_best
-            best_candidate = candidates[generation_best_idx].copy()
+        generation_best = float(np.nanmax(train_scores))
+        train_evaluation = dict(ga.last_eval_diagnostics)
+        next_gen = ga.next_generation(
+            candidates,
+            fitness=train_fitness,
+            p_crossover=p_crossover,
+            protect_crossover_fraction=protect_crossover_fraction,
+            p_mutation=p_mutation,
+            mutation_scale=mutation_scale,
+            n_elites=n_elites,
+            replicate_ids=train_ids,
+        )
+        if diagnose_crossover:
+            ga.evaluate_last_crossover(next_gen, replicate_ids=train_ids)
 
-        finite_fitness = f[np.isfinite(f)]
-        evaluation = ga.last_eval_diagnostics
+        survival_pool = np.concatenate([candidates, next_gen], axis=0)
+        score_fitness = ga.eval_candidates(survival_pool, replicate_ids=score_ids)
+        score_scores = ga.aggregate_fitness(
+            score_fitness, risk_weight=ga.validation_risk_weight
+        )
+        score_evaluation = dict(ga.last_eval_diagnostics)
+        valid_score = np.isfinite(score_scores)
+        if valid_score.sum() < ga.n_population:
+            raise ValueError(
+                f'generation {i} produced only {valid_score.sum()} valid survival scores'
+            )
+        selected_indices = np.argsort(
+            np.where(valid_score, score_scores, -np.inf)
+        )[-ga.n_population:]
+        candidates = ga.canonicalize_rows(survival_pool[selected_indices])
+        selected_scores = score_scores[selected_indices]
+        score_best_index = int(np.argmax(score_scores))
+        score_best = float(score_scores[score_best_index])
+        if score_best > best_fitness:
+            best_fitness = score_best
+            best_candidate = survival_pool[score_best_index].copy()
+
+        finite_fitness = train_fitness[np.isfinite(train_fitness)]
         qs = np.quantile(
             finite_fitness,
             q=(0.01, 0.05, 0.25, 0.5, 0.75, 0.95, 0.99),
         )
         evo_log.append({
             'generation': i,
+            'train_replicate_ids': train_ids,
+            'score_replicate_ids': score_ids,
             'mean_fitness': float(np.mean(finite_fitness)),
             'variance_fitness': float(np.var(finite_fitness)),
             'generation_best': generation_best,
-            'generation_best_index': generation_best_idx,
+            'score_best': score_best,
             'best_so_far': best_fitness,
             'quantiles': [float(q) for q in qs],
             'population_before': population_before,
-            'evaluation': evaluation,
+            'evaluation': train_evaluation,
+            'score_evaluation': score_evaluation,
+            'score_population_summary': {
+                'mean': float(np.mean(selected_scores)),
+                'std': float(np.std(selected_scores)),
+                'best': float(np.max(selected_scores)),
+            },
         })
-        next_gen = ga.next_generation(
-            candidates,
-            fitness=f,
-            p_crossover=p_crossover,
-            protect_crossover_fraction=protect_crossover_fraction,
-            p_mutation=p_mutation,
-            mutation_scale=mutation_scale,
-            n_elites=n_elites,
-        )
-        if diagnose_crossover:
-            ga.evaluate_last_crossover(next_gen)
         evo_log[-1]['operators'] = ga.last_operator_diagnostics
-        evo_log[-1]['population_after'] = ga.population_diagnostics(next_gen)
-        candidates = next_gen.copy()
+        evo_log[-1]['population_after'] = ga.population_diagnostics(candidates)
         operators = ga.last_operator_diagnostics
         crossover_log = operators['crossover']
         print(
-            f'{np.mean(finite_fitness):.4g} q99={qs[6]:.4g} '
+            f'train={np.mean(finite_fitness):.4g} score={score_best:.4g} '
             f'best={best_fitness:.4g} '
-            f'finite={evaluation["fitness"]["finite_score_fraction"]:.3f} '
-            f'errors={evaluation["n_errors"]} '
+            f'finite={train_evaluation["fitness"]["finite_score_fraction"]:.3f} '
+            f'errors={train_evaluation["n_errors"]} '
             f'unique={population_before["unique_chromosome_fraction"]:.3f} '
             f'-> {evo_log[-1]["population_after"]["unique_chromosome_fraction"]:.3f} '
             f'parents={operators["selection"]["unique_selected_parent_fraction"]:.3f} '
@@ -879,12 +1454,35 @@ def evo_loop(
                 f'pre_win={comparison["pre_mutation_fraction_beating_parent_best"]:.3f} '
                 f'post_win={comparison["post_mutation_fraction_beating_parent_best"]:.3f}'
             )
+        _save_optimizer_checkpoint(checkpoint_path, {
+            'algorithm': 'ga',
+            'generation': i,
+            'candidates': candidates,
+            'best_candidate': best_candidate,
+            'best_fitness': best_fitness,
+            'evolution_log': evo_log,
+            'grn': ga.grn_metadata,
+            'surrogate': ga.surrogate_metadata(),
+        })
 
+    final_replicate_fitness = ga.eval_candidates(
+        best_candidate[None, ...], replicate_ids=list(range(ga.n_replicates))
+    )
+    final_robust_fitness = float(
+        ga.aggregate_fitness(
+            final_replicate_fitness,
+            risk_weight=ga.validation_risk_weight,
+        )[0]
+    )
     return {
         'best_candidate': best_candidate,
         'best_fitness': best_fitness,
+        'final_robust_fitness': final_robust_fitness,
+        'final_replicate_fitness': final_replicate_fitness,
         'population': candidates,
         'evolution_log': evo_log,
+        'grn': ga.grn_metadata,
+        'surrogate': ga.surrogate_metadata(),
     }
 
 
@@ -898,71 +1496,55 @@ def de_loop(
     """Optimize MR-state chromosomes with vectorized differential evolution.
 
     ``max_generations`` DE generations each evaluate one trial population.
-    Parent fitness is cached between generations, and target/trial pairs use
-    greedy one-to-one replacement, providing implicit elitism without a
-    separate elite count. The existing GA loop is intentionally unchanged.
+    Target/trial pairs use greedy one-to-one replacement, providing implicit
+    elitism without a separate elite count. DE uses the target-free intrinsic
+    program objective; the existing GA loop retains its target-aware mode.
     """
     if max_generations < 1:
         raise ValueError('max_generations must be positive')
 
-    de = MRStateGAOptimizer(config_fn, **de_kwargs)
+    de = MRStateGAOptimizer(
+        config_fn,
+        objective_mode='intrinsic',
+        **de_kwargs,
+    )
     de.generate_tree()
     candidates = de.initialize_population()
     print(candidates.shape)
-
-    # Evaluate the initial population once. Thereafter this array is the
-    # exact parent-fitness cache aligned with the candidate population.
-    fitness = de.eval_candidates(candidates)
-    finite_counts = np.isfinite(fitness).sum(axis=0)
-    parent_scores = np.divide(
-        np.nansum(fitness, axis=0),
-        finite_counts,
-        out=np.full(de.n_population, np.nan),
-        where=finite_counts > 0,
-    )
-    if not np.isfinite(parent_scores).any():
-        raise ValueError('initial population produced no finite fitness values')
-
-    valid_scores = np.isfinite(parent_scores)
-    best_index = int(np.flatnonzero(valid_scores)[np.argmax(parent_scores[valid_scores])])
-    best_fitness = float(parent_scores[best_index])
-    best_candidate = candidates[best_index].copy()
+    checkpoint_path = de.cfg.get('optimizer_checkpoint_path')
+    best_fitness = -np.inf
+    best_candidate = None
     evo_log = []
 
     for generation in range(max_generations):
         print(f'=== DE gen {generation + 1}/{max_generations} ===')
+        _, score_ids = de.generation_replicates(generation)
         population_before = de.population_diagnostics(candidates)
-        parent_scores_before = parent_scores.copy()
 
         trials = de.next_generation_de(
             candidates,
             differential_weight=differential_weight,
             crossover_rate=crossover_rate,
         )
-        trial_fitness = de.eval_candidates(trials)
-        trial_counts = np.isfinite(trial_fitness).sum(axis=0)
-        trial_scores = np.divide(
-            np.nansum(trial_fitness, axis=0),
-            trial_counts,
-            out=np.full(de.n_population, np.nan),
-            where=trial_counts > 0,
+        score_pool = np.concatenate([candidates, trials], axis=0)
+        score_fitness = de.eval_candidates(score_pool, replicate_ids=score_ids)
+        score_pool_scores = de.aggregate_fitness(
+            score_fitness, risk_weight=de.validation_risk_weight
         )
-
-        accepted = np.isfinite(trial_scores) & (
-            ~np.isfinite(parent_scores) | (trial_scores > parent_scores)
+        parent_scores_before = score_pool_scores[:de.n_population]
+        trial_scores = score_pool_scores[de.n_population:]
+        accepted = np.isfinite(trial_scores) & np.isfinite(parent_scores_before) & (
+            trial_scores > parent_scores_before
         )
         candidates[accepted] = trials[accepted]
-        fitness[:, accepted] = trial_fitness[:, accepted]
-        parent_scores[accepted] = trial_scores[accepted]
+        parent_scores = np.where(accepted, trial_scores, parent_scores_before)
 
         finite_scores = np.isfinite(parent_scores)
         if not finite_scores.any():
             raise ValueError(
                 f'DE generation {generation} produced no finite population fitness values'
             )
-        generation_best_index = int(
-            np.flatnonzero(finite_scores)[np.argmax(parent_scores[finite_scores])]
-        )
+        generation_best_index = int(np.flatnonzero(finite_scores)[np.argmax(parent_scores[finite_scores])])
         generation_best = float(parent_scores[generation_best_index])
         if generation_best > best_fitness:
             best_fitness = generation_best
@@ -986,6 +1568,7 @@ def de_loop(
         population_finite = parent_scores[np.isfinite(parent_scores)]
         evo_log.append({
             'generation': generation,
+            'score_replicate_ids': score_ids,
             'mean_fitness': float(np.mean(population_finite)),
             'variance_fitness': float(np.var(population_finite)),
             'generation_best': generation_best,
@@ -1018,12 +1601,35 @@ def de_loop(
             f'changed={operators["changed_entries"]} '
             f'out_of_bounds={operators["out_of_bounds_entries"]}'
         )
+        _save_optimizer_checkpoint(checkpoint_path, {
+            'algorithm': 'de',
+            'generation': generation,
+            'candidates': candidates,
+            'best_candidate': best_candidate,
+            'best_fitness': best_fitness,
+            'evolution_log': evo_log,
+            'grn': de.grn_metadata,
+            'surrogate': de.surrogate_metadata(),
+        })
 
+    final_replicate_fitness = de.eval_candidates(
+        best_candidate[None, ...], replicate_ids=list(range(de.n_replicates))
+    )
+    final_robust_fitness = float(
+        de.aggregate_fitness(
+            final_replicate_fitness,
+            risk_weight=de.validation_risk_weight,
+        )[0]
+    )
     return {
         'best_candidate': best_candidate,
         'best_fitness': best_fitness,
+        'final_robust_fitness': final_robust_fitness,
+        'final_replicate_fitness': final_replicate_fitness,
         'population': candidates,
         'evolution_log': evo_log,
+        'grn': de.grn_metadata,
+        'surrogate': de.surrogate_metadata(),
     }
 
 
@@ -1090,7 +1696,7 @@ def exp_unprotected_xover05(config_fn:str):
 def exp_de_F05_CR08(config_fn: str, seed:int):
     return de_loop(
         config_fn,
-        max_generations=110,
+        max_generations=70,
         n_population=200,
         seed=seed,
         differential_weight=0.5,
@@ -1174,22 +1780,22 @@ if __name__=='__main__':
 
     elif sys.argv[1] == 'de_F05_CR08':
         ret = exp_de_F05_CR08(config_fn, seed=seed)
-        with open(f'/content/Drive/MyDrive/Colab Notebooks/ga_opt_log_20260827_02.de_F05_CR08.seed{seed}.pickle', 'wb') as f:
+        with open(f'/content/Drive/MyDrive/Colab Notebooks/ga_opt_log_20260901_01.de_F05_CR08.seed{seed}.pickle', 'wb') as f:
             pickle.dump(ret, f)
 
     elif sys.argv[1] == 'de_F03_CR05':
-        ret = exp_de_F03_CR05(config_fn)
-        with open('/content/Drive/MyDrive/Colab Notebooks/ga_opt_log_20260827_02.de_F03_CR05.pickle', 'wb') as f:
+        ret = exp_de_F03_CR05(config_fn, seed=seed)
+        with open('/content/Drive/MyDrive/Colab Notebooks/ga_opt_log_20260827_02.de_F03_CR05.seed{seed}.pickle', 'wb') as f:
             pickle.dump(ret, f)
 
     elif sys.argv[1] == 'de_F03_CR08':
-        ret = exp_de_F03_CR08(config_fn)
-        with open('/content/Drive/MyDrive/Colab Notebooks/ga_opt_log_20260827_02.de_F03_CR08.pickle', 'wb') as f:
+        ret = exp_de_F03_CR08(config_fn, seed=seed)
+        with open('/content/Drive/MyDrive/Colab Notebooks/ga_opt_log_20260831_01.de_F03_CR08.seed{seed}.pickle', 'wb') as f:
             pickle.dump(ret, f)
 
     elif sys.argv[1] == 'de_F05_CR05':
-        ret = exp_de_F05_CR05(config_fn)
-        with open('/content/Drive/MyDrive/Colab Notebooks/ga_opt_log_20260827_02.de_F05_CR05.pickle', 'wb') as f:
+        ret = exp_de_F05_CR05(config_fn, seed=seed)
+        with open('/content/Drive/MyDrive/Colab Notebooks/ga_opt_log_20260827_02.de_F05_CR05.seed{seed}.pickle', 'wb') as f:
             pickle.dump(ret, f)
 
 

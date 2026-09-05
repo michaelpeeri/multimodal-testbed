@@ -1810,3 +1810,67 @@ Several single-file research scripts, with locally shared code. No tests, no pac
     deferred above) remains open for a future dedicated pilot.
 
 
+- The first `mr_state_harness.py` comparison incorporating a saved optimizer
+  result (`mr_state_comparison.*`, current arm
+  `de_f05_cr08_seed1` from
+  `ga_opt_log_20260827_02.de_F05_CR08.seed1.pickle`) was analyzed. The fixed
+  vector is valid (`15 x 84`, finite, within `[1, 5]`) and was evaluated over
+  12 harness replicates against `iid_random`, `sobol_random`, and
+  `sobol_spectral`. Its SERGIO distance was 0.4083 versus 0.4059, 0.3958,
+  and 0.3950 respectively, so this single DE result showed no downstream
+  improvement; its aggregate expression/PCA metrics were also essentially
+  indistinguishable from the existing arms. The 12 replicates reused the
+  same fixed DE vector and varied only harness simulation seeds; the harness
+  generates one shared GRN per run, not one GRN per replicate.
+  - The stored comparison initially did not use its requested weights:
+    `_load_base_config` normalized a tuned-result config after applying
+    `base_overrides`, discarding the overrides and leaving `base_config`'s
+    `weights` empty. Distances therefore defaulted every scored key to weight
+    1.0 and were dominated by raw `gene_corr_abs_p50`. Fixed by normalizing
+    first and applying overrides afterward; `mr_state_harness_config.example
+    .json` now gives explicit weights for all scored/derived keys, including
+    zero weights for the raw/confounded families. Existing stored statistics
+    can be reweighted without rerunning SERGIO because each record retains
+    unweighted distance terms.
+  - GA/DE initialization is Sobol-based but is not equivalent to any current
+    harness arm: each optimizer individual is a complete independent
+    `15 x 84` chromosome, whereas the harness Sobol arms draw one pool and
+    select rows. The optimizer's stored PCA-stability fitness is not directly
+    comparable to harness target distance. Next comparison step is to verify
+    the corrected weighting on seed1, then add DE seeds 1--5 (and GA variants),
+   while confirming that their MR-column ordering matches the harness's
+   shared GRN; the optimizer pickles do not store MR IDs or a GRN fingerprint.
+
+- The `mr_state_comparison.20260903_ablation_*` stage-isolation results show
+  that the multidimensional MR state is not lost during candidate generation,
+  GRN/Hill surrogate evaluation, or entry into SERGIO: the selected state
+  matrices and shared GRN were identical across the ablation files. The
+  biological/state-linked expression signal is first strongly attenuated by
+  intrinsic SERGIO noise (`within_minus_across` fell from ~0.279 clean to
+  ~0.025 with noise only). The reproducible expression subspace is then
+  destroyed mainly by dropout (standardized split-half loading stability fell
+  from ~0.817 before dropout to ~0.162 after it). UMI conversion adds an
+  apparent high-rank tail but makes it less reproducible (tail participation
+  ~10.1 -> ~18.6 while loading stability fell to ~0.081). Library-size and
+  outlier stages had comparatively small structural effects in this setup.
+  The full pipeline made rank-1 constant MR input and multidimensional IID/DE
+  input nearly indistinguishable in PCA spectrum and target distance, so the
+  aggregate objective is not sufficient to detect this failure mode.
+  `mr_state_harness.py` now records label-aware metrics for every scenario:
+  `label_between_variance_fraction`,
+  `label_centroid_participation_ratio`,
+  `label_centroid_mean_pairwise_distance`, and
+  `label_holdout_accuracy`. The first two measure the size and effective rank
+  of label-defined program structure after per-gene standardization; the
+  holdout accuracy tests whether that structure generalizes to held-out cells
+  rather than being noise-induced. The comparison plot includes the key label
+  metrics alongside MR-state rank and PCA stability.
+  A new pilot manifest,
+  `mr_state_harness_config.20260905_noise_dropout_grid.json`, and runner,
+  `run_mr_state_harness_grid.py`, cover noise parameters 0, 0.1433, and
+  0.2867 crossed with dropout off and dropout percentiles 40, 70, and 90.
+  Other technical stages are disabled for this grid. It uses 3 paired
+  replicates per condition for screening; informative conditions should be
+  rerun with 12 replicates before treating small differences as reliable.
+  Launch the grid with `python3 run_mr_state_harness_grid.py --config
+  mr_state_harness_config.20260905_noise_dropout_grid.json`.

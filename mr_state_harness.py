@@ -1,3 +1,47 @@
+# OUTSTANDING ISSUES / LIMITATIONS
+# - A comparison run uses one shared GRN, so it isolates state/simulation
+#   effects but does not measure robustness to topology or GRN-parameter change.
+# - Random/Sobol arms currently resample their selected MR-state matrix for
+#   each replicate; only fixed-state arms isolate expression robustness.
+# - The default pilot may use fewer cells than the target statistics. Absolute
+#   target distances are then screening values, although paired arm deltas are
+#   still useful when seeds are shared.
+# - PCA stability is conditional on one fixed gene subset and cell split seed;
+#   it is not uncertainty over all possible subsets/splits.
+# - Fixed-state artifacts must carry and be checked against ordered MR IDs and
+#   an exact GRN fingerprint; legacy pickles do not contain that provenance.
+# - The full SERGIO pipeline is intentionally used for validation, not for
+#   large candidate-population optimization.
+#
+# NEXT EXPERIMENT PLAN: STAGE-ISOLATION PILOT
+# - Compare constant-state, IID-state, and intrinsic-DE-state arms using the
+#   same GRN, MR ordering, cell count, replicate seeds, and target-statistics
+#   settings. The primary question is whether DE-created cluster structure is
+#   present before technical stages and then erased by full SERGIO processing.
+# - Run the pilot in two harness invocations: clean_simulation=true (SERGIO
+#   with noise, outliers, library-size effects, dropout, and UMI conversion
+#   disabled) and clean_simulation=false (the full configured pipeline). The
+#   harness deliberately makes clean_simulation a run-level switch, so two
+#   configs are preferable to adding per-arm scenario plumbing.
+# - The arm set should include iid_random, a constant-state control whose
+#   per-MR vector is the grand mean of the existing IID states, and both new
+#   fixed DE candidates. The constant control removes cluster-to-cluster MR
+#   variation while preserving the average MR rate as closely as possible.
+# - Evaluate PC2-PC9 explained variance, cluster/between-state separation,
+#   within-versus-across module correlation, expression variance, sparsity,
+#   and full target distance. Reuse the existing full-pipeline IID results
+#   when the GRN fingerprint, ordered MR IDs, seeds, and configuration match;
+#   do not rerun already-completed control arms merely to populate a config.
+# - Decision rule: if DE improves clean SERGIO but not full SERGIO, technical
+#   stages are suppressing biological signal; if it fails already in clean
+#   SERGIO, the GRN/MR-state construction or surrogate is the bottleneck. If
+#   neither arm beats IID in clean SERGIO, stop investing in this DE objective
+#   and move to explicitly structured, low-rank MR programs.
+# - No harness code change is required for this pilot. Existing fixed_array or
+#   fixed_pickle arms can load the constant matrix; only a derived .npy file
+#   and suitable clean/full configs are needed. A future constant candidate
+#   method would be convenience only, not required for the experiment.
+
 """Compare multiple MR-state candidate and selection configurations.
 
 This module is deliberately separate from the Optuna tuning entry point.  It
@@ -22,8 +66,14 @@ Example configuration::
          "selection_method": "spectral",
          "candidate_params": {"n_candidate_states": 64},
          "selection_params": {"n_selected_states": 15,
-                               "n_restarts": 1, "swap_passes": 0}}
-      ],
+                               "n_restarts": 1, "swap_passes": 0}},
+         {"name": "de_f05_cr08_seed1", "candidate_method": "fixed_pickle",
+          "candidate_params": {
+              "path": "ga_opt_log_20260827_02.de_F05_CR08.seed1.pickle",
+              "key": "best_candidate"},
+          "selection_method": "identity",
+          "selection_params": {"n_selected_states": 15}}
+       ],
       "n_replicates": 3,
       "seed_base": 0,
       "include_sergio": true,
@@ -40,6 +90,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import os
@@ -75,6 +126,10 @@ from synthetic_data import (
 _SCALAR_METRIC_KEYS = (
     "distance",
     "mr_state_participation_ratio",
+    "label_between_variance_fraction",
+    "label_centroid_participation_ratio",
+    "label_centroid_mean_pairwise_distance",
+    "label_holdout_accuracy",
     "pca_size_normalized_standardized_tail_participation_ratio",
     "pca_size_normalized_standardized_split_half_subspace_stability",
     "pca_size_normalized_standardized_split_half_spectrum_similarity",
@@ -128,9 +183,14 @@ def _load_base_config(config: str | dict) -> tuple[dict, str | None]:
     else:
         base = raw
 
-    tsd = _load_tuning_helpers()
-    base.update(overrides)
-    return _load_mr_tree_experiment_config(base), source
+    _load_tuning_helpers()
+    # Normalize tuned-result configs first: the normalizer intentionally reads
+    # resolved values from _meta/best_resolved_params and otherwise ignores
+    # top-level fields.  Applying overrides afterward ensures harness-local
+    # settings such as weights and statistics options are not discarded.
+    normalized = _load_mr_tree_experiment_config(base)
+    normalized.update(overrides)
+    return normalized, source
 
 
 def _load_harness_config(path: str) -> tuple[dict, str | None]:
@@ -176,22 +236,72 @@ def _build_trees(grn_path: str, mr_ids: list[int], path_decay: float) -> dict:
     return {"target_sets": target_sets, "trees": trees}
 
 
-def _load_fixed_states(path: str) -> np.ndarray:
-    """Load a fixed state matrix from .npy or an existing best.pt artifact."""
+def _load_fixed_states(
+    path: str,
+    key: str | None = None,
+    expected_mr_ids: list[int] | None = None,
+    expected_grn_sha256: str | None = None,
+    require_grn_provenance: bool = False,
+) -> np.ndarray:
+    """Load a fixed state matrix from NumPy, pickle, or PyTorch data.
+
+    Pickle dictionaries default to ``best_candidate`` because that is the
+    matrix stored by ``mr_state_ga_opt.py``.  PyTorch artifact dictionaries
+    retain the existing ``mr_state`` default.  Supplying ``key`` overrides
+    either default.
+    """
     suffix = Path(path).suffix.lower()
+    artifact = None
     if suffix == ".npy":
         states = np.load(path)
+    elif suffix in (".pkl", ".pickle"):
+        with open(path, "rb") as f:
+            artifact = pickle.load(f)
+        if isinstance(artifact, dict):
+            artifact_key = key or "best_candidate"
+            states = artifact.get(artifact_key)
+        else:
+            if key is not None:
+                raise ValueError(
+                    f"fixed pickle {path!r} is not a mapping; cannot read key {key!r}"
+                )
+            states = artifact
     else:
         try:
             artifact = torch.load(path, map_location="cpu", weights_only=False)
         except TypeError:
             artifact = torch.load(path, map_location="cpu")
         if isinstance(artifact, dict):
-            states = artifact.get("mr_state")
+            states = artifact.get(key or "mr_state")
         else:
+            if key is not None:
+                raise ValueError(
+                    f"fixed artifact {path!r} is not a mapping; cannot read key {key!r}"
+                )
             states = artifact
     if states is None:
-        raise ValueError(f"fixed state file {path!r} has no mr_state")
+        expected = key or ("best_candidate" if suffix in (".pkl", ".pickle") else "mr_state")
+        raise ValueError(f"fixed state file {path!r} has no {expected}")
+    provenance = artifact.get("grn") if isinstance(artifact, dict) else None
+    if expected_mr_ids is not None or expected_grn_sha256 is not None:
+        if provenance is None:
+            if require_grn_provenance:
+                raise ValueError(
+                    f"fixed state file {path!r} has no GRN provenance metadata"
+                )
+        else:
+            if isinstance(provenance, list):
+                provenance = provenance[0] if provenance else None
+            if not isinstance(provenance, dict):
+                raise ValueError(f"fixed state file {path!r} has invalid GRN provenance")
+            if expected_mr_ids is not None and list(provenance.get("mr_ids", [])) != list(expected_mr_ids):
+                raise ValueError(
+                    f"fixed state file {path!r} has incompatible ordered MR IDs"
+                )
+            if expected_grn_sha256 is not None and provenance.get("sha256") != expected_grn_sha256:
+                raise ValueError(
+                    f"fixed state file {path!r} was generated from a different GRN"
+                )
     states = np.asarray(states, dtype=np.float32)
     if states.ndim != 2 or not np.isfinite(states).all() or (states < 0).any():
         raise ValueError(f"fixed state file {path!r} must contain a finite 2D non-negative matrix")
@@ -240,15 +350,40 @@ def _candidate_pool(
             tree_strength=float(params.get("tree_strength", 1.0)),
             root_variance=float(params.get("root_variance", 0.0)),
         )
-    elif method in ("fixed_array", "fixed_artifact"):
+    elif method in ("fixed_array", "fixed_artifact", "fixed_pickle"):
         path = params.get("path")
         if not path:
             raise ValueError(f"arm {arm['name']!r} requires candidate_params.path")
-        states = _load_fixed_states(path)
+        if method == "fixed_pickle" and Path(path).suffix.lower() not in (".pkl", ".pickle"):
+            raise ValueError(
+                f"arm {arm['name']!r} uses fixed_pickle but path {path!r} is not a pickle"
+            )
+        states = _load_fixed_states(
+            path,
+            key=params.get("key"),
+            expected_mr_ids=mr_ids,
+            expected_grn_sha256=base.get("_grn_sha256"),
+            require_grn_provenance=bool(base.get("require_grn_provenance", False)),
+        )
     else:
         raise ValueError(
             f"unsupported candidate_method {method!r}; expected iid, sobol, "
-            "tree_*, fixed_array, or fixed_artifact"
+            "tree_*, fixed_array, fixed_artifact, or fixed_pickle"
+        )
+
+    states = np.asarray(states, dtype=np.float32)
+    if states.ndim != 2 or states.shape[1] != len(mr_ids):
+        raise ValueError(
+            f"arm {arm['name']!r} produced state shape {states.shape}; "
+            f"expected (n_states, {len(mr_ids)}) for this GRN"
+        )
+    if not np.isfinite(states).all() or (
+        (states < float(base['mr_rate_low'])).any()
+        or (states > float(base['mr_rate_high'])).any()
+    ):
+        raise ValueError(
+            f"arm {arm['name']!r} produced states outside "
+            f"[{base['mr_rate_low']}, {base['mr_rate_high']}]"
         )
 
     metadata = {
@@ -380,6 +515,122 @@ def _state_geometry(states: np.ndarray) -> dict:
     }
 
 
+def _label_aware_expression_metrics(
+    X: torch.Tensor,
+    labels: np.ndarray,
+    seed: int | None = 0,
+) -> dict:
+    """Measure expression structure that is reproducible across labels.
+
+    The input is imputed and standardized per gene before the label-aware
+    measurements.  This makes the metrics less dependent on a few high-count
+    genes while keeping them aligned with the PCA stability calculations.
+    ``label_between_variance_fraction`` measures how much standardized
+    expression variance is explained by labels; centroid participation ratio
+    measures the effective dimensionality of that label signal; and the
+    holdout accuracy tests whether the label signal generalizes to cells not
+    used to form the centroids.
+    """
+    if isinstance(X, torch.Tensor):
+        matrix = X.detach().cpu().numpy()
+    else:
+        matrix = np.asarray(X)
+    matrix = np.asarray(matrix, dtype=np.float64)
+    labels = np.asarray(labels)
+    output = {
+        "label_between_variance_fraction": float("nan"),
+        "label_centroid_participation_ratio": float("nan"),
+        "label_centroid_mean_pairwise_distance": float("nan"),
+        "label_holdout_accuracy": float("nan"),
+    }
+    if matrix.ndim != 2 or labels.ndim != 1 or matrix.shape[0] != labels.size:
+        return output
+
+    valid_labels = np.isfinite(labels)
+    if not valid_labels.all():
+        matrix = matrix[valid_labels]
+        labels = labels[valid_labels]
+    if matrix.shape[0] < 2:
+        return output
+
+    observed = np.isfinite(matrix)
+    observed_values = np.where(observed, matrix, 0.0)
+    observed_count = observed.sum(axis=0)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        gene_mean = observed_values.sum(axis=0) / observed_count
+    gene_mean = np.where(observed_count > 0, gene_mean, 0.0)
+    filled = np.where(observed, matrix, gene_mean[None, :])
+
+    unique_labels, inverse, counts = np.unique(
+        labels, return_inverse=True, return_counts=True)
+    if unique_labels.size < 2:
+        return output
+    global_mean = filled.mean(axis=0, keepdims=True)
+    gene_std = filled.std(axis=0, keepdims=True)
+    gene_std = np.maximum(gene_std, 1e-6)
+    standardized = (filled - global_mean) / gene_std
+
+    n_labels = unique_labels.size
+    centroids = np.zeros((n_labels, standardized.shape[1]), dtype=np.float64)
+    for index in range(n_labels):
+        members = inverse == index
+        centroids[index] = standardized[members].mean(axis=0)
+
+    total_ss = float(np.square(standardized).sum())
+    between_ss = float((counts[:, None] * np.square(centroids)).sum())
+    if total_ss > 0.0:
+        output["label_between_variance_fraction"] = float(
+            np.clip(between_ss / total_ss, 0.0, 1.0)
+        )
+
+    centered_centroids = centroids - centroids.mean(axis=0, keepdims=True)
+    singular = np.linalg.svd(
+        centered_centroids, full_matrices=False, compute_uv=False)
+    centroid_variance = np.square(singular)
+    centroid_total = float(centroid_variance.sum())
+    if centroid_total > 0.0:
+        output["label_centroid_participation_ratio"] = float(
+            centroid_total ** 2 / np.square(centroid_variance).sum()
+        )
+    centroid_distances = np.linalg.norm(
+        centered_centroids[:, None, :] - centered_centroids[None, :, :], axis=2)
+    if n_labels > 1:
+        upper = centroid_distances[np.triu_indices(n_labels, k=1)]
+        output["label_centroid_mean_pairwise_distance"] = float(upper.mean())
+
+    # Form train/test sets independently within each label so class balance
+    # does not turn the accuracy into a proxy for the Dirichlet draw.
+    rng = np.random.default_rng(seed)
+    train_mask = np.zeros(labels.size, dtype=bool)
+    test_mask = np.zeros(labels.size, dtype=bool)
+    for index in range(n_labels):
+        members = np.flatnonzero(inverse == index)
+        if members.size < 2:
+            continue
+        members = members[rng.permutation(members.size)]
+        n_train = max(1, members.size // 2)
+        train_mask[members[:n_train]] = True
+        test_mask[members[n_train:]] = True
+    if train_mask.any() and test_mask.any() and np.unique(inverse[train_mask]).size == n_labels:
+        train = filled[train_mask]
+        test = filled[test_mask]
+        train_mean = train.mean(axis=0, keepdims=True)
+        train_std = np.maximum(train.std(axis=0, keepdims=True), 1e-6)
+        train = (train - train_mean) / train_std
+        test = (test - train_mean) / train_std
+        train_labels = inverse[train_mask]
+        train_centroids = np.zeros((n_labels, train.shape[1]), dtype=np.float64)
+        for index in range(n_labels):
+            train_centroids[index] = train[train_labels == index].mean(axis=0)
+        distances = np.square(
+            test[:, None, :] - train_centroids[None, :, :]).sum(axis=2)
+        predicted = np.argmin(distances, axis=1)
+        output["label_holdout_accuracy"] = float(
+            np.mean(predicted == inverse[test_mask])
+        )
+    return output
+
+
 def _simulate_arm(
     states: np.ndarray,
     base: dict,
@@ -457,6 +708,8 @@ def _evaluate_matrix(
             eps_abs_floor=base.get("distance_eps_abs_floor", 0.02),
         )
     geometry = _state_geometry(states)
+    label_metrics = _label_aware_expression_metrics(
+        X, labels, seed=base.get("stats_seed", 0))
     module_metrics = _gene_module_correlations(
         X,
         labels,
@@ -474,6 +727,13 @@ def _evaluate_matrix(
     scalar_metrics["distance"] = _safe_float(distance)
     scalar_metrics["mr_state_participation_ratio"] = geometry["participation_ratio"]
     for key in (
+        "label_between_variance_fraction",
+        "label_centroid_participation_ratio",
+        "label_centroid_mean_pairwise_distance",
+        "label_holdout_accuracy",
+    ):
+        scalar_metrics[key] = _safe_float(label_metrics[key])
+    for key in (
         "within_module_mean_abs_corr",
         "across_module_mean_abs_corr",
         "within_minus_across",
@@ -485,6 +745,7 @@ def _evaluate_matrix(
         "distance_breakdown": breakdown,
         "scalar_metrics": scalar_metrics,
         "mr_state_geometry": geometry,
+        "label_metrics": label_metrics,
         "module_metrics": module_metrics,
         "surrogate_metrics": surrogate_metrics or {},
         "n_cells": int(X.shape[0]),
@@ -643,6 +904,11 @@ def run_mr_state_comparison(config: str | dict) -> dict:
         balancing_strength=base["balancing_strength"],
         path_decay=base["path_decay"],
     )
+    grn_digest = hashlib.sha256()
+    with open(temp_path, 'rb') as f:
+        for block in iter(lambda: f.read(1 << 20), b''):
+            grn_digest.update(block)
+    base["_grn_sha256"] = grn_digest.hexdigest()
     dag = load_sergio_dag(
         temp_path,
         shared_coop_state=base["shared_coop_state"],
@@ -845,9 +1111,10 @@ def run_mr_state_comparison(config: str | dict) -> dict:
             "grn": {
                 "mr_ids": list(mr_ids),
                 "gene_id_to_symbol": gene_id_to_symbol,
-                "diagnostics": grn_diagnostics,
-                "grn_seed": base["grn_seed"],
-            },
+            "diagnostics": grn_diagnostics,
+            "grn_seed": base["grn_seed"],
+            "sha256": grn_digest.hexdigest(),
+        },
             "scenario_names": scenario_names,
             "baseline": baseline_name,
             "arms": arm_results,
@@ -959,13 +1226,15 @@ def plot_mr_state_comparison(result_or_path, path: str | None = None, scenario: 
     scenario = scenario or scenario_names[-1]
     arm_names = list(result["arms"])
     x = np.arange(len(arm_names))
-    fig, axes = plt.subplots(2, 3, figsize=(15, 8))
+    fig, axes = plt.subplots(2, 4, figsize=(18, 8))
     panels = (
         ("distance", "distance", True),
         ("mr_state_participation_ratio", "MR-state effective rank", False),
+        ("label_between_variance_fraction", "label-explained variance", False),
+        ("label_centroid_participation_ratio", "label-program effective rank", False),
+        ("label_holdout_accuracy", "label holdout accuracy", False),
         ("pca_size_normalized_standardized_split_half_subspace_stability", "loading subspace stability", False),
         ("pca_size_normalized_standardized_split_half_spectrum_similarity", "PCA spectrum stability", False),
-        ("gene_var_mean", "gene variance mean", False),
         ("nonzero_frac", "nonzero fraction", False),
     )
     for ax, (key, title, lower_is_better) in zip(axes.flat, panels):

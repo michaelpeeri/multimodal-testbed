@@ -1088,7 +1088,12 @@ def _sample_mr_state(n_clusters: int, n_mrs: int, low: float, high: float, seed:
     return rng.uniform(low, high, size=(n_clusters, n_mrs))
 
 
-def _load_fixed_mr_state(config: dict, n_mrs: int, cache: dict | None = None) -> np.ndarray:
+def _load_fixed_mr_state(
+    config: dict,
+    n_mrs: int,
+    cache: dict | None = None,
+    expected_mr_ids: list[int] | None = None,
+) -> np.ndarray:
     """Load and validate a fixed MR-state matrix from a pickle artifact."""
     path = str(config["mr_state_path"])
     key = config.get("mr_state_key", "best_candidate")
@@ -1098,11 +1103,18 @@ def _load_fixed_mr_state(config: dict, n_mrs: int, cache: dict | None = None) ->
 
     with open(path, "rb") as f:
         artifact = pickle.load(f)
+    provenance = artifact.get("grn") if isinstance(artifact, dict) else None
+    if isinstance(provenance, list):
+        provenance = provenance[0] if provenance else None
+    if expected_mr_ids is not None:
+        stored_mr_ids = provenance.get("mr_ids") if isinstance(provenance, dict) else None
+        if list(stored_mr_ids or []) != list(expected_mr_ids):
+            raise ValueError(
+                f"fixed MR state {path!r} has MR-ID ordering {stored_mr_ids!r}; "
+                f"generated GRN has {list(expected_mr_ids)!r}"
+            )
     expected_grn_sha256 = config.get("mr_state_grn_sha256")
     if expected_grn_sha256:
-        provenance = artifact.get("grn") if isinstance(artifact, dict) else None
-        if isinstance(provenance, list):
-            provenance = provenance[0] if provenance else None
         actual_grn_sha256 = provenance.get("sha256") if isinstance(provenance, dict) else None
         if actual_grn_sha256 != expected_grn_sha256:
             raise ValueError(
@@ -1600,7 +1612,8 @@ def run_trial(
             )
         elif config.get("mr_state_method", "random") == "fixed_pickle":
             mr_state_np = _load_fixed_mr_state(
-                config, len(mr_ids), cache=mr_state_cache)
+                config, len(mr_ids), cache=mr_state_cache,
+                expected_mr_ids=list(mr_ids))
             mr_state_diagnostics = {
                 "method": "fixed_pickle",
                 "path": config["mr_state_path"],
@@ -2472,7 +2485,8 @@ def regenerate_best(study_or_params, config: dict, final_missing_rate: float | N
     if mr_state_np is None:
         if mr_state_method == "fixed_pickle":
             mr_state_np = _load_fixed_mr_state(
-                config, len(mr_ids), cache=mr_state_cache)
+                config, len(mr_ids), cache=mr_state_cache,
+                expected_mr_ids=list(mr_ids))
         elif mr_state_method == "spectral":
             dag = load_sergio_dag(
                 grn_path,

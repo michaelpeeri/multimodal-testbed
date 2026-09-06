@@ -12,7 +12,6 @@
   "mr_state_method": "fixed_pickle",
   "mr_state_path": "ga_opt_log_20260901_01.de_F05_CR08.seed0.pickle",
   "mr_state_key": "best_candidate",
-  "mr_state_grn_sha256": "f0f653cd1c7db0499a63c6b5f4adc8cb2901a5baac69fb499522cfb0e7dc934",
   "n_candidate_states": 200,
   "n_selected_states": 15,
   "candidate_design": "random",

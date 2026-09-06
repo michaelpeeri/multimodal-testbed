@@ -1,0 +1,198 @@
+{
+  "_comment": "Validation grid for the strongest v0_5b biology-preserving candidates. Each condition uses one candidate's resolved technical/GRN parameters, then compares fixed DE states against IID and constant-state controls over paired full-pipeline replicates.",
+  "_comment_grn_provenance": "The v0_5b tuning round varied GRN parameters while reusing DE pickles generated from the v0_5 GRN. Exact replay therefore intentionally checks MR-ID ordering but disables the fixed-state GRN hash check. Do not use this manifest as evidence that the DE state is GRN-aligned; use the matched-GRN control separately.",
+  "base_config": "synthetic_tuning_20260906.v0_5b.04/tuned_synthetic_config.20260906.v0_5b.04.json",
+  "base_overrides": {
+    "stats_n_pca_components": 20,
+    "stats_n_structure_genes": 500,
+    "stats_percentiles": [5, 25, 50, 75, 95],
+    "check_fixed_state_grn_provenance": false,
+    "weights": {
+      "log_lib_size_mean": 3.0,
+      "log_lib_size_std": 3.0,
+      "log_lib_size_p5": 3.0,
+      "log_lib_size_p25": 3.0,
+      "log_lib_size_p50": 3.0,
+      "log_lib_size_p75": 3.0,
+      "log_lib_size_p95": 3.0,
+      "gene_corr_abs_mean": 0.0,
+      "gene_corr_abs_std": 0.0,
+      "gene_corr_abs_p50": 0.0,
+      "gene_corr_abs_p90": 0.0,
+      "pca_explained_variance_ratio": 0.0,
+      "pca_tail_participation_ratio": 0.0,
+      "pca_pc2_9_explained_variance_ratio": 0.0,
+      "zero_frac": 0.0,
+      "dropout_curve_zero_frac": 3.0,
+      "lib_size_zero_frac": 0.0,
+      "gene_mean_mean": 1.0,
+      "gene_mean_std": 1.0,
+      "gene_var_mean": 1.0,
+      "gene_var_std": 1.0,
+      "gene_mean_p5": 0.5,
+      "gene_mean_p25": 0.5,
+      "gene_mean_p50": 0.5,
+      "gene_mean_p75": 0.5,
+      "gene_mean_p95": 0.5,
+      "gene_var_p5": 0.5,
+      "gene_var_p25": 0.5,
+      "gene_var_p50": 0.5,
+      "gene_var_p75": 0.5,
+      "gene_var_p95": 0.5,
+      "mean_var_log_slope": 0.0,
+      "mean_var_log_corr": 0.0,
+      "gene_corr_abs_normalized_mean": 3.0,
+      "gene_corr_abs_normalized_p50": 3.0,
+      "gene_corr_abs_normalized_std": 3.0,
+      "gene_corr_abs_normalized_p90": 3.0,
+      "nonzero_frac": 3.0,
+      "pca_standardized_explained_variance_ratio": 0.0,
+      "pca_standardized_tail_participation_ratio": 0.0,
+      "pca_standardized_pc2_9_explained_variance_ratio": 0.0,
+      "pca_size_normalized_standardized_explained_variance_ratio": 0.0,
+      "pca_size_normalized_standardized_tail_participation_ratio": 0.0,
+      "pca_size_normalized_standardized_pc2_9_explained_variance_ratio": 0.0
+    }
+  },
+  "baseline": "iid_random",
+  "arms": [
+    {
+      "name": "iid_random",
+      "candidate_method": "iid",
+      "candidate_params": {"n_candidate_states": 64},
+      "selection_method": "random",
+      "selection_params": {"n_selected_states": 15}
+    },
+    {
+      "name": "constant_iid_mean",
+      "candidate_method": "fixed_array",
+      "candidate_params": {"path": "mr_state_constant_iid_mean.npy"},
+      "selection_method": "identity",
+      "selection_params": {"n_selected_states": 15}
+    },
+    {
+      "name": "de_seed0",
+      "candidate_method": "fixed_pickle",
+      "candidate_params": {
+        "path": "ga_opt_log_20260901_01.de_F05_CR08.seed0.pickle",
+        "key": "best_candidate"
+      },
+      "selection_method": "identity",
+      "selection_params": {"n_selected_states": 15}
+    },
+    {
+      "name": "de_seed1",
+      "candidate_method": "fixed_pickle",
+      "candidate_params": {
+        "path": "ga_opt_log_20260901_01.de_F05_CR08.seed1.pickle",
+        "key": "best_candidate"
+      },
+      "selection_method": "identity",
+      "selection_params": {"n_selected_states": 15}
+    }
+  ],
+  "n_replicates": 12,
+  "seed_base": 0,
+  "include_sergio": true,
+  "clean_simulation": false,
+  "n_cells": 600,
+  "mr_jitter_std": 0.0,
+  "store_candidate_pools": false,
+  "verbose": true,
+  "output_template": "mr_state_comparison.20260906_v0_5b_{name}.pickle",
+  "plot_template": "mr_state_comparison.20260906_v0_5b_{name}.png",
+  "grid": [
+    {
+      "name": "04_32",
+      "base_overrides": {
+        "noise_params": 0.2431768144121976,
+        "decays": 0.9890565821140479,
+        "cluster_conc": 49.39214920078023,
+        "outlier_prob": 0.016848503838117212,
+        "outlier_mean": 0.8286305191366115,
+        "outlier_scale": 0.9083749863627195,
+        "lib_size_mean": 4.6,
+        "lib_size_scale": 0.4,
+        "dropout_shape": 18.65399849579603,
+        "dropout_percentile": 91.11298626644775,
+        "grn_k_low": 0.7552438352855727,
+        "grn_k_span": 0.21946095829444978,
+        "hill_coeff": 2.3929374065737523,
+        "unknown_mode_repressor_prob": 0.114493921702007,
+        "coherency_bias": 0.5478452487920739,
+        "canalization_strength": 0.8454049035138966,
+        "balancing_strength": 0.4070154528863904,
+        "path_decay": 0.5583142273761066
+      }
+    },
+    {
+      "name": "04_30",
+      "base_overrides": {
+        "noise_params": 0.24645617765094577,
+        "decays": 0.9797121597390771,
+        "cluster_conc": 48.60155706836204,
+        "outlier_prob": 0.017314293448483144,
+        "outlier_mean": 0.8276990034714092,
+        "outlier_scale": 0.922436689218442,
+        "lib_size_mean": 4.6,
+        "lib_size_scale": 0.4,
+        "dropout_shape": 18.89297807412276,
+        "dropout_percentile": 90.13031580692495,
+        "grn_k_low": 0.7838590745063545,
+        "grn_k_span": 0.2198451003786288,
+        "hill_coeff": 2.391873931305724,
+        "unknown_mode_repressor_prob": 0.12286735379692032,
+        "coherency_bias": 0.5389911219010839,
+        "canalization_strength": 0.8760626913265579,
+        "balancing_strength": 0.6227297950019813,
+        "path_decay": 0.5595580826025759
+      }
+    },
+    {
+      "name": "04_46",
+      "base_overrides": {
+        "noise_params": 0.279959247490156,
+        "decays": 1.0343837452856013,
+        "cluster_conc": 27.06389790176871,
+        "outlier_prob": 0.02618732124396113,
+        "outlier_mean": 1.038321996157011,
+        "outlier_scale": 0.8534079593694914,
+        "lib_size_mean": 4.6,
+        "lib_size_scale": 0.4,
+        "dropout_shape": 18.98702487444086,
+        "dropout_percentile": 93.2892998608872,
+        "grn_k_low": 1.00574071398152,
+        "grn_k_span": 0.659274594779244,
+        "hill_coeff": 2.340167920483752,
+        "unknown_mode_repressor_prob": 0.10849061236663596,
+        "coherency_bias": 0.9370130204734122,
+        "canalization_strength": 0.9425087769191588,
+        "balancing_strength": 0.48125126912687255,
+        "path_decay": 0.6483332947021758
+      }
+    },
+    {
+      "name": "02_41",
+      "base_overrides": {
+        "noise_params": 0.2902349865658259,
+        "decays": 1.3786880507120038,
+        "cluster_conc": 17.126851180501,
+        "outlier_prob": 0.008960480923660304,
+        "outlier_mean": 0.971816257263213,
+        "outlier_scale": 1.3184632570390722,
+        "lib_size_mean": 4.6,
+        "lib_size_scale": 0.4,
+        "dropout_shape": 13.793845851502503,
+        "dropout_percentile": 88.81597999657359,
+        "grn_k_low": 0.7898871000230289,
+        "grn_k_span": 2.738771375026796,
+        "hill_coeff": 2.4454059327562416,
+        "unknown_mode_repressor_prob": 0.6977762653076106,
+        "coherency_bias": 0.9089879466361231,
+        "canalization_strength": 0.9957885043778011,
+        "balancing_strength": 0.4761961299372032,
+        "path_decay": 0.7890788255277712
+      }
+    }
+  ]
+}

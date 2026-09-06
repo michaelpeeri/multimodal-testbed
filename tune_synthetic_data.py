@@ -25,7 +25,8 @@ Optuna study where each trial:
      (e.g. TRRUST) via generate_sergio_grn_from_reference, with the trial's
      suggested K/Hill-coefficient distribution and unknown_mode_repressor_prob;
   3. samples an mr_state (master-regulator basal production rate) matrix,
-     either iid or by spectral selection from a larger candidate pool;
+     either iid, by spectral selection from a larger candidate pool, or from
+     a fixed DE/GA pickle;
   4. runs make_synthetic_data6(..., missing_rate=0.0) to produce a candidate
      synthetic matrix;
   5. computes compute_summary_stats() on the candidate and scores it against
@@ -56,7 +57,9 @@ from top-level config keys -- they are not part of search_space. So are:
     candidate_design/selection_* settings: fixed study configuration, not
     entries in search_space. ``random`` preserves the historical iid sampler;
     ``spectral`` selects the configured number of rows using the DAG/Hill
-    surrogate. Spectral selection requires n_selected_states == n_clusters.
+    surrogate. ``fixed_pickle`` loads a complete matrix from
+    mr_state_path/mr_state_key for replaying an externally optimized DE/GA
+    state. Spectral selection requires n_selected_states == n_clusters.
   - grn_seed: fixes which reference-subgraph topology/DAG-order is sampled
     from reference_grn_path, so every trial shares the exact same GRN
     *structure* -- only the K-magnitude/Hill-coefficient/repressor-sign
@@ -420,11 +423,21 @@ See synthetic_tuning_config.example.json for a full example. Notable keys
                             streaming params -- see that function's docstring;
                             defaults match its own defaults).
     n_clusters/n_genes/n_cells/sampling_state/shared_coop_state/dt/
-    noise_type/min_cells_per_cluster/add_outlier_genes/add_lib_size_effect/
-    add_dropout/convert_to_umi_counts : fixed make_synthetic_data6 shape/
-                            toggle parameters, forwarded unchanged to every
-                            trial.
-    mr_state_method            : "random" or "spectral"; fixed per study.
+    noise_type/min_cells_per_cluster : fixed make_synthetic_data6 settings.
+                            add_outlier_genes/add_lib_size_effect/add_dropout/
+                            convert_to_umi_counts are fixed unless explicitly
+                            listed in search_space as categorical switches;
+                            then Optuna controls them per trial.
+    mr_state_method            : "random", "spectral", or "fixed_pickle";
+                            fixed per study. fixed_pickle loads the matrix at
+                            mr_state_path[mr_state_key].
+    mr_state_path/mr_state_key: fixed-pickle path and dictionary key;
+                            default key is "best_candidate".
+    mr_state_grn_sha256      : optional GRN-file SHA256 provenance for a
+                            fixed_pickle state. When set, the pickle metadata
+                            and every generated trial GRN must match it;
+                            mismatches are pruned rather than silently
+                            evaluating a DE state against a different GRN.
     n_candidate_states         : spectral candidate-pool size.
     n_selected_states          : spectral output row count; must equal
                                  n_clusters for spectral mode.
@@ -488,6 +501,17 @@ See synthetic_tuning_config.example.json for a full example. Notable keys
                             reference and every candidate.
     weights/distance_eps/distance_eps_frac/distance_eps_abs_floor : compute_
                             stats_distance's config (see above).
+    biological_signal       : optional target-free penalty/guard. Its
+                            minimums may include
+                            biological_label_between_variance_fraction,
+                            biological_within_minus_across,
+                            biological_mr_state_expression_distance_correlation,
+                            and biological_split_half_subspace_stability.
+                            These are computed from candidate labels, the MR
+                            state, GRN modules, and split halves; they are
+                            deliberately not added to the unlabeled reference
+                            target distance. Use this layer for PCA-derived
+                            biological quality, not PCA-tail rank matching.
     max_lib_size_zero_frac : float, default 0.05 -- hard guard (see "Hard
                             guards against degenerate candidates" below):
                             a trial is pruned if candidate_stats
@@ -496,9 +520,9 @@ See synthetic_tuning_config.example.json for a full example. Notable keys
                             pruned if candidate_stats[pca_pc1_dominance_key]
                             [0] exceeds this factor times target_stats's own
                             value at that same key.
-    pca_pc1_dominance_key   : str, default "pca_explained_variance_ratio" --
-                            which PCA family's PC1 the max_pca_pc1_ratio_
-                            factor guard above checks. Historically always
+     pca_pc1_dominance_key   : str|None, default "pca_explained_variance_ratio" --
+                             which PCA family's PC1 the max_pca_pc1_ratio_
+                             factor guard above checks. Historically always
                             the raw (un-normalized) family -- but as of the
                             20260816/20260820 rounds (see AGENTS.md), the
                             *objective* itself may weight a different PCA
@@ -517,12 +541,14 @@ See synthetic_tuning_config.example.json for a full example. Notable keys
                             "pca_size_normalized_standardized_explained_
                             variance_ratio") to keep the guard aligned with
                             the objective -- and re-tune max_pca_pc1_ratio_
-                            factor itself when doing so, since each family's
-                            plausible PC1 range differs (the size-normalized-
-                            standardized family's PC1 sits much closer to
-                            its own tail than the raw family's does, so the
-                            same factor value doesn't mean the same thing in
-                            both families).
+                             factor itself when doing so, since each family's
+                             plausible PC1 range differs (the size-normalized-
+                             standardized family's PC1 sits much closer to
+                             its own tail than the raw family's does, so the
+                             same factor value doesn't mean the same thing in
+                             both families). Set to null to disable this
+                             target-based PCA guard when PCA quality is being
+                             enforced through biological_signal instead.
     storage                : str, default "sqlite:///synthetic_tuning.db" --
                             same sqlite-resumability pattern as tuning.py;
                             run this script from multiple processes against
@@ -628,6 +654,7 @@ plus `optuna`. It can only be syntax-checked here, not executed.
 """
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -653,6 +680,7 @@ from synthetic_data import (
     load_sergio_dag,
     make_synthetic_data6,
     sample_mr_state_from_spectral_subset,
+    _gene_module_correlations,
 )
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -673,6 +701,17 @@ _SIM_KWARG_DEFAULTS = {
     "dropout_percentile": 82.0,
 }
 
+# These are explicit make_synthetic_data6 arguments rather than entries in
+# **sim_kwargs.  Historical configs keep their top-level fixed values, while a
+# study may opt into per-trial categorical control by listing one or more of
+# these names in search_space.
+_STAGE_SWITCH_DEFAULTS = {
+    "add_outlier_genes":      True,
+    "add_lib_size_effect":    True,
+    "add_dropout":            True,
+    "convert_to_umi_counts":  True,
+}
+
 # generate_sergio_grn_from_reference kwargs that are tunable here (via a
 # derived k_dist/hill_coeff_dist -- see _split_resolved) -- kept in sync
 # with that function's own k_dist=('uniform', 1.0, 5.0) and
@@ -689,7 +728,11 @@ _GRN_KWARG_DEFAULTS = {
     "path_decay":                  0.9,
 }
 
-TUNABLE_KEYS = frozenset(_SIM_KWARG_DEFAULTS) | frozenset(_GRN_KWARG_DEFAULTS)
+TUNABLE_KEYS = (
+    frozenset(_SIM_KWARG_DEFAULTS)
+    | frozenset(_STAGE_SWITCH_DEFAULTS)
+    | frozenset(_GRN_KWARG_DEFAULTS)
+)
 
 # compute_summary_stats entries excluded from compute_stats_distance:
 # structural (not distributional) entries, not stats to be matched.
@@ -740,6 +783,8 @@ _CONFIG_DEFAULTS = {
     # MR-state selection -- fixed per study, not part of search_space. The
     # historical default remains iid; spectral studies opt in explicitly.
     "mr_state_method":       "random",
+    "mr_state_path":         None,
+    "mr_state_key":          "best_candidate",
     "n_candidate_states":    200,
     "n_selected_states":     15,
     "candidate_design":      "random",
@@ -822,6 +867,18 @@ _CONFIG_DEFAULTS = {
     # regenerate_best() only -- ignored during tuning itself (missing_rate
     # is forced to 0.0 for every trial, see module docstring)
     "final_missing_rate": 0.1,
+
+    # Target-free biological-signal guard/penalty. These diagnostics are
+    # computed from candidate labels, the fixed MR state, GRN module
+    # assignments, and split-half expression structure. Existing configs keep
+    # this disabled so their objective remains unchanged.
+    "biological_signal": {
+        "enabled": False,
+        "penalty_weight": 0.0,
+        "hard_prune": False,
+        "minimums": {},
+        "scales": {},
+    },
 }
 
 
@@ -853,6 +910,20 @@ def load_config(path: str) -> dict:
                 f"(expected 'float', 'int', or 'categorical')"
             )
 
+    for name in _STAGE_SWITCH_DEFAULTS:
+        if not isinstance(config[name], bool):
+            raise ValueError(f"config[{name!r}] must be boolean")
+        spec = config["search_space"].get(name)
+        if spec is not None:
+            choices = spec.get("choices")
+            if spec.get("type") != "categorical" or not choices or not all(
+                isinstance(choice, bool) for choice in choices
+            ):
+                raise ValueError(
+                    f"search_space[{name!r}] must be a non-empty categorical list "
+                    "of booleans"
+                )
+
     if config["shared_coop_state"] > 0:
         raise ValueError(
             "config['shared_coop_state'] must be <= 0 -- "
@@ -865,10 +936,19 @@ def load_config(path: str) -> dict:
     if config["reference_n_top_genes"] is None:
         config["reference_n_top_genes"] = config["n_genes"]
 
-    if config["mr_state_method"] not in ("random", "spectral"):
+    if config["mr_state_method"] not in ("random", "spectral", "fixed_pickle"):
         raise ValueError(
             f"Unsupported mr_state_method {config['mr_state_method']!r}; "
-            "expected 'random' or 'spectral'"
+            "expected 'random', 'spectral', or 'fixed_pickle'"
+        )
+    if config["mr_state_method"] == "fixed_pickle" and not config.get("mr_state_path"):
+        raise ValueError(
+            "mr_state_method='fixed_pickle' requires a non-empty mr_state_path"
+        )
+    if (config["mr_state_method"] == "fixed_pickle"
+            and not Path(config["mr_state_path"]).is_file()):
+        raise ValueError(
+            f"fixed MR-state pickle does not exist: {config['mr_state_path']!r}"
         )
     if (not isinstance(config["n_candidate_states"], int)
             or config["n_candidate_states"] < 2):
@@ -899,6 +979,28 @@ def load_config(path: str) -> dict:
             f"n_clusters={config['n_clusters']}"
         )
 
+    biological_signal = config.get("biological_signal") or {}
+    if not isinstance(biological_signal, dict):
+        raise ValueError("biological_signal must be a JSON object")
+    for key in ("enabled", "hard_prune"):
+        if key in biological_signal and not isinstance(biological_signal[key], bool):
+            raise ValueError(f"biological_signal[{key!r}] must be boolean")
+    penalty_weight = biological_signal.get("penalty_weight", 0.0)
+    if not isinstance(penalty_weight, (int, float)) or penalty_weight < 0:
+        raise ValueError("biological_signal.penalty_weight must be >= 0")
+    minimums = biological_signal.get("minimums", {})
+    scales = biological_signal.get("scales", {})
+    if not isinstance(minimums, dict) or not isinstance(scales, dict):
+        raise ValueError("biological_signal.minimums/scales must be objects")
+    for name, value in {**minimums, **scales}.items():
+        if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+            raise ValueError(
+                f"biological_signal threshold {name!r} must be finite numeric"
+            )
+    for name, scale in scales.items():
+        if scale <= 0:
+            raise ValueError(f"biological_signal.scales[{name!r}] must be > 0")
+
     if config["sampler"] not in _SAMPLERS:
         raise ValueError(f"Unsupported sampler {config['sampler']!r}. Supported: {list(_SAMPLERS)}")
     if config["pruner"] not in _PRUNERS:
@@ -923,12 +1025,28 @@ def suggest_from_spec(trial: optuna.Trial, name: str, spec: dict):
     raise ValueError(f"Unsupported search_space type {kind!r} for {name!r}")
 
 
-def suggest_sim_cfg(trial: optuna.Trial, search_space: dict) -> dict:
+def suggest_sim_cfg(
+    trial: optuna.Trial,
+    search_space: dict,
+    fixed_config: dict | None = None,
+) -> dict:
     """Resolve every tunable key to a value: suggested via Optuna for keys
     present in search_space, falling back to _SIM_KWARG_DEFAULTS/
-    _GRN_KWARG_DEFAULTS (matching the wrapped functions' own defaults) for
-    keys left out of search_space."""
+    _GRN_KWARG_DEFAULTS (matching the wrapped functions' own defaults) and
+    fixed_config's stage-switch values for keys left out of search_space."""
     resolved = {**_SIM_KWARG_DEFAULTS, **_GRN_KWARG_DEFAULTS}
+    if fixed_config is not None:
+        resolved.update({
+            key: fixed_config[key]
+            for key in (*_SIM_KWARG_DEFAULTS, *_GRN_KWARG_DEFAULTS)
+            if key in fixed_config
+        })
+    resolved.update(_STAGE_SWITCH_DEFAULTS)
+    if fixed_config is not None:
+        resolved.update({
+            key: bool(fixed_config[key])
+            for key in _STAGE_SWITCH_DEFAULTS
+        })
     for name, spec in search_space.items():
         resolved[name] = suggest_from_spec(trial, name, spec)
     return resolved
@@ -968,6 +1086,189 @@ def _sample_mr_state(n_clusters: int, n_mrs: int, low: float, high: float, seed:
     cluster row is drawn i.i.d. from the same range."""
     rng = np.random.default_rng(seed)
     return rng.uniform(low, high, size=(n_clusters, n_mrs))
+
+
+def _load_fixed_mr_state(config: dict, n_mrs: int, cache: dict | None = None) -> np.ndarray:
+    """Load and validate a fixed MR-state matrix from a pickle artifact."""
+    path = str(config["mr_state_path"])
+    key = config.get("mr_state_key", "best_candidate")
+    cache_key = ("fixed_pickle", os.path.abspath(path), key, config["n_clusters"], n_mrs)
+    if cache is not None and cache_key in cache:
+        return cache[cache_key].copy()
+
+    with open(path, "rb") as f:
+        artifact = pickle.load(f)
+    expected_grn_sha256 = config.get("mr_state_grn_sha256")
+    if expected_grn_sha256:
+        provenance = artifact.get("grn") if isinstance(artifact, dict) else None
+        if isinstance(provenance, list):
+            provenance = provenance[0] if provenance else None
+        actual_grn_sha256 = provenance.get("sha256") if isinstance(provenance, dict) else None
+        if actual_grn_sha256 != expected_grn_sha256:
+            raise ValueError(
+                f"fixed MR state {path!r} has GRN sha256 {actual_grn_sha256!r}; "
+                f"expected {expected_grn_sha256!r}"
+            )
+    state = artifact[key] if isinstance(artifact, dict) else artifact
+    state = np.asarray(state, dtype=np.float32)
+    expected = (config["n_clusters"], n_mrs)
+    if state.shape != expected:
+        raise ValueError(
+            f"fixed MR state {path!r}[{key!r}] has shape {state.shape}; "
+            f"expected {expected}"
+        )
+    if not np.isfinite(state).all() or (state < 0).any():
+        raise ValueError(f"fixed MR state {path!r}[{key!r}] contains invalid values")
+    if cache is not None:
+        cache[cache_key] = state.copy()
+    return state
+
+
+def _sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _mr_state_expression_distance_correlation(
+    X_sim: torch.Tensor,
+    cluster_labels: np.ndarray,
+    mr_state: np.ndarray,
+) -> float:
+    """Correlate pairwise MR-state and expression-centroid distances.
+
+    This is target-free but state-linked: it rewards expression structure that
+    follows the supplied multidimensional MR programs, rather than dimensions
+    that merely increase PCA tail rank under noise or dropout. A constant MR
+    state, or a degenerate expression centroid matrix, returns zero.
+    """
+    X = X_sim.detach().to(torch.float64).cpu().numpy()
+    labels = np.asarray(cluster_labels)
+    state = np.asarray(mr_state, dtype=np.float64)
+    if X.ndim != 2 or labels.ndim != 1 or X.shape[0] != labels.size:
+        return 0.0
+    unique_labels = np.unique(labels)
+    if unique_labels.size != state.shape[0] or unique_labels.size < 2:
+        return 0.0
+
+    with np.errstate(invalid="ignore"):
+        gene_mean = np.nanmean(X, axis=0)
+    gene_mean = np.where(np.isfinite(gene_mean), gene_mean, 0.0)
+    filled = np.where(np.isfinite(X), X, gene_mean[None, :])
+    centered = filled - filled.mean(axis=0, keepdims=True)
+    gene_std = np.maximum(centered.std(axis=0, keepdims=True), 1e-6)
+    standardized = centered / gene_std
+    centroids = np.vstack([
+        standardized[labels == label].mean(axis=0)
+        for label in unique_labels
+    ])
+
+    state = state - state.mean(axis=0, keepdims=True)
+    state /= np.maximum(state.std(axis=0, keepdims=True), 1e-6)
+    centroids -= centroids.mean(axis=0, keepdims=True)
+
+    upper = np.triu_indices(unique_labels.size, k=1)
+    state_distances = np.linalg.norm(state[:, None, :] - state[None, :, :], axis=2)[upper]
+    expression_distances = np.linalg.norm(
+        centroids[:, None, :] - centroids[None, :, :], axis=2
+    )[upper]
+    if (not np.isfinite(state_distances).all()
+            or not np.isfinite(expression_distances).all()
+            or np.std(state_distances) <= 1e-12
+            or np.std(expression_distances) <= 1e-12):
+        return 0.0
+    value = float(np.corrcoef(state_distances, expression_distances)[0, 1])
+    return value if math.isfinite(value) else 0.0
+
+
+_BIOLOGICAL_SIGNAL_KEYS = frozenset({
+    "biological_label_between_variance_fraction",
+    "biological_label_centroid_participation_ratio",
+    "biological_label_holdout_accuracy",
+    "biological_within_minus_across",
+    "biological_mr_state_expression_distance_correlation",
+    "biological_split_half_subspace_stability",
+})
+
+
+def _compute_biological_signal_stats(
+    X_sim: torch.Tensor,
+    cluster_labels: np.ndarray,
+    mr_state: np.ndarray,
+    candidate_stats: dict,
+    grn_diagnostics: dict,
+    mr_ids: list[int],
+    gene_id_to_symbol: dict,
+    config: dict,
+) -> dict:
+    """Return target-free diagnostics for reproducible biological programs."""
+    # Keep the label-aware implementation shared with the harness used for
+    # stage-isolation analysis, while adding the explicit MR-state alignment
+    # metric needed by fixed DE-state tuning.
+    from mr_state_harness import _label_aware_expression_metrics
+
+    label_metrics = _label_aware_expression_metrics(
+        X_sim, cluster_labels, seed=config["stats_seed"])
+    winner_mr_by_gene = (
+        (grn_diagnostics.get("tgt_ids", []), grn_diagnostics.get("winner_mr", []))
+        if grn_diagnostics.get("winner_mr") else None
+    )
+    module_metrics = _gene_module_correlations(
+        X_sim,
+        cluster_labels,
+        winner_mr_by_gene,
+        mr_ids,
+        gene_id_to_symbol,
+        n_structure_genes=config["stats_n_structure_genes"],
+        seed=config["stats_seed"],
+    )
+    return {
+        "biological_label_between_variance_fraction": float(
+            label_metrics["label_between_variance_fraction"]),
+        "biological_label_centroid_participation_ratio": float(
+            label_metrics["label_centroid_participation_ratio"]),
+        "biological_label_holdout_accuracy": float(
+            label_metrics["label_holdout_accuracy"]),
+        "biological_within_minus_across": float(
+            module_metrics["within_minus_across"]),
+        "biological_mr_state_expression_distance_correlation":
+            _mr_state_expression_distance_correlation(
+                X_sim, cluster_labels, mr_state),
+        "biological_split_half_subspace_stability": float(
+            candidate_stats.get(
+                "pca_size_normalized_standardized_split_half_subspace_stability",
+                float("nan"),
+            )
+        ),
+    }
+
+
+def _biological_signal_penalty(candidate_stats: dict, config: dict) -> tuple[float, dict, list[str]]:
+    """Score deficits below configured target-free biological minimums."""
+    settings = config.get("biological_signal") or {}
+    if not settings.get("enabled", False):
+        return 0.0, {}, []
+    minimums = settings.get("minimums") or {}
+    scales = settings.get("scales") or {}
+    terms = {}
+    failed = []
+    for key, minimum in minimums.items():
+        if key not in _BIOLOGICAL_SIGNAL_KEYS:
+            raise ValueError(f"unknown biological-signal metric {key!r}")
+        value = float(candidate_stats.get(key, float("nan")))
+        if not math.isfinite(value):
+            failed.append(key)
+            terms[key] = 1.0
+            continue
+        deficit = max(0.0, float(minimum) - value)
+        if deficit > 0.0:
+            failed.append(key)
+        scale = float(scales.get(key, max(abs(float(minimum)), 1.0)))
+        terms[key] = (deficit / scale) ** 2
+    penalty = float(np.mean(list(terms.values()))) if terms else 0.0
+    return penalty, terms, failed
 
 
 _STAT_FAMILY_SUFFIX_RE = re.compile(r"_(mean|std|p\d+)$")
@@ -1202,8 +1503,11 @@ def run_trial(
     parameters, score it against target_stats via compute_stats_distance,
     and return that scalar distance (to minimize). See module docstring
     for the full pipeline description."""
-    resolved = suggest_sim_cfg(trial, config["search_space"])
-    trial.set_user_attr("resolved_params", {k: float(v) for k, v in resolved.items()})
+    resolved = suggest_sim_cfg(trial, config["search_space"], fixed_config=config)
+    trial.set_user_attr(
+        "resolved_params",
+        {k: (v if isinstance(v, bool) else float(v)) for k, v in resolved.items()},
+    )
     sim_kwargs, grn_k_dist, hill_coeff_dist, unknown_mode_repressor_prob, grn_coherency_kwargs = _split_resolved(resolved)
 
     grn_tmp_dir = config["grn_tmp_dir"] or tempfile.gettempdir()
@@ -1232,6 +1536,19 @@ def run_trial(
         )
     except Exception as e:
         _prune(trial, "grn_generation_failed", str(e))
+
+    expected_grn_sha256 = config.get("mr_state_grn_sha256")
+    if expected_grn_sha256 and config.get("mr_state_method") == "fixed_pickle":
+        actual_grn_sha256 = _sha256_file(grn_path)
+        if actual_grn_sha256 != expected_grn_sha256:
+            if os.path.exists(grn_path):
+                os.remove(grn_path)
+            _prune(
+                trial,
+                "fixed_mr_state_grn_mismatch",
+                f"generated GRN sha256={actual_grn_sha256}; "
+                f"fixed MR-state sha256={expected_grn_sha256}",
+            )
 
     # Cheap scalar summaries of the coherency_bias/canalization_strength/
     # balancing_strength mechanism's behavior on this trial -- always
@@ -1281,6 +1598,14 @@ def run_trial(
                 cache=mr_state_cache,
                 diagnostics=mr_state_diagnostics,
             )
+        elif config.get("mr_state_method", "random") == "fixed_pickle":
+            mr_state_np = _load_fixed_mr_state(
+                config, len(mr_ids), cache=mr_state_cache)
+            mr_state_diagnostics = {
+                "method": "fixed_pickle",
+                "path": config["mr_state_path"],
+                "key": config.get("mr_state_key", "best_candidate"),
+            }
         else:
             mr_state_np = _sample_mr_state(
                 config["n_clusters"], len(mr_ids),
@@ -1318,10 +1643,10 @@ def run_trial(
             sampling_state=config["sampling_state"],
             dt=config["dt"],
             min_cells_per_cluster=config["min_cells_per_cluster"],
-            add_outlier_genes=config["add_outlier_genes"],
-            add_lib_size_effect=config["add_lib_size_effect"],
-            add_dropout=config["add_dropout"],
-            convert_to_umi_counts=config["convert_to_umi_counts"],
+            add_outlier_genes=resolved["add_outlier_genes"],
+            add_lib_size_effect=resolved["add_lib_size_effect"],
+            add_dropout=resolved["add_dropout"],
+            convert_to_umi_counts=resolved["convert_to_umi_counts"],
             missing_rate=0.0,
             seed=config["sim_seed"],
             device=device,
@@ -1361,11 +1686,41 @@ def run_trial(
         candidate_stats.get("pca_standardized_tail_participation_ratio", float("nan")),
     )
 
+    if config.get("biological_signal", {}).get("enabled", False):
+        candidate_stats.update(_compute_biological_signal_stats(
+            X_sim,
+            cluster_labels,
+            mr_state_np,
+            candidate_stats,
+            grn_diagnostics,
+            mr_ids,
+            gene_id_to_symbol,
+            config,
+        ))
+    biological_penalty, biological_terms, biological_failures = (
+        _biological_signal_penalty(candidate_stats, config)
+    )
+    trial.set_user_attr("biological_signal_metrics", {
+        key: float(candidate_stats.get(key, float("nan")))
+        for key in _BIOLOGICAL_SIGNAL_KEYS
+    })
+    trial.set_user_attr("biological_signal_penalty", biological_penalty)
+    trial.set_user_attr("biological_signal_penalty_terms", biological_terms)
+    trial.set_user_attr("biological_signal_failed_metrics", biological_failures)
+
     if config["grn_archive_dir"]:
         archive_dir = Path(config["grn_archive_dir"])
         archive_dir.mkdir(parents=True, exist_ok=True)
         with open(archive_dir / f"trial{trial.number}.candidate_stats.json", "w") as f:
             json.dump(_jsonify_stats(candidate_stats), f)
+
+    if (config.get("biological_signal", {}).get("hard_prune", False)
+            and biological_failures):
+        _prune(
+            trial,
+            "biological_signal_below_minimum",
+            ", ".join(biological_failures),
+        )
 
     # --- hard guards against degenerate/collapsed candidates -- see
     # module docstring's "Hard guards against degenerate candidates" ---
@@ -1393,9 +1748,9 @@ def run_trial(
     # defaults to the raw family but should be pointed at whichever PCA
     # family the objective's weights dict actually scores.
     pc1_key = config.get("pca_pc1_dominance_key", "pca_explained_variance_ratio")
-    cand_pc1_pca = candidate_stats.get(pc1_key, np.array([]))
-    target_pc1_pca = target_stats.get(pc1_key, np.array([]))
-    if len(cand_pc1_pca) and len(target_pc1_pca):
+    cand_pc1_pca = candidate_stats.get(pc1_key, np.array([])) if pc1_key else np.array([])
+    target_pc1_pca = target_stats.get(pc1_key, np.array([])) if pc1_key else np.array([])
+    if pc1_key and len(cand_pc1_pca) and len(target_pc1_pca):
         max_pc1 = float(target_pc1_pca[0]) * config["max_pca_pc1_ratio_factor"]
         if float(cand_pc1_pca[0]) > max_pc1:
             _prune(
@@ -1405,12 +1760,16 @@ def run_trial(
                 f"factor={config['max_pca_pc1_ratio_factor']})",
             )
 
-    distance, breakdown = compute_stats_distance(
+    target_distance, breakdown = compute_stats_distance(
         target_stats, candidate_stats, weights=config.get("weights"), eps=config["distance_eps"],
         eps_frac=config.get("distance_eps_frac", 0.05),
         eps_abs_floor=config.get("distance_eps_abs_floor", 0.02),
     )
     trial.set_user_attr("skipped_stats_keys", breakdown["skipped"])
+    distance = target_distance + config.get("biological_signal", {}).get(
+        "penalty_weight", 0.0) * biological_penalty
+    trial.set_user_attr("target_distance", target_distance)
+    trial.set_user_attr("objective_distance", distance)
     if not math.isfinite(distance):
         _prune(trial, "non_finite_distance")
 
@@ -1868,7 +2227,7 @@ def run(config_path: str) -> optuna.Study:
     # short-circuit in run_trial()), so this is a loud warning even though
     # nothing strictly breaks.
     pc1_key = config.get("pca_pc1_dominance_key", "pca_explained_variance_ratio")
-    if pc1_key not in target_stats:
+    if pc1_key and pc1_key not in target_stats:
         print(
             f"  *** WARNING: config['pca_pc1_dominance_key']={pc1_key!r} is not a key "
             f"in target_stats -- the degenerate_pca_pc1_dominance hard guard will "
@@ -1933,6 +2292,9 @@ def run(config_path: str) -> optuna.Study:
                 "n_genes":             config["n_genes"],
                 "n_cells":             config["n_cells"],
                 "mr_state_method":     config.get("mr_state_method", "random"),
+                "mr_state_path":       config.get("mr_state_path"),
+                "mr_state_key":        config.get("mr_state_key"),
+                "mr_state_grn_sha256": config.get("mr_state_grn_sha256"),
                 "n_candidate_states":  config.get("n_candidate_states"),
                 "n_selected_states":   config.get("n_selected_states"),
                 "candidate_design":    config.get("candidate_design"),
@@ -1943,6 +2305,7 @@ def run(config_path: str) -> optuna.Study:
                 "shared_coop_state":   config["shared_coop_state"],
                 "grn_seed":            config["grn_seed"],
                 "sim_seed":            config["sim_seed"],
+                "biological_signal":   config.get("biological_signal"),
             },
         }
         out_path = Path(config["output"])
@@ -2056,7 +2419,16 @@ def regenerate_best(study_or_params, config: dict, final_missing_rate: float | N
     else:
         params = study_or_params
 
-    resolved = {**_SIM_KWARG_DEFAULTS, **_GRN_KWARG_DEFAULTS, **params}
+    resolved = {
+        **_SIM_KWARG_DEFAULTS,
+        **_GRN_KWARG_DEFAULTS,
+        **_STAGE_SWITCH_DEFAULTS,
+        **{
+            key: bool(config[key])
+            for key in _STAGE_SWITCH_DEFAULTS
+        },
+        **params,
+    }
     sim_kwargs, grn_k_dist, hill_coeff_dist, unknown_mode_repressor_prob, grn_coherency_kwargs = _split_resolved(resolved)
 
     grn_tmp_dir = config["grn_tmp_dir"] or tempfile.gettempdir()
@@ -2083,13 +2455,25 @@ def regenerate_best(study_or_params, config: dict, final_missing_rate: float | N
     )
 
     mr_state_method = config.get("mr_state_method", "random")
+    expected_grn_sha256 = config.get("mr_state_grn_sha256")
+    if expected_grn_sha256 and mr_state_method == "fixed_pickle":
+        actual_grn_sha256 = _sha256_file(grn_path)
+        if actual_grn_sha256 != expected_grn_sha256:
+            raise ValueError(
+                f"generated GRN sha256={actual_grn_sha256!r} does not match "
+                f"fixed MR-state sha256={expected_grn_sha256!r}"
+            )
+
     mr_state_cache = {}
     mr_state_np = _load_matching_mr_state_artifact(
         config, resolved, mr_state_method, len(mr_ids)
     )
     mr_state_diagnostics = {"method": mr_state_method, "artifact_cache_hit": mr_state_np is not None}
     if mr_state_np is None:
-        if mr_state_method == "spectral":
+        if mr_state_method == "fixed_pickle":
+            mr_state_np = _load_fixed_mr_state(
+                config, len(mr_ids), cache=mr_state_cache)
+        elif mr_state_method == "spectral":
             dag = load_sergio_dag(
                 grn_path,
                 shared_coop_state=config["shared_coop_state"],
@@ -2131,10 +2515,10 @@ def regenerate_best(study_or_params, config: dict, final_missing_rate: float | N
         sampling_state=config["sampling_state"],
         dt=config["dt"],
         min_cells_per_cluster=config["min_cells_per_cluster"],
-        add_outlier_genes=config["add_outlier_genes"],
-        add_lib_size_effect=config["add_lib_size_effect"],
-        add_dropout=config["add_dropout"],
-        convert_to_umi_counts=config["convert_to_umi_counts"],
+        add_outlier_genes=resolved["add_outlier_genes"],
+        add_lib_size_effect=resolved["add_lib_size_effect"],
+        add_dropout=resolved["add_dropout"],
+        convert_to_umi_counts=resolved["convert_to_umi_counts"],
         missing_rate=missing_rate,
         seed=sim_seed,
         device=device,

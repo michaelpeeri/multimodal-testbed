@@ -358,11 +358,20 @@ def _candidate_pool(
             raise ValueError(
                 f"arm {arm['name']!r} uses fixed_pickle but path {path!r} is not a pickle"
             )
+        # Some historical tuning rounds intentionally reused a fixed state
+        # while varying GRN parameters. Keep strict hash validation by default,
+        # but allow those replays to opt out explicitly while retaining MR-ID
+        # ordering validation.
+        expected_grn_sha256 = (
+            base.get("_grn_sha256")
+            if base.get("check_fixed_state_grn_provenance", True)
+            else None
+        )
         states = _load_fixed_states(
             path,
             key=params.get("key"),
             expected_mr_ids=mr_ids,
-            expected_grn_sha256=base.get("_grn_sha256"),
+            expected_grn_sha256=expected_grn_sha256,
             require_grn_provenance=bool(base.get("require_grn_provenance", False)),
         )
     else:

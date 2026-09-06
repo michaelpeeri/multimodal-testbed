@@ -751,7 +751,7 @@ _OPT_IN_STATS_KEYS = frozenset({
 })
 
 _SAMPLERS = {
-    "tpe": lambda: optuna.samplers.TPESampler(seed=0),
+    "tpe": lambda seed=0: optuna.samplers.TPESampler(seed=seed),
 }
 
 _PRUNERS = {
@@ -860,6 +860,7 @@ _CONFIG_DEFAULTS = {
     # "Interrupting/resuming a run" docstring section below).
     "timeout":      None,
     "sampler":      "tpe",
+    "sampler_seed": 0,
     "pruner":       "none",
     "output":       "tuned_synthetic_config.json",
     "artifact_dir": "synthetic_checkpoints",
@@ -1901,8 +1902,8 @@ def trial_summary_callback(study: optuna.Study, trial: optuna.trial.FrozenTrial)
     )
 
 
-def build_sampler(name: str):
-    return _SAMPLERS[name]()
+def build_sampler(name: str, seed: int = 0):
+    return _SAMPLERS[name](seed=seed)
 
 
 def build_pruner(name: str):
@@ -2253,7 +2254,7 @@ def run(config_path: str) -> optuna.Study:
         storage=config["storage"],
         load_if_exists=True,
         direction="minimize",
-        sampler=build_sampler(config["sampler"]),
+        sampler=build_sampler(config["sampler"], seed=config.get("sampler_seed", 0)),
         pruner=build_pruner(config["pruner"]),
     )
 

@@ -1869,8 +1869,50 @@ Several single-file research scripts, with locally shared code. No tests, no pac
   `mr_state_harness_config.20260905_noise_dropout_grid.json`, and runner,
   `run_mr_state_harness_grid.py`, cover noise parameters 0, 0.1433, and
   0.2867 crossed with dropout off and dropout percentiles 40, 70, and 90.
-  Other technical stages are disabled for this grid. It uses 3 paired
-  replicates per condition for screening; informative conditions should be
-  rerun with 12 replicates before treating small differences as reliable.
-  Launch the grid with `python3 run_mr_state_harness_grid.py --config
-  mr_state_harness_config.20260905_noise_dropout_grid.json`.
+   Other technical stages are disabled for this grid. Four paired replicates
+   were completed per condition for screening; informative conditions should
+   be rerun with 12 replicates before treating small differences as reliable.
+   Launch the grid with `python3 run_mr_state_harness_grid.py --config
+   mr_state_harness_config.20260905_noise_dropout_grid.json`.
+
+- The 20260905 noise/dropout grid and the earlier 20260903 stage-isolation
+  runs show that no tested configuration simultaneously matches reference-like
+  sparsity and preserves a useful biological signal. Clean SERGIO retained
+  `within_minus_across` ~0.276 and standardized split-half loading stability
+  ~0.733. Noise alone reduced module contrast to ~0.025, while dropout was
+  the dominant subsequent failure mode: at `d90`, zero fraction was ~0.899,
+  but module contrast was approximately zero and split-half stability was only
+  0.24-0.28. The reference-like full pipeline reached zero fraction ~0.879,
+  but module contrast ~0.00045 and stability ~0.081. UMI conversion inflated
+  PCA-tail participation without preserving reproducible directions.
+  Therefore PCA tail rank, PCA target distance, and label holdout accuracy are
+  not sufficient biological-quality objectives; constant-MR controls can score
+  well on those under technical noise/dropout.
+  The practical screening compromise from the grid was `noise_params=0.1433`
+  with dropout percentile 40-70 (`within_minus_across` ~0.031-0.009,
+  stability ~0.673-0.541), but neither reaches reference sparsity. This is a
+  Pareto gap in the current parameterization, not evidence that the reference
+  combination is impossible; technical-stage tuning must explicitly protect
+  reproducible, state-linked structure.
+
+- `tune_synthetic_data.py` now supports `mr_state_method="fixed_pickle"`
+  with `mr_state_path`/`mr_state_key`, and computes target-free biological
+  diagnostics per candidate: label-explained variance, normalized GRN-module
+  `within_minus_across`, MR-state/expression-centroid distance correlation,
+  and size-normalized standardized split-half subspace stability. A configurable
+  biological-signal penalty/minimum layer is separate from the target-based
+  library/count/gene-distribution/dropout objective. The new DE pilot configs
+  `synthetic_tuning_config.20260905.de_seed0.json` and
+  `synthetic_tuning_config.20260905.de_seed1.json` replay the fixed states from
+  `ga_opt_log_20260901_01.de_F05_CR08.seed{0,1}.pickle`, keep target-based
+  library/count/dropout terms, set all target-based PCA-rank/tail weights to
+  zero, disable the target-based PC1 guard, and apply target-free minimums for
+  biological retention. Use the resulting trials to test whether tuning the
+  technical parameters can close the reference-sparsity gap without accepting
+  noise-derived dimensions; do not infer success from aggregate distance or
+  PCA-tail participation alone. The DE optimizer pickles do not store MR IDs
+  or a GRN fingerprint, so verify their column ordering against the shared
+  `grn_seed=42` GRN before treating a fixed-state study as biologically valid;
+  the new minimum thresholds are screening defaults, not reference-derived
+  ground truth, and should be calibrated from the pilot's retained-signal
+  distributions before a larger sweep.

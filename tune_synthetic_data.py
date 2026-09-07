@@ -438,6 +438,10 @@ See synthetic_tuning_config.example.json for a full example. Notable keys
                             and every generated trial GRN must match it;
                             mismatches are pruned rather than silently
                             evaluating a DE state against a different GRN.
+    require_mr_state_grn_provenance : bool, default False -- when true,
+                            fixed_pickle studies must provide the SHA256
+                            above; use this for scientifically valid replay
+                            studies rather than legacy state pickles.
     n_candidate_states         : spectral candidate-pool size.
     n_selected_states          : spectral output row count; must equal
                                  n_clusters for spectral mode.
@@ -785,6 +789,8 @@ _CONFIG_DEFAULTS = {
     "mr_state_method":       "random",
     "mr_state_path":         None,
     "mr_state_key":          "best_candidate",
+    "mr_state_grn_sha256":   None,
+    "require_mr_state_grn_provenance": False,
     "n_candidate_states":    200,
     "n_selected_states":     15,
     "candidate_design":      "random",
@@ -945,6 +951,19 @@ def load_config(path: str) -> dict:
     if config["mr_state_method"] == "fixed_pickle" and not config.get("mr_state_path"):
         raise ValueError(
             "mr_state_method='fixed_pickle' requires a non-empty mr_state_path"
+        )
+    if not isinstance(config.get("require_mr_state_grn_provenance", False), bool):
+        raise ValueError("require_mr_state_grn_provenance must be boolean")
+    expected_mr_state_grn_sha256 = config.get("mr_state_grn_sha256")
+    if expected_mr_state_grn_sha256 is not None:
+        if (not isinstance(expected_mr_state_grn_sha256, str)
+                or re.fullmatch(r"[0-9a-fA-F]{64}", expected_mr_state_grn_sha256) is None):
+            raise ValueError("mr_state_grn_sha256 must be a 64-character hexadecimal SHA256")
+    if (config.get("require_mr_state_grn_provenance", False)
+            and config["mr_state_method"] == "fixed_pickle"
+            and not expected_mr_state_grn_sha256):
+        raise ValueError(
+            "fixed_pickle provenance is required but mr_state_grn_sha256 is unset"
         )
     if (config["mr_state_method"] == "fixed_pickle"
             and not Path(config["mr_state_path"]).is_file()):
@@ -1550,16 +1569,17 @@ def run_trial(
     except Exception as e:
         _prune(trial, "grn_generation_failed", str(e))
 
+    generated_grn_sha256 = _sha256_file(grn_path)
+    trial.set_user_attr("generated_grn_sha256", generated_grn_sha256)
     expected_grn_sha256 = config.get("mr_state_grn_sha256")
     if expected_grn_sha256 and config.get("mr_state_method") == "fixed_pickle":
-        actual_grn_sha256 = _sha256_file(grn_path)
-        if actual_grn_sha256 != expected_grn_sha256:
+        if generated_grn_sha256 != expected_grn_sha256:
             if os.path.exists(grn_path):
                 os.remove(grn_path)
             _prune(
                 trial,
                 "fixed_mr_state_grn_mismatch",
-                f"generated GRN sha256={actual_grn_sha256}; "
+                f"generated GRN sha256={generated_grn_sha256}; "
                 f"fixed MR-state sha256={expected_grn_sha256}",
             )
 
@@ -1619,6 +1639,7 @@ def run_trial(
                 "method": "fixed_pickle",
                 "path": config["mr_state_path"],
                 "key": config.get("mr_state_key", "best_candidate"),
+                "grn_sha256": generated_grn_sha256,
             }
         else:
             mr_state_np = _sample_mr_state(
@@ -2309,6 +2330,8 @@ def run(config_path: str) -> optuna.Study:
                 "mr_state_path":       config.get("mr_state_path"),
                 "mr_state_key":        config.get("mr_state_key"),
                 "mr_state_grn_sha256": config.get("mr_state_grn_sha256"),
+                "require_mr_state_grn_provenance": config.get(
+                    "require_mr_state_grn_provenance", False),
                 "n_candidate_states":  config.get("n_candidate_states"),
                 "n_selected_states":   config.get("n_selected_states"),
                 "candidate_design":    config.get("candidate_design"),

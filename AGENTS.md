@@ -1916,3 +1916,54 @@ Several single-file research scripts, with locally shared code. No tests, no pac
   the new minimum thresholds are screening defaults, not reference-derived
   ground truth, and should be calibrated from the pilot's retained-signal
   distributions before a larger sweep.
+
+- The `mr_state_comparison.20260906_v0_5b_{02_41,04_30,04_32,04_46}`
+  harness results clarified the apparent disagreement with the
+  `synthetic_tuning_20260906.v0_5b.*` Optuna studies. This is not a complete
+  loss of biological structure in the harness: across all four runs, DE states
+  retained much more label-defined/module-linked structure than the constant
+  MR control (`label_between_variance_fraction` ~0.28-0.35 vs. ~0.10-0.15;
+  `within_minus_across` ~0.04-0.09 vs. ~0.009-0.03; split-half stability
+  ~0.40-0.49 vs. ~0.11-0.26). The issue is that Optuna's single-realization
+  biological margins did not reproduce robustly across independently generated
+  GRNs and simulation seeds.
+  - Direct apples-to-apples comparison for the `.04` study's true best trial
+    (trial 32, whose resolved parameters are the `04_32` harness condition):
+    Optuna recorded target distance 0.3651,
+    `label_between_variance_fraction=0.3047`,
+    `within_minus_across=0.0499`, MR-state/expression distance correlation
+    0.5114, and split-half stability 0.4891. The harness's matching fixed
+    `de_seed1` arm recorded target distance 0.3656,
+    `label_between_variance_fraction=0.2765`,
+    `within_minus_across=0.0496`, and split-half stability 0.4380. Thus the
+    target-distance metric and module-contrast metric reproduce closely; the
+    larger discrepancy is in label variance/stability. The harness currently
+    does not compute the MR-state/expression distance-correlation metric.
+  - Optuna evaluates one `sim_seed=0` realization per trial and one GRN
+    topology per tuning process. The harness evaluates 12 other simulation
+    seeds (`20000..20011`) and regenerates its shared GRN. The known
+    `_sample_connected_subgraph` Python-hash-order non-determinism means the
+    same `grn_seed=42` is not sufficient to reproduce topology across
+    processes; the four harness output files have different GRN hashes. The
+    v0_5b manifest also deliberately disables fixed-state GRN provenance
+    checks because the DE pickles came from an older GRN. This is the primary
+    train/evaluation mismatch, not evidence that the target-distance code is
+    wrong.
+  - The Optuna `biological_signal` layer is a soft deficit penalty, not a
+    constraint: `tune_synthetic_data.py` computes the diagnostics, penalizes
+    only deficits below the configured minimums, and still allows failed
+    trials when target distance compensates. It is therefore useful for
+    candidate generation but not sufficient evidence of robust biological
+    quality. Label variance and split-half stability can also be increased by
+    GRN/technical effects; PCA-tail rank and holdout accuracy remain
+    insufficient controls, as established by the earlier ablations.
+  - Treat the v0_5b Optuna results as single-realization screening results,
+    not validated biological configurations. The next decisive comparison is
+    to replay an Optuna best trial with the exact archived GRN and
+    `sim_seed=0`, then evaluate that identical GRN/configuration over held-out
+    simulation seeds and, separately, held-out GRNs. Fixed MR-state artifacts
+    should carry matching ordered MR IDs and a GRN fingerprint. Future tuning
+    should aggregate biological diagnostics over multiple seeds (mean or a
+    lower quantile), include MR-state/expression correlation, and use explicit
+    robustness constraints or a Pareto objective rather than relying only on
+    the current soft penalty.

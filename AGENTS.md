@@ -1965,5 +1965,35 @@ Several single-file research scripts, with locally shared code. No tests, no pac
     should carry matching ordered MR IDs and a GRN fingerprint. Future tuning
     should aggregate biological diagnostics over multiple seeds (mean or a
     lower quantile), include MR-state/expression correlation, and use explicit
-    robustness constraints or a Pareto objective rather than relying only on
-    the current soft penalty.
+   robustness constraints or a Pareto objective rather than relying only on
+   the current soft penalty.
+
+- Added `synthetic_tuning_config.20260907.buffered.50` through `.57` as an
+  eight-study unbounded expansion of the v0_5b tuning round. These use Optuna
+  `sampler_seed` 50-57, keep `sim_seed=0` for common objective semantics, and
+  retain the existing DE seed1 MR-state artifact. Buffered biological
+  minimums are `label_between_variance_fraction=0.33`,
+  `within_minus_across=0.035`, `split_half_subspace_stability=0.45`, and the
+  existing MR-state/expression correlation minimum `0.25` (the latter remains
+  provisional because the harness does not yet record that metric). The
+  biological penalty weight is 25 and `hard_prune` remains false for this
+  exploration round.
+  - GRN provenance is now explicit in these configs:
+    `mr_state_grn_sha256` is
+    `f0f653cd1cd7db0499a63c6b5f4adc8cb2901a5baac69fb499522cfb0e7dc934`,
+    matching both existing DE pickles' embedded metadata and 84 ordered MR
+    IDs. All GRN parameter knobs are removed from the new search spaces and
+    fixed to the values used to generate that artifact; otherwise varying GRN
+    parameters with a fixed MR-state pickle would make the fingerprint fail or
+    silently misalign the state.
+  - `tune_synthetic_data.py` now exposes and validates
+    `require_mr_state_grn_provenance`, validates SHA256 format, and records
+    each generated trial GRN's SHA256 as `generated_grn_sha256` in Optuna user
+    attributes. A fixed-pickle trial with the configured fingerprint is pruned
+    before simulation if the generated GRN differs.
+  - These studies have not been launched in this environment. Launch every
+    process with the same interpreter-startup hash seed, e.g.
+    `PYTHONHASHSEED=0`, and create each study's parent output directory before
+    starting because SQLite storage requires it. The new search is deliberately
+    GRN-locked; if broader GRN tuning is desired later, regenerate the MR-state
+    artifact against each exact GRN family rather than disabling provenance.

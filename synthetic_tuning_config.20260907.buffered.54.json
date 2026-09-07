@@ -1,0 +1,151 @@
+{
+  "_comment": "Buffered-threshold, GRN-locked expansion; sampler_seed=54. See buffered.50 for the full field documentation.",
+  "target_stats_path": "1cb67ec8-c9e3-4d4a-ba23-a1a8ef3f8450.GRNseed42.stats.v6.mean.pickle",
+  "reference_grn_path": "data/trrust_rawdata.human.tsv",
+  "grn_archive_dir": "synthetic_tuning_20260907.buffered.54/grn_diags",
+  "n_clusters": 15,
+  "n_genes": 800,
+  "n_cells": 600,
+  "sampling_state": 5,
+  "shared_coop_state": 0,
+  "stats_n_pca_components": 20,
+  "stats_n_structure_genes": 500,
+  "mr_state_method": "fixed_pickle",
+  "mr_state_path": "ga_opt_log_20260901_01.de_F05_CR08.seed1.pickle",
+  "mr_state_key": "best_candidate",
+  "mr_state_grn_sha256": "f0f653cd1cd7db0499a63c6b5f4adc8cb2901a5baac69fb499522cfb0e7dc934",
+  "require_mr_state_grn_provenance": true,
+  "storage": "sqlite:///synthetic_tuning_20260907.buffered.54/synthetic_tuning_20260907.buffered.54.db",
+  "study_name": "tune_synthetic_data6_20260907.buffered.54",
+  "output": "synthetic_tuning_20260907.buffered.54/tuned_synthetic_config.20260907.buffered.54.json",
+  "artifact_dir": "synthetic_tuning_20260907.buffered.54/checkpoints",
+  "n_trials": null,
+  "timeout": null,
+  "sampler": "tpe",
+  "sampler_seed": 54,
+  "sim_seed": 0,
+  "pruner": "none",
+  "max_lib_size_zero_frac": 0.01,
+  "max_pca_pc1_ratio_factor": 2.0,
+  "pca_pc1_dominance_key": null,
+  "grn_k_low": 0.7011049297514086,
+  "grn_k_span": 7.104491545583991,
+  "hill_coeff": 1.3017583064092848,
+  "unknown_mode_repressor_prob": 0.5076458800749091,
+  "coherency_bias": 0.6993541868705931,
+  "canalization_strength": 0.08906358019922286,
+  "balancing_strength": 1.4076563685695531,
+  "path_decay": 0.8325389406875506,
+  "add_outlier_genes": true,
+  "add_lib_size_effect": false,
+  "add_dropout": true,
+  "convert_to_umi_counts": true,
+  "weights": {
+    "log_lib_size_mean": 3.0,
+    "log_lib_size_std": 3.0,
+    "log_lib_size_p5": 3.0,
+    "log_lib_size_p25": 3.0,
+    "log_lib_size_p50": 3.0,
+    "log_lib_size_p75": 3.0,
+    "log_lib_size_p95": 3.0,
+    "gene_corr_abs_mean": 0.0,
+    "gene_corr_abs_std": 0.0,
+    "gene_corr_abs_p50": 0.0,
+    "gene_corr_abs_p90": 0.0,
+    "pca_explained_variance_ratio": 0.0,
+    "pca_tail_participation_ratio": 0.0,
+    "pca_pc2_9_explained_variance_ratio": 0.0,
+    "zero_frac": 0.0,
+    "dropout_curve_zero_frac": 3.0,
+    "lib_size_zero_frac": 0.0,
+    "gene_mean_mean": 1.0,
+    "gene_mean_std": 1.0,
+    "gene_var_mean": 1.0,
+    "gene_var_std": 1.0,
+    "gene_mean_p5": 0.5,
+    "gene_mean_p25": 0.5,
+    "gene_mean_p50": 0.5,
+    "gene_mean_p75": 0.5,
+    "gene_mean_p95": 0.5,
+    "gene_var_p5": 0.5,
+    "gene_var_p25": 0.5,
+    "gene_var_p50": 0.5,
+    "gene_var_p75": 0.5,
+    "gene_var_p95": 0.5,
+    "mean_var_log_slope": 0.0,
+    "mean_var_log_corr": 0.0,
+    "gene_corr_abs_normalized_mean": 3.0,
+    "gene_corr_abs_normalized_p50": 3.0,
+    "gene_corr_abs_normalized_std": 3.0,
+    "gene_corr_abs_normalized_p90": 3.0,
+    "nonzero_frac": 3.0,
+    "pca_standardized_explained_variance_ratio": 0.0,
+    "pca_standardized_tail_participation_ratio": 0.0,
+    "pca_standardized_pc2_9_explained_variance_ratio": 0.0,
+    "pca_size_normalized_standardized_explained_variance_ratio": 0.0,
+    "pca_size_normalized_standardized_tail_participation_ratio": 0.0,
+    "pca_size_normalized_standardized_pc2_9_explained_variance_ratio": 0.0
+  },
+  "biological_signal": {
+    "enabled": true,
+    "penalty_weight": 25.0,
+    "hard_prune": false,
+    "minimums": {
+      "biological_label_between_variance_fraction": 0.33,
+      "biological_within_minus_across": 0.035,
+      "biological_mr_state_expression_distance_correlation": 0.25,
+      "biological_split_half_subspace_stability": 0.45
+    },
+    "scales": {
+      "biological_label_between_variance_fraction": 0.33,
+      "biological_within_minus_across": 0.035,
+      "biological_mr_state_expression_distance_correlation": 0.25,
+      "biological_split_half_subspace_stability": 0.45
+    }
+  },
+  "search_space": {
+    "noise_params": {
+      "type": "float",
+      "low": 0.2,
+      "high": 0.6,
+      "log": true
+    },
+    "decays": {
+      "type": "float",
+      "low": 0.3,
+      "high": 1.5
+    },
+    "cluster_conc": {
+      "type": "float",
+      "low": 2.0,
+      "high": 50.0,
+      "log": true
+    },
+    "outlier_prob": {
+      "type": "float",
+      "low": 0.005,
+      "high": 0.03,
+      "log": true
+    },
+    "outlier_mean": {
+      "type": "float",
+      "low": 0.5,
+      "high": 1.2
+    },
+    "outlier_scale": {
+      "type": "float",
+      "low": 0.5,
+      "high": 1.5
+    },
+    "dropout_shape": {
+      "type": "float",
+      "low": 1.0,
+      "high": 20.0
+    },
+    "dropout_percentile": {
+      "type": "float",
+      "low": 50.0,
+      "high": 99.0
+    }
+  }
+}

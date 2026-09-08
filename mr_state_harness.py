@@ -10,6 +10,10 @@
 #   it is not uncertainty over all possible subsets/splits.
 # - Fixed-state artifacts must carry and be checked against ordered MR IDs and
 #   an exact GRN fingerprint; legacy pickles do not contain that provenance.
+# - A harness config may set ``fixed_grn_path`` (and optionally
+#   ``grn_diagnostics_path``) to evaluate an archived GRN byte-for-byte rather
+#   than regenerating it; this is the preferred path for matched GRN/state
+#   experiments.
 # - The full SERGIO pipeline is intentionally used for validation, not for
 #   large candidate-population optimization.
 #
@@ -113,6 +117,7 @@ from synthetic_data import (
     generate_sergio_grn_from_reference,
     load_sergio_dag,
     make_synthetic_data6,
+    _parse_sergio_targets_file,
     sample_mr_state_from_tree,
     sample_sergio_mr_states,
     select_sergio_spectral_subset,
@@ -197,6 +202,14 @@ def _load_harness_config(path: str) -> tuple[dict, str | None]:
     with open(path) as f:
         harness = json.load(f)
     return harness, path
+
+
+def _sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def _jsonify(value):
@@ -361,10 +374,16 @@ def _candidate_pool(
         # Some historical tuning rounds intentionally reused a fixed state
         # while varying GRN parameters. Keep strict hash validation by default,
         # but allow those replays to opt out explicitly while retaining MR-ID
-        # ordering validation.
+        # ordering validation. NumPy fixed-array controls have no container for
+        # provenance metadata, so strict provenance applies only to artifact
+        # formats that can actually carry the GRN record.
+        provenance_capable = method in ("fixed_artifact", "fixed_pickle")
         expected_grn_sha256 = (
             base.get("_grn_sha256")
-            if base.get("check_fixed_state_grn_provenance", True)
+            if (
+                provenance_capable
+                and base.get("check_fixed_state_grn_provenance", True)
+            )
             else None
         )
         states = _load_fixed_states(
@@ -372,7 +391,10 @@ def _candidate_pool(
             key=params.get("key"),
             expected_mr_ids=mr_ids,
             expected_grn_sha256=expected_grn_sha256,
-            require_grn_provenance=bool(base.get("require_grn_provenance", False)),
+            require_grn_provenance=(
+                provenance_capable
+                and bool(base.get("require_grn_provenance", False))
+            ),
         )
     else:
         raise ValueError(
@@ -869,6 +891,14 @@ def run_mr_state_comparison(config: str | dict) -> dict:
         "base_overrides": harness.get("base_overrides", {}),
     }
     base, base_source = _load_base_config(base_input)
+    # Tuning configs use the longer name; the harness keeps its historical
+    # shorter name for fixed-state provenance checks.
+    base["require_grn_provenance"] = bool(
+        base.get(
+            "require_grn_provenance",
+            base.get("require_mr_state_grn_provenance", False),
+        )
+    )
     tsd = _load_tuning_helpers()
     target_stats = None
     if base.get("target_stats_path"):
@@ -879,45 +909,70 @@ def run_mr_state_comparison(config: str | dict) -> dict:
         add_nonzero_frac_stat(target_stats)
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    fixed_grn_path = harness.get("fixed_grn_path") or base.get("fixed_grn_path")
     temp_path = harness.get("grn_output_path")
-    if temp_path is None:
-        temp_path = os.path.join(
-            base.get("grn_tmp_dir") or "/tmp",
-            f"mr_state_harness_{os.getpid()}.csv",
+    if fixed_grn_path:
+        temp_path = os.path.abspath(str(fixed_grn_path))
+        if not os.path.isfile(temp_path):
+            raise FileNotFoundError(f"fixed_grn_path does not exist: {temp_path!r}")
+        log(f"[setup] using archived GRN: {temp_path}")
+        n_grn_genes, mr_ids = _parse_sergio_targets_file(temp_path)
+        if n_grn_genes != int(base["n_genes"]):
+            raise ValueError(
+                f"fixed GRN has {n_grn_genes} genes; expected {base['n_genes']}"
+            )
+        gene_id_to_symbol = {
+            gene_id: str(gene_id) for gene_id in range(n_grn_genes)
+        }
+        grn_diagnostics = {}
+        diagnostics_path = harness.get("grn_diagnostics_path") or base.get(
+            "grn_diagnostics_path"
         )
-    Path(temp_path).parent.mkdir(parents=True, exist_ok=True)
+        if diagnostics_path:
+            with open(diagnostics_path) as handle:
+                grn_diagnostics = json.load(handle)
+        base["_grn_sha256"] = _sha256_file(temp_path)
+        expected_grn_sha256 = base.get("mr_state_grn_sha256")
+        if expected_grn_sha256 and base["_grn_sha256"] != expected_grn_sha256:
+            raise ValueError(
+                f"fixed GRN sha256={base['_grn_sha256']!r} does not match "
+                f"mr_state_grn_sha256={expected_grn_sha256!r}"
+            )
+    else:
+        if temp_path is None:
+            temp_path = os.path.join(
+                base.get("grn_tmp_dir") or "/tmp",
+                f"mr_state_harness_{os.getpid()}.csv",
+            )
+        Path(temp_path).parent.mkdir(parents=True, exist_ok=True)
 
-    log(
-        f"[setup] generating shared GRN: n_genes={base['n_genes']} "
-        f"grn_seed={base['grn_seed']}"
-    )
-    grn_diagnostics = {}
-    _, mr_ids, gene_id_to_symbol = generate_sergio_grn_from_reference(
-        reference_grn_path=base["reference_grn_path"],
-        n_genes=base["n_genes"],
-        output_path=temp_path,
-        delimiter=base["grn_delimiter"],
-        regulator_col=base["grn_regulator_col"],
-        target_col=base["grn_target_col"],
-        mode_col=base["grn_mode_col"],
-        activation_labels=base["grn_activation_labels"],
-        repression_labels=base["grn_repression_labels"],
-        unknown_mode_repressor_prob=base["unknown_mode_repressor_prob"],
-        k_dist=("uniform", base["grn_k_low"], base["grn_k_low"] + base["grn_k_span"]),
-        hill_coeff_dist=("constant", base["hill_coeff"]),
-        max_seed_attempts=base["grn_max_seed_attempts"],
-        seed=base["grn_seed"],
-        diagnostics=grn_diagnostics,
-        coherency_bias=base["coherency_bias"],
-        canalization_strength=base["canalization_strength"],
-        balancing_strength=base["balancing_strength"],
-        path_decay=base["path_decay"],
-    )
-    grn_digest = hashlib.sha256()
-    with open(temp_path, 'rb') as f:
-        for block in iter(lambda: f.read(1 << 20), b''):
-            grn_digest.update(block)
-    base["_grn_sha256"] = grn_digest.hexdigest()
+        log(
+            f"[setup] generating shared GRN: n_genes={base['n_genes']} "
+            f"grn_seed={base['grn_seed']}"
+        )
+        grn_diagnostics = {}
+        _, mr_ids, gene_id_to_symbol = generate_sergio_grn_from_reference(
+            reference_grn_path=base["reference_grn_path"],
+            n_genes=base["n_genes"],
+            output_path=temp_path,
+            delimiter=base["grn_delimiter"],
+            regulator_col=base["grn_regulator_col"],
+            target_col=base["grn_target_col"],
+            mode_col=base["grn_mode_col"],
+            activation_labels=base["grn_activation_labels"],
+            repression_labels=base["grn_repression_labels"],
+            unknown_mode_repressor_prob=base["unknown_mode_repressor_prob"],
+            k_dist=("uniform", base["grn_k_low"], base["grn_k_low"] + base["grn_k_span"]),
+            hill_coeff_dist=("constant", base["hill_coeff"]),
+            max_seed_attempts=base["grn_max_seed_attempts"],
+            seed=base["grn_seed"],
+            diagnostics=grn_diagnostics,
+            coherency_bias=base["coherency_bias"],
+            canalization_strength=base["canalization_strength"],
+            balancing_strength=base["balancing_strength"],
+            path_decay=base["path_decay"],
+        )
+        base["_grn_sha256"] = _sha256_file(temp_path)
     dag = load_sergio_dag(
         temp_path,
         shared_coop_state=base["shared_coop_state"],
@@ -1122,7 +1177,7 @@ def run_mr_state_comparison(config: str | dict) -> dict:
                 "gene_id_to_symbol": gene_id_to_symbol,
             "diagnostics": grn_diagnostics,
             "grn_seed": base["grn_seed"],
-            "sha256": grn_digest.hexdigest(),
+            "sha256": base["_grn_sha256"],
         },
             "scenario_names": scenario_names,
             "baseline": baseline_name,
@@ -1133,7 +1188,11 @@ def run_mr_state_comparison(config: str | dict) -> dict:
             },
         }
     finally:
-        if harness.get("grn_output_path") is None and os.path.exists(temp_path):
+        if (
+            not fixed_grn_path
+            and harness.get("grn_output_path") is None
+            and os.path.exists(temp_path)
+        ):
             os.remove(temp_path)
 
     output = harness.get("output")

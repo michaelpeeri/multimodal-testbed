@@ -9,6 +9,7 @@ import numpy as np
 from synthetic_data import (
     add_pca_derived_stats,
     generate_sergio_grn_from_reference, load_sergio_dag, sample_sergio_mr_states,
+    _parse_sergio_targets_file,
     sergio_dag_hill_forward_batched,
     _sample_cluster_sizes,
 )
@@ -274,6 +275,40 @@ class MRStateGAOptimizer:
 
         # harness:624
         def gen_grn(seed:int):
+            fixed_grn_path = base_setting('fixed_grn_path', None)
+            if fixed_grn_path:
+                fixed_grn_path = os.path.abspath(str(fixed_grn_path))
+                if not os.path.isfile(fixed_grn_path):
+                    raise FileNotFoundError(
+                        f'fixed_grn_path does not exist: {fixed_grn_path!r}'
+                    )
+                n_grn_genes, mr_ids = _parse_sergio_targets_file(fixed_grn_path)
+                expected_n_genes = int(base_setting('n_genes', n_grn_genes))
+                if n_grn_genes != expected_n_genes:
+                    raise ValueError(
+                        f'fixed GRN has {n_grn_genes} genes; expected '
+                        f'{expected_n_genes}'
+                    )
+                expected_sha256 = base_setting('fixed_grn_sha256', None)
+                if expected_sha256:
+                    digest = hashlib.sha256()
+                    with open(fixed_grn_path, 'rb') as handle:
+                        for block in iter(lambda: handle.read(1 << 20), b''):
+                            digest.update(block)
+                    actual_sha256 = digest.hexdigest()
+                    if actual_sha256 != expected_sha256:
+                        raise ValueError(
+                            f'fixed GRN sha256={actual_sha256!r} does not '
+                            f'match expected {expected_sha256!r}'
+                        )
+                # The optimizer only needs the ordered MR IDs. The symbol map
+                # is retained for artifact completeness when the GRN is loaded
+                # from an archived SERGIO file rather than regenerated here.
+                gene_id_to_symbol = {
+                    gene_id: str(gene_id) for gene_id in range(n_grn_genes)
+                }
+                return fixed_grn_path, mr_ids, gene_id_to_symbol
+
             temp_path = os.path.join(
                 grn_tmp_dir, f'mr_state_ga_{os.getpid()}_{seed}.csv'
             )

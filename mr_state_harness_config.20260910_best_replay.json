@@ -1,0 +1,56 @@
+{
+  "_comment": "One-condition crossover template for the three Optuna-selected technical parameter sets. Before each run, set the base_overrides search parameters to one study's best_params and use a distinct output path. All three MR-state arms then share those technical settings.",
+  "base_config": "synthetic_tuning_config.20260910.mr_de.json",
+  "base_overrides": {
+    "fixed_grn_path": "synthetic_tuning_20260907.buffered.50/grn_diags/trial68.grn.csv",
+    "grn_diagnostics_path": "synthetic_tuning_20260907.buffered.50/grn_diags/trial68.diagnostics.json",
+    "decays": 0.8,
+    "cluster_conc": 10.0,
+    "noise_params": 0.14334676581600892,
+    "outlier_prob": 0.015,
+    "outlier_mean": 0.8,
+    "outlier_scale": 1.0,
+    "dropout_shape": 6.5,
+    "dropout_percentile": 40.0,
+    "add_outlier_genes": false,
+    "add_lib_size_effect": false,
+    "convert_to_umi_counts": false,
+    "add_dropout": true
+  },
+  "baseline": "iid_random",
+  "arms": [
+    {
+      "name": "iid_random",
+      "candidate_method": "iid",
+      "candidate_params": {"n_candidate_states": 64},
+      "selection_method": "random",
+      "selection_params": {"n_selected_states": 15}
+    },
+    {
+      "name": "constant_iid_mean",
+      "candidate_method": "fixed_array",
+      "candidate_params": {"path": "mr_state_constant_iid_mean.npy"},
+      "selection_method": "identity",
+      "selection_params": {"n_selected_states": 15}
+    },
+    {
+      "name": "de_locked_best",
+      "candidate_method": "fixed_pickle",
+      "candidate_params": {
+        "path": "mr_state_de_20260910.best_surrogate.pickle",
+        "key": "best_candidate"
+      },
+      "selection_method": "identity",
+      "selection_params": {"n_selected_states": 15}
+    }
+  ],
+  "n_replicates": 12,
+  "seed_base": 50000,
+  "include_sergio": true,
+  "clean_simulation": false,
+  "n_cells": 600,
+  "mr_jitter_std": 0.0,
+  "store_candidate_pools": false,
+  "verbose": true,
+  "output": "mr_state_comparison.20260910_best_replay_de_params.pickle"
+}

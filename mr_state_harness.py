@@ -135,6 +135,7 @@ _SCALAR_METRIC_KEYS = (
     "label_centroid_participation_ratio",
     "label_centroid_mean_pairwise_distance",
     "label_holdout_accuracy",
+    "mr_state_expression_distance_correlation",
     "pca_size_normalized_standardized_tail_participation_ratio",
     "pca_size_normalized_standardized_split_half_subspace_stability",
     "pca_size_normalized_standardized_split_half_spectrum_similarity",
@@ -739,6 +740,9 @@ def _evaluate_matrix(
             eps_abs_floor=base.get("distance_eps_abs_floor", 0.02),
         )
     geometry = _state_geometry(states)
+    mr_state_expression_distance_correlation = (
+        tsd._mr_state_expression_distance_correlation(X, labels, states)
+    )
     label_metrics = _label_aware_expression_metrics(
         X, labels, seed=base.get("stats_seed", 0))
     module_metrics = _gene_module_correlations(
@@ -757,6 +761,9 @@ def _evaluate_matrix(
     }
     scalar_metrics["distance"] = _safe_float(distance)
     scalar_metrics["mr_state_participation_ratio"] = geometry["participation_ratio"]
+    scalar_metrics["mr_state_expression_distance_correlation"] = _safe_float(
+        mr_state_expression_distance_correlation
+    )
     for key in (
         "label_between_variance_fraction",
         "label_centroid_participation_ratio",
@@ -800,6 +807,26 @@ def _summarize_values(values: list[float]) -> dict:
         "q90": float(np.percentile(array, 90)),
         "n": int(array.size),
     }
+
+
+def _summarize_paired_deltas(values: list[float]) -> dict:
+    """Summarize paired effects and a deterministic percentile bootstrap CI."""
+    array = np.asarray(values, dtype=np.float64)
+    array = array[np.isfinite(array)]
+    summary = _summarize_values(array.tolist())
+    summary["n_positive"] = int(np.count_nonzero(array > 0.0))
+    summary["n_negative"] = int(np.count_nonzero(array < 0.0))
+    summary["n_zero"] = int(np.count_nonzero(array == 0.0))
+    if array.size >= 2:
+        rng = np.random.default_rng(0)
+        indices = rng.integers(0, array.size, size=(10_000, array.size))
+        bootstrap_means = array[indices].mean(axis=1)
+        summary["mean_ci95"] = [
+            float(value) for value in np.percentile(bootstrap_means, [2.5, 97.5])
+        ]
+    else:
+        summary["mean_ci95"] = None
+    return summary
 
 
 def _summarize_arm(replicates: list[dict], scenario_names: list[str]) -> dict:
@@ -858,7 +885,7 @@ def _paired_deltas(arm_results: dict, baseline_name: str, scenario_names: list[s
                     bv = b["scalar_metrics"].get(key, float("nan"))
                     if math.isfinite(av) and math.isfinite(bv):
                         deltas.append(av - bv)
-                metrics[key] = _summarize_values(deltas)
+                metrics[key] = _summarize_paired_deltas(deltas)
             output[arm_name]["scenarios"][scenario] = metrics
     return output
 

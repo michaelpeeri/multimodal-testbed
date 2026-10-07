@@ -1997,3 +1997,77 @@ Several single-file research scripts, with locally shared code. No tests, no pac
     starting because SQLite storage requires it. The new search is deliberately
     GRN-locked; if broader GRN tuning is desired later, regenerate the MR-state
     artifact against each exact GRN family rather than disabling provenance.
+
+- The matched GRN/state biological-signal grid
+  (`mr_state_comparison.20260908_matched_signal_*`) completed successfully:
+  five conditions, 12 paired SERGIO replicates per arm, identical simulation
+  seeds across arms, and the exact locked GRN
+  (`f0f653cd1cd7db0499a63c6b5f4adc8cb2901a5baac69fb499522cfb0e7dc934`).
+  Arms were `iid_random`, a constant-MR control, and the provenance-matched
+  `de_seed1` state. Conditions were clean technical stages, reduced noise
+  (`noise_params=0.1433`) with dropout percentile 40 or 70, higher noise
+  (`0.2867`) with dropout percentile 40, and the fuller reduced `.1433/d70`
+  pipeline with outliers and UMI conversion restored.
+  - Clean SERGIO carries strong structure for both nonconstant states:
+    label-between variance fraction is 1.0, split-half standardized
+    subspace stability is about 0.75, and winner-module `within_minus_across`
+    is about 0.28. The constant-MR control has no meaningful label structure.
+    This demonstrates that state variation reaches clean SERGIO, but it is not
+    a useful ranking condition: with no technical noise, within-cluster
+    expression is nearly deterministic, so label-between variance saturates
+    at 1.0 and split-half stability is nearly tautological. `de_seed1` and
+    IID are not literally identical: their state matrices differ strongly,
+    DE state participation ratio is about 12.23 versus IID about 11.95, and
+    clean module contrast differs slightly (`0.2849` versus `0.2822`), but
+    the aggregate clean diagnostics have little room to distinguish them.
+  - At reduced noise with dropout percentile 40, the matched DE state gives a
+    modest but reproducible advantage over IID: split-half stability is
+    `0.4528` versus `0.4396` (DE is higher in all 12 paired replicates), and
+    module contrast is `0.0049` versus `0.0029` (higher in 11/12). At the
+    higher-noise `.2867/d40` condition the same direction remains but is
+    smaller: stability `0.4772` versus `0.4694`, module contrast `0.0015`
+    versus `0.0006`.
+  - At dropout percentile 70, structure is mostly erased: DE and IID both
+    have label-between variance about `0.094`, stability about `0.11`, and
+    module contrast below `0.001`. Restoring outliers and UMI conversion in
+    `full_reduced_n014_d70` reduces stability further to `0.033` for DE and
+    `0.037` for IID, with module contrast effectively zero. Thus this run
+    demonstrates biological structure at a reduced technical burden, not
+    robust structure through the fuller reference-like pipeline.
+  - Target distance moves in the wrong direction for biological validation:
+    it is about `6.1` at dropout percentile 40 but about `2.65` at percentile
+    70, while split-half stability and module contrast collapse. Target
+    distance alone must not be used as evidence of biological quality.
+  - The constant-MR control is useful but not sufficient by itself. Under
+    dropout it can still achieve high label holdout accuracy (`0.86-0.98`),
+    despite having no biological cluster-varying MR program. This confirms
+    that label holdout accuracy can be driven by technical/label artifacts;
+    module contrast, split-half stability, and direct state-to-expression
+    alignment are needed together.
+  - The harness currently does not record the target-free
+    MR-state/expression-centroid distance correlation used by
+    `tune_synthetic_data.py`'s biological penalty. Therefore the results do
+    not yet prove that DE state geometry is preserved as a state-linked
+    expression geometry. A follow-up should add that metric to the harness
+    and include a direct deterministic surrogate-vs-SERGIO response test.
+  - Possible explanations for the clean DE/IID equivalence are therefore:
+    (1) diagnostic saturation in deterministic clean SERGIO, (2) IID
+    Uniform[1,5] states already provide nearly full-rank, well-separated
+    15-cluster programs, leaving little room for DE to improve aggregate
+    rank/separation, (3) the DE intrinsic objective optimizes surrogate
+    entropy/participation/stability and PC1 control rather than direct
+    state-to-expression alignment or full-SERGIO biological metrics, and
+    (4) the Hill surrogate's batch-wise half-response normalization can
+    attenuate absolute MR-rate differences before they reach downstream
+    expression. A more serious implementation failure is not currently
+    supported: the DE and IID matrices are different, the fixed DE artifact
+    has the exact GRN provenance, the constant-state control collapses clean
+    biological structure, and DE/IID expression metrics are modestly
+    different. The direct state-to-expression test is still needed to rule
+    out a subtler GRN/SERGIO mapping problem.
+  - Recommended next test: add the MR-state/expression distance-correlation
+    metric and deterministic response diagnostics, then isolate outliers and
+    UMI conversion one at a time around the `.1433/d40` operating point. Do
+    not conclude that the DE optimizer improves state quality from the clean
+    grid alone; its clearest evidence so far is the small, paired advantage
+    at dropout percentile 40.

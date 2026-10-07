@@ -59,7 +59,9 @@ from top-level config keys -- they are not part of search_space. So are:
     ``spectral`` selects the configured number of rows using the DAG/Hill
     surrogate. ``fixed_pickle`` loads a complete matrix from
     mr_state_path/mr_state_key for replaying an externally optimized DE/GA
-    state. Spectral selection requires n_selected_states == n_clusters.
+    state. ``constant`` repeats either mr_state_constant_value across all
+    MRs/clusters or a per-MR template from mr_state_constant_path across
+    clusters. Spectral selection requires n_selected_states == n_clusters.
   - grn_seed: fixes which reference-subgraph topology/DAG-order is sampled
     from reference_grn_path, so every trial shares the exact same GRN
     *structure* -- only the K-magnitude/Hill-coefficient/repressor-sign
@@ -428,11 +430,14 @@ See synthetic_tuning_config.example.json for a full example. Notable keys
                             convert_to_umi_counts are fixed unless explicitly
                             listed in search_space as categorical switches;
                             then Optuna controls them per trial.
-    mr_state_method            : "random", "spectral", or "fixed_pickle";
-                            fixed per study. fixed_pickle loads the matrix at
-                            mr_state_path[mr_state_key].
+    mr_state_method            : "random", "spectral", "fixed_pickle", or
+                                 "constant"; fixed per study.
     mr_state_path/mr_state_key: fixed-pickle path and dictionary key;
                             default key is "best_candidate".
+    mr_state_constant_value   : scalar MR rate repeated across all clusters
+                                and MRs when method is "constant".
+    mr_state_constant_path    : optional .npy per-MR vector or repeated-row
+                                matrix used for the constant-state control.
     mr_state_grn_sha256      : optional GRN-file SHA256 provenance for a
                             fixed_pickle state. When set, the pickle metadata
                             and every generated trial GRN must match it;
@@ -785,8 +790,11 @@ _CONFIG_DEFAULTS = {
     "mr_rate_low":  1.0,
     "mr_rate_high": 5.0,
     # MR-state selection -- fixed per study, not part of search_space. The
-    # historical default remains iid; spectral studies opt in explicitly.
+    # historical default remains iid; spectral, fixed-pickle, and constant
+    # controls opt in explicitly.
     "mr_state_method":       "random",
+    "mr_state_constant_value": None,
+    "mr_state_constant_path": None,
     "mr_state_path":         None,
     "mr_state_key":          "best_candidate",
     "mr_state_grn_sha256":   None,
@@ -943,11 +951,40 @@ def load_config(path: str) -> dict:
     if config["reference_n_top_genes"] is None:
         config["reference_n_top_genes"] = config["n_genes"]
 
-    if config["mr_state_method"] not in ("random", "spectral", "fixed_pickle"):
+    if config["mr_state_method"] not in (
+            "random", "spectral", "fixed_pickle", "constant"):
         raise ValueError(
             f"Unsupported mr_state_method {config['mr_state_method']!r}; "
-            "expected 'random', 'spectral', or 'fixed_pickle'"
+            "expected 'random', 'spectral', 'fixed_pickle', or 'constant'"
         )
+    if config["mr_state_method"] == "constant":
+        constant_path = config.get("mr_state_constant_path")
+        constant_value = config.get("mr_state_constant_value")
+        if constant_path:
+            if constant_value is not None:
+                raise ValueError(
+                    "set only one of mr_state_constant_path and "
+                    "mr_state_constant_value"
+                )
+            if Path(constant_path).suffix.lower() != ".npy" or not Path(constant_path).is_file():
+                raise ValueError(
+                    "mr_state_constant_path must name an existing .npy file"
+                )
+        else:
+            if constant_value is None:
+                constant_value = 0.5 * (
+                    float(config["mr_rate_low"]) + float(config["mr_rate_high"])
+                )
+                config["mr_state_constant_value"] = constant_value
+            if (isinstance(constant_value, bool)
+                    or not isinstance(constant_value, (int, float))
+                    or not math.isfinite(float(constant_value))
+                    or not float(config["mr_rate_low"]) <= float(constant_value)
+                    <= float(config["mr_rate_high"])):
+                raise ValueError(
+                    "mr_state_constant_value must be finite and within "
+                    "[mr_rate_low, mr_rate_high]"
+                )
     if config["mr_state_method"] == "fixed_pickle" and not config.get("mr_state_path"):
         raise ValueError(
             "mr_state_method='fixed_pickle' requires a non-empty mr_state_path"
@@ -1106,6 +1143,44 @@ def _sample_mr_state(n_clusters: int, n_mrs: int, low: float, high: float, seed:
     cluster row is drawn i.i.d. from the same range."""
     rng = np.random.default_rng(seed)
     return rng.uniform(low, high, size=(n_clusters, n_mrs))
+
+
+def _constant_mr_state(config: dict, n_mrs: int) -> np.ndarray:
+    """Build a cluster-invariant MR state from a scalar or per-MR template."""
+    n_clusters = int(config["n_clusters"])
+    path = config.get("mr_state_constant_path")
+    if path:
+        values = np.asarray(np.load(path, allow_pickle=False), dtype=np.float32)
+        if values.ndim == 2:
+            if values.shape != (n_clusters, n_mrs):
+                raise ValueError(
+                    f"constant MR template has shape {values.shape}; expected "
+                    f"({n_clusters}, {n_mrs}) or ({n_mrs},)"
+                )
+            if not np.allclose(values, values[:1], rtol=0.0, atol=1e-7):
+                raise ValueError(
+                    "constant MR template must repeat the same per-MR vector "
+                    "for every cluster"
+                )
+            values = values[0]
+        if values.shape != (n_mrs,):
+            raise ValueError(
+                f"constant MR template has shape {values.shape}; expected ({n_mrs},)"
+            )
+    else:
+        value = config.get("mr_state_constant_value")
+        if value is None:
+            value = 0.5 * (config["mr_rate_low"] + config["mr_rate_high"])
+        values = np.full(n_mrs, float(value), dtype=np.float32)
+
+    if (not np.isfinite(values).all()
+            or (values < float(config["mr_rate_low"])).any()
+            or (values > float(config["mr_rate_high"])).any()):
+        raise ValueError(
+            "constant MR values must be finite and within "
+            "[mr_rate_low, mr_rate_high]"
+        )
+    return np.broadcast_to(values[None, :], (n_clusters, n_mrs)).copy()
 
 
 def _load_fixed_mr_state(
@@ -1640,6 +1715,13 @@ def run_trial(
                 "path": config["mr_state_path"],
                 "key": config.get("mr_state_key", "best_candidate"),
                 "grn_sha256": generated_grn_sha256,
+            }
+        elif config.get("mr_state_method", "random") == "constant":
+            mr_state_np = _constant_mr_state(config, len(mr_ids))
+            mr_state_diagnostics = {
+                "method": "constant",
+                "path": config.get("mr_state_constant_path"),
+                "value": config.get("mr_state_constant_value"),
             }
         else:
             mr_state_np = _sample_mr_state(
@@ -2511,6 +2593,8 @@ def regenerate_best(study_or_params, config: dict, final_missing_rate: float | N
             mr_state_np = _load_fixed_mr_state(
                 config, len(mr_ids), cache=mr_state_cache,
                 expected_mr_ids=list(mr_ids))
+        elif mr_state_method == "constant":
+            mr_state_np = _constant_mr_state(config, len(mr_ids))
         elif mr_state_method == "spectral":
             dag = load_sergio_dag(
                 grn_path,

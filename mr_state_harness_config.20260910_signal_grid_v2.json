@@ -112,7 +112,7 @@
     {"name": "reduced_n014_d50", "base_overrides": {"noise_params": 0.14334676581600892, "add_dropout": true, "dropout_percentile": 50.0}},
     {"name": "reduced_n014_d60", "base_overrides": {"noise_params": 0.14334676581600892, "add_dropout": true, "dropout_percentile": 60.0}},
     {"name": "reduced_n014_d70", "base_overrides": {"noise_params": 0.14334676581600892, "add_dropout": true, "dropout_percentile": 70.0}},
-    {"name": "reduced_n029_d40", "base_overrides": {"noise_params": 0.28669353163201783, "add_dropout": true, "dropout_percentile": 40.0}}
+    {"name": "reduced_n029_d40", "base_overrides": {"noise_params": 0.28669353163201783, "add_dropout": true, "dropout_percentile": 40.0}},
     {"name": "reduced_n029_d50", "base_overrides": {"noise_params": 0.28669353163201783, "add_dropout": true, "dropout_percentile": 50.0}},
     {"name": "reduced_n029_d60", "base_overrides": {"noise_params": 0.28669353163201783, "add_dropout": true, "dropout_percentile": 60.0}},
     {"name": "full_n014_d40", "base_overrides": {"noise_params": 0.14334676581600892, "add_outlier_genes": true, "add_lib_size_effect": false, "convert_to_umi_counts": true, "add_dropout": true, "dropout_percentile": 40.0}},

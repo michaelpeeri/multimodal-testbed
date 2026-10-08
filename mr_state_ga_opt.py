@@ -196,6 +196,9 @@ class MRStateGAOptimizer:
                 self.cfg.get('surrogate_program_stability_weight', 1.0)
             ),
             'pc1': float(self.cfg.get('surrogate_program_pc1_weight', 2.0)),
+            'alignment': float(
+                self.cfg.get('surrogate_program_alignment_weight', 2.0)
+            ),
         }
         self.program_max_pc1_fraction = float(
             self.cfg.get('surrogate_program_max_pc1_fraction', 0.25)
@@ -696,6 +699,62 @@ class MRStateGAOptimizer:
         gene_std = np.clip(structured.std(axis=1, keepdims=True), 1e-6, None)
         standardized = structured / gene_std
 
+        if self.objective_mode == 'intrinsic':
+            # Target-free state/expression alignment: do pairwise MR-state
+            # distances (per-dimension standardized across clusters) predict
+            # pairwise expression-centroid distances (library-normalized,
+            # per-gene-standardized, same convention as
+            # tune_synthetic_data._mr_state_expression_distance_correlation)?
+            # This is the metric the downstream harness/Optuna objective
+            # actually scores candidates on; the entropy/participation/
+            # stability/pc1 terms above do not target it directly.
+            state_centered = candidates - candidates.mean(axis=1, keepdims=True)
+            state_scale = np.maximum(
+                state_centered.std(axis=1, keepdims=True), 1e-6
+            )
+            state_normalized = state_centered / state_scale
+            expr_centroids = np.stack([
+                standardized[:, labels == cluster, :].mean(axis=1)
+                for cluster in range(self.n_clusters)
+            ], axis=1)
+            expr_centroids = expr_centroids - expr_centroids.mean(
+                axis=1, keepdims=True
+            )
+
+            pair_i, pair_j = np.triu_indices(self.n_clusters, k=1)
+            state_pair_dist = np.linalg.norm(
+                state_normalized[:, pair_i, :] - state_normalized[:, pair_j, :],
+                axis=2,
+            )
+            expr_pair_dist = np.linalg.norm(
+                expr_centroids[:, pair_i, :] - expr_centroids[:, pair_j, :],
+                axis=2,
+            )
+            state_pair_centered = state_pair_dist - state_pair_dist.mean(
+                axis=1, keepdims=True
+            )
+            expr_pair_centered = expr_pair_dist - expr_pair_dist.mean(
+                axis=1, keepdims=True
+            )
+            pair_covariance = (state_pair_centered * expr_pair_centered).mean(
+                axis=1
+            )
+            pair_denominator = (
+                state_pair_dist.std(axis=1) * expr_pair_dist.std(axis=1)
+            )
+            program_state_expression_alignment = np.divide(
+                pair_covariance,
+                pair_denominator,
+                out=np.zeros(candidates.shape[0], dtype=np.float64),
+                where=pair_denominator > 1e-12,
+            )
+            program_state_expression_alignment = np.clip(
+                program_state_expression_alignment, -1.0, 1.0
+            )
+            program_metrics['program_state_expression_alignment'] = (
+                program_state_expression_alignment
+            )
+
         _, singular, _ = np.linalg.svd(
             standardized, full_matrices=False, compute_uv=True
         )
@@ -806,6 +865,9 @@ class MRStateGAOptimizer:
             pc1_loss = np.square(
                 pc1_excess / max(1.0 - self.program_max_pc1_fraction, 1e-12)
             )
+            alignment_loss = (
+                1.0 - program_metrics['program_state_expression_alignment']
+            ) / 2.0
             loss = (
                 weights['entropy'] * (1.0 - program_entropy)
                 + weights['participation'] * (
@@ -813,6 +875,7 @@ class MRStateGAOptimizer:
                 )
                 + weights['stability'] * (1.0 - stability_score)
                 + weights['pc1'] * pc1_loss
+                + weights['alignment'] * alignment_loss
             )
         else:
             weights = self.target_objective_weights

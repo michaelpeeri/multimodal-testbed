@@ -1,0 +1,187 @@
+{
+  "_comment": "Rank-resolved follow-up to the v2 DE grid (step 2b). Same GRN/base config/seed_base (40000)/n_replicates (8) as the v2 grid, so iid_random, constant_iid_mean and de_locked_best_v2 should reproduce the v2 results exactly for all pre-existing metrics; new arms and metrics are additive. New arms: lowrank_rank1/lowrank_rank3 (exactly rank-k states with IID-matched per-MR range; mr_state_harness.sample_lowrank_mr_states) and de_v2_column_shuffled (v2 DE matrix with MR columns permuted per replicate: preserves state geometry and per-MR marginals, destroys state-to-GRN alignment). New metrics (mr_state_harness._state_expression_rank_metrics): mr_state_expression_distance_correlation_null_mean/_null_q95/_excess (cluster/state shuffle null); centroid_n_reproducible_dims, centroid_reproducible_participation_ratio, centroid_reproducible_variance_fraction (split-half-cell reproducible between-cluster rank, noise-controlled by a label-permutation parallel-analysis null; SERGIO scenario only, NaN for the one-cell-per-cluster surrogate); state_expression_cka/_cka_null_mean/_cka_excess (state/expression Gram alignment vs. shuffle null).",
+  "_comment_interpretation": "Question answered: do DE states carry high-dimensional, state-linked programs through SERGIO rather than noise-induced dimensions? Read centroid_reproducible_participation_ratio/centroid_n_reproducible_dims (expression-side, noise-controlled rank) together with state_expression_cka_excess and the correlation excess (state link). Expected: constant ~0; lowrank_rank1/3 cap near 1/3 reproducible dims with high CKA excess; IID/DE higher rank; de_v2_column_shuffled keeps the state's geometry but should lose the DE advantage in correlation/CKA excess if DE's gain is GRN-specific alignment. Interpret CKA only as excess over its own null (flat-spectrum states have a high chance level). Paired deltas are vs. iid_random. CAVEAT (smoke test): the constant arm showed 13 'reproducible' dims / 0.73 reproducible variance fraction, so centroid_* metrics must be read as excess over constant_iid_mean, not as absolute state-linked rank; correlation and CKA excess are the state-linked readouts.",
+  "base_config": "synthetic_tuning_config.20260910.mr_de.json",
+  "base_overrides": {
+    "fixed_grn_path": "synthetic_tuning_20260907.buffered.50/grn_diags/trial68.grn.csv",
+    "grn_diagnostics_path": "synthetic_tuning_20260907.buffered.50/grn_diags/trial68.diagnostics.json",
+    "stats_n_pca_components": 20,
+    "stats_n_structure_genes": 500,
+    "stats_percentiles": [
+      5,
+      25,
+      50,
+      75,
+      95
+    ],
+    "sampling_state": 5,
+    "min_cells_per_cluster": 1,
+    "decays": 0.8,
+    "cluster_conc": 10.0,
+    "outlier_prob": 0.015,
+    "outlier_mean": 0.8,
+    "outlier_scale": 1.0,
+    "lib_size_mean": 4.6,
+    "lib_size_scale": 0.4,
+    "dropout_shape": 6.5,
+    "add_outlier_genes": false,
+    "add_lib_size_effect": false,
+    "convert_to_umi_counts": false,
+    "weights": {
+      "log_lib_size_mean": 3.0,
+      "log_lib_size_std": 3.0,
+      "log_lib_size_p5": 3.0,
+      "log_lib_size_p25": 3.0,
+      "log_lib_size_p50": 3.0,
+      "log_lib_size_p75": 3.0,
+      "log_lib_size_p95": 3.0,
+      "gene_corr_abs_mean": 0.0,
+      "gene_corr_abs_std": 0.0,
+      "gene_corr_abs_p50": 0.0,
+      "gene_corr_abs_p90": 0.0,
+      "pca_explained_variance_ratio": 0.0,
+      "pca_tail_participation_ratio": 0.0,
+      "pca_pc2_9_explained_variance_ratio": 0.0,
+      "zero_frac": 0.0,
+      "dropout_curve_zero_frac": 3.0,
+      "lib_size_zero_frac": 0.0,
+      "gene_mean_mean": 1.0,
+      "gene_mean_std": 1.0,
+      "gene_var_mean": 1.0,
+      "gene_var_std": 1.0,
+      "gene_mean_p5": 0.0,
+      "gene_mean_p25": 0.0,
+      "gene_mean_p50": 0.0,
+      "gene_mean_p75": 0.0,
+      "gene_mean_p95": 0.0,
+      "gene_var_p5": 0.0,
+      "gene_var_p25": 0.0,
+      "gene_var_p50": 0.0,
+      "gene_var_p75": 0.0,
+      "gene_var_p95": 0.0,
+      "mean_var_log_slope": 0.0,
+      "mean_var_log_corr": 0.0,
+      "gene_corr_abs_normalized_mean": 3.0,
+      "gene_corr_abs_normalized_p50": 3.0,
+      "gene_corr_abs_normalized_std": 3.0,
+      "gene_corr_abs_normalized_p90": 3.0,
+      "nonzero_frac": 3.0,
+      "pca_standardized_explained_variance_ratio": 0.0,
+      "pca_standardized_tail_participation_ratio": 0.0,
+      "pca_standardized_pc2_9_explained_variance_ratio": 0.0,
+      "pca_size_normalized_standardized_explained_variance_ratio": 0.0,
+      "pca_size_normalized_standardized_tail_participation_ratio": 0.0,
+      "pca_size_normalized_standardized_pc2_9_explained_variance_ratio": 0.0
+    },
+    "rank_null_permutations": 200
+  },
+  "baseline": "iid_random",
+  "arms": [
+    {
+      "name": "iid_random",
+      "candidate_method": "iid",
+      "candidate_params": {
+        "n_candidate_states": 64
+      },
+      "selection_method": "random",
+      "selection_params": {
+        "n_selected_states": 15
+      }
+    },
+    {
+      "name": "constant_iid_mean",
+      "candidate_method": "fixed_array",
+      "candidate_params": {
+        "path": "mr_state_constant_iid_mean.npy"
+      },
+      "selection_method": "identity",
+      "selection_params": {
+        "n_selected_states": 15
+      }
+    },
+    {
+      "name": "de_locked_best_v2",
+      "candidate_method": "fixed_pickle",
+      "candidate_params": {
+        "path": "mr_state_de_20260910_v2.best_surrogate.pickle",
+        "key": "best_candidate"
+      },
+      "selection_method": "identity",
+      "selection_params": {
+        "n_selected_states": 15
+      }
+    },
+    {
+      "name": "lowrank_rank1",
+      "candidate_method": "lowrank",
+      "candidate_params": {
+        "rank": 1,
+        "n_candidate_states": 15
+      },
+      "selection_method": "identity",
+      "selection_params": {
+        "n_selected_states": 15
+      }
+    },
+    {
+      "name": "lowrank_rank3",
+      "candidate_method": "lowrank",
+      "candidate_params": {
+        "rank": 3,
+        "n_candidate_states": 15
+      },
+      "selection_method": "identity",
+      "selection_params": {
+        "n_selected_states": 15
+      }
+    },
+    {
+      "name": "de_v2_column_shuffled",
+      "candidate_method": "fixed_pickle",
+      "candidate_params": {
+        "path": "mr_state_de_20260910_v2.best_surrogate.pickle",
+        "key": "best_candidate",
+        "column_shuffle": true
+      },
+      "selection_method": "identity",
+      "selection_params": {
+        "n_selected_states": 15
+      }
+    }
+  ],
+  "n_replicates": 8,
+  "seed_base": 40000,
+  "include_sergio": true,
+  "clean_simulation": false,
+  "n_cells": 600,
+  "mr_jitter_std": 0.0,
+  "store_candidate_pools": false,
+  "verbose": true,
+  "output_template": "mr_state_comparison.20260911_rank_resolved_{name}.pickle",
+  "plot_template": "mr_state_comparison.20260911_rank_resolved_{name}.png",
+  "grid": [
+    {
+      "name": "noise_only_n014",
+      "base_overrides": {
+        "noise_params": 0.14334676581600891,
+        "add_dropout": false
+      }
+    },
+    {
+      "name": "reduced_n014_d40",
+      "base_overrides": {
+        "noise_params": 0.14334676581600891,
+        "add_dropout": true,
+        "dropout_percentile": 40.0
+      }
+    },
+    {
+      "name": "reduced_n014_d60",
+      "base_overrides": {
+        "noise_params": 0.14334676581600891,
+        "add_dropout": true,
+        "dropout_percentile": 60.0
+      }
+    }
+  ]
+}

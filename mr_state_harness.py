@@ -149,6 +149,15 @@ _SCALAR_METRIC_KEYS = (
     "within_module_mean_abs_corr",
     "across_module_mean_abs_corr",
     "within_minus_across",
+    "mr_state_expression_distance_correlation_null_mean",
+    "mr_state_expression_distance_correlation_null_q95",
+    "mr_state_expression_distance_correlation_excess",
+    "centroid_reproducible_variance_fraction",
+    "centroid_n_reproducible_dims",
+    "centroid_reproducible_participation_ratio",
+    "state_expression_cka",
+    "state_expression_cka_null_mean",
+    "state_expression_cka_excess",
 )
 
 _PCA_ARRAY_KEYS = (
@@ -351,6 +360,19 @@ def _candidate_pool(
             design="random" if method == "iid" else method,
             seed=seed,
         )
+    elif method == "lowrank":
+        # Rank-k control with IID-matched per-MR range; see
+        # sample_lowrank_mr_states.  Requires candidate_params.rank.
+        if "rank" not in params:
+            raise ValueError(f"arm {arm['name']!r} (lowrank) requires candidate_params.rank")
+        states = sample_lowrank_mr_states(
+            n_states=n_candidates,
+            n_mrs=len(mr_ids),
+            low=low,
+            high=high,
+            rank=int(params["rank"]),
+            seed=seed,
+        )
     elif method.startswith("tree_"):
         tree_name = method.removeprefix("tree_")
         if tree_name not in trees["trees"]:
@@ -400,10 +422,17 @@ def _candidate_pool(
     else:
         raise ValueError(
             f"unsupported candidate_method {method!r}; expected iid, sobol, "
-            "tree_*, fixed_array, fixed_artifact, or fixed_pickle"
+            "lowrank, tree_*, fixed_array, fixed_artifact, or fixed_pickle"
         )
 
     states = np.asarray(states, dtype=np.float32)
+    if params.get("column_shuffle") and states.ndim == 2:
+        # Permute which MR each state column drives, independently per
+        # replicate (seeded by ``seed``).  A column permutation preserves
+        # every pairwise MR-state distance and the per-MR marginals exactly,
+        # so only the state-to-GRN alignment is destroyed.
+        permutation = np.random.default_rng(seed + 50_000).permutation(states.shape[1])
+        states = states[:, permutation]
     if states.ndim != 2 or states.shape[1] != len(mr_ids):
         raise ValueError(
             f"arm {arm['name']!r} produced state shape {states.shape}; "
@@ -663,6 +692,254 @@ def _label_aware_expression_metrics(
     return output
 
 
+_RANK_METRIC_KEYS = (
+    "mr_state_expression_distance_correlation_null_mean",
+    "mr_state_expression_distance_correlation_null_q95",
+    "mr_state_expression_distance_correlation_excess",
+    "centroid_reproducible_variance_fraction",
+    "centroid_n_reproducible_dims",
+    "centroid_reproducible_participation_ratio",
+    "state_expression_cka",
+    "state_expression_cka_null_mean",
+    "state_expression_cka_excess",
+)
+
+
+def _split_half_centroid_gram(
+    standardized: np.ndarray,
+    inverse: np.ndarray,
+    n_labels: int,
+    rng: np.random.Generator,
+    n_splits: int,
+) -> tuple[np.ndarray, float] | None:
+    """Symmetrized cross-half centroid Gram, averaged over random splits.
+
+    Cells are split into two halves within each label.  Because the halves'
+    sampling noise is independent, ``C1 C2'`` estimates the reproducible
+    between-label structure with noise cancelling in expectation.  Returns
+    the (K x K) Gram and the mean per-half total centroid variance (signal
+    plus noise), or None when a label has fewer than two cells.
+    """
+    members = [np.flatnonzero(inverse == k) for k in range(n_labels)]
+    if any(m.size < 2 for m in members):
+        return None
+    gram = np.zeros((n_labels, n_labels))
+    total = 0.0
+    for _ in range(n_splits):
+        # One permutation per label, split in two, so the halves are disjoint.
+        c1 = np.zeros((n_labels, standardized.shape[1]))
+        c2 = np.zeros_like(c1)
+        for k, m in enumerate(members):
+            perm = m[rng.permutation(m.size)]
+            half = perm.size // 2
+            c1[k] = standardized[perm[:half]].mean(axis=0)
+            c2[k] = standardized[perm[half:2 * half]].mean(axis=0)
+        c1 -= c1.mean(axis=0, keepdims=True)
+        c2 -= c2.mean(axis=0, keepdims=True)
+        cross = c1 @ c2.T
+        gram += 0.5 * (cross + cross.T)
+        total += 0.5 * (np.trace(c1 @ c1.T) + np.trace(c2 @ c2.T))
+    return gram / n_splits, total / n_splits
+
+
+def _linear_cka(a: np.ndarray, b: np.ndarray) -> float:
+    """Linear CKA between two centered (K x K) Gram matrices."""
+    denom = np.linalg.norm(a) * np.linalg.norm(b)
+    return float(np.sum(a * b) / denom) if denom > 1e-12 else 0.0
+
+
+def _state_expression_rank_metrics(
+    X,
+    labels: np.ndarray,
+    states: np.ndarray,
+    n_permutations: int = 200,
+    seed: int = 0,
+    n_split_permutations: int = 200,
+    n_splits: int = 3,
+    min_dim_fraction: float = 0.05,
+) -> tuple[dict, dict]:
+    """State-shuffle nulls plus a noise-controlled rank readout.
+
+    Preprocessing matches ``tune_synthetic_data.
+    _mr_state_expression_distance_correlation`` (impute, per-gene
+    standardize, per-label centroids, per-MR standardized state).
+
+    * ``..._distance_correlation_null_mean/_null_q95/_excess``: the pairwise
+      distance correlation under a cluster/state shuffle, and observed minus
+      null mean (the caller supplies the observed value).
+    * **Reproducible between-cluster rank** (expression side only; no state
+      model).  Cells of every cluster are split into two random halves; the
+      eigenvalues of the symmetrized cross-half centroid Gram matrix
+      ``C1 C2'`` estimate the between-cluster structure that *replicates*
+      across independent cells -- sampling/dropout noise cancels in
+      expectation, so noise-induced dimensions do not appear.  A parallel-
+      analysis null (cell labels permuted across clusters, same split
+      procedure, per-eigenvalue q99, which controls false positives across
+      the ~K-1 tested eigenvalues) gives ``centroid_n_reproducible_dims``
+      (eigenvalues above the null that each carry >= ``min_dim_fraction`` of
+      the above-null variance, gated to 0 when the reproducible variance
+      fraction is < 1%; the share rule suppresses spurious small
+      eigenvalues from signal x noise cross terms);
+      ``centroid_reproducible_participation_ratio`` is the participation
+      ratio of the positive above-null-median eigenvalues (effective number
+      of reproducible directions); ``centroid_reproducible_variance_
+      fraction`` is trace(cross-Gram) over total per-half centroid variance
+      (the reliability of between-cluster structure).  Needs >= 2 cells per
+      cluster; the one-cell-per-cluster surrogate scenario returns NaN.
+    * **State link**: ``state_expression_cka`` is the linear CKA between the
+      cross-half centroid Gram and the state Gram (both centered); the null
+      shuffles which state belongs to which cluster; ``..._cka_excess`` is
+      observed minus null mean.  Unlike a per-direction regression this is
+      defined for states of any rank, including full-rank IID/DE states.
+
+    A constant state returns 0/NaN rather than a spurious high-rank result.
+    The participation ratio is the threshold-free readout; it is mildly
+    inflated when the reproducible variance fraction is very small (<~5%).
+    ``state_expression_cka`` has a high chance level for flat-spectrum
+    (IID/DE) states, so interpret only its excess over the null, within arm.
+    """
+    nan = float("nan")
+    out = {key: nan for key in _RANK_METRIC_KEYS}
+    arrays = {}
+    if isinstance(X, torch.Tensor):
+        matrix = X.detach().to(torch.float64).cpu().numpy()
+    else:
+        matrix = np.asarray(X, dtype=np.float64)
+    labels = np.asarray(labels)
+    state = np.asarray(states, dtype=np.float64)
+    if matrix.ndim != 2 or labels.ndim != 1 or matrix.shape[0] != labels.size:
+        return out, arrays
+    unique_labels, inverse = np.unique(labels, return_inverse=True)
+    n_clusters = unique_labels.size
+    if n_clusters != state.shape[0] or n_clusters < 3:
+        return out, arrays
+
+    with np.errstate(invalid="ignore"):
+        gene_mean = np.nanmean(matrix, axis=0)
+    gene_mean = np.where(np.isfinite(gene_mean), gene_mean, 0.0)
+    filled = np.where(np.isfinite(matrix), matrix, gene_mean[None, :])
+    centered = filled - filled.mean(axis=0, keepdims=True)
+    standardized = centered / np.maximum(centered.std(axis=0, keepdims=True), 1e-6)
+    centroids = np.vstack([
+        standardized[inverse == k].mean(axis=0) for k in range(n_clusters)
+    ])
+    centroids -= centroids.mean(axis=0, keepdims=True)
+
+    state = state - state.mean(axis=0, keepdims=True)
+    state = state / np.maximum(state.std(axis=0, keepdims=True), 1e-6)
+
+    iu = np.triu_indices(n_clusters, k=1)
+    state_dist = np.linalg.norm(state[:, None, :] - state[None, :, :], axis=2)
+    expr_dist = np.linalg.norm(centroids[:, None, :] - centroids[None, :, :], axis=2)
+    expr_pairs = expr_dist[iu]
+    degenerate_state = np.std(state_dist[iu]) <= 1e-12
+    degenerate_expr = (not np.isfinite(expr_pairs).all()) or np.std(expr_pairs) <= 1e-12
+
+    rng = np.random.default_rng(seed)
+    null_corr = np.full(n_permutations, np.nan)
+    for index in range(n_permutations):
+        perm = rng.permutation(n_clusters)
+        if not (degenerate_state or degenerate_expr):
+            null_corr[index] = np.corrcoef(
+                state_dist[np.ix_(perm, perm)][iu], expr_pairs)[0, 1]
+    if degenerate_state or degenerate_expr:
+        # Matches the observed metric's own convention (zero when degenerate).
+        out["mr_state_expression_distance_correlation_null_mean"] = 0.0
+        out["mr_state_expression_distance_correlation_null_q95"] = 0.0
+    else:
+        out["mr_state_expression_distance_correlation_null_mean"] = float(np.nanmean(null_corr))
+        out["mr_state_expression_distance_correlation_null_q95"] = float(np.nanpercentile(null_corr, 95))
+
+    observed = _split_half_centroid_gram(standardized, inverse, n_clusters, rng, n_splits)
+    if observed is None:
+        return out, arrays
+    gram, total_variance = observed
+    eigenvalues = np.sort(np.linalg.eigvalsh(gram))[::-1][: n_clusters - 1]
+
+    null_eigs = np.full((n_split_permutations, n_clusters - 1), np.nan)
+    for index in range(n_split_permutations):
+        shuffled = rng.permutation(inverse)
+        null_gram = _split_half_centroid_gram(
+            standardized, shuffled, n_clusters, rng, n_splits)
+        null_eigs[index] = np.sort(np.linalg.eigvalsh(null_gram[0]))[::-1][: n_clusters - 1]
+    null_q99 = np.nanpercentile(null_eigs, 99, axis=0)
+    null_median = np.nanmedian(null_eigs, axis=0)
+    exceeds = eigenvalues > null_q99
+    excess = np.maximum(eigenvalues - null_median, 0.0) * exceeds
+    # A signal-free null does not contain signal x noise cross terms, which
+    # put small spurious eigenvalues above it when real structure is strong.
+    # Require each counted dimension to carry >= min_dim_fraction of the
+    # reproducible (above-null) variance as well.
+    share = excess / excess.sum() if excess.sum() > 0 else excess
+    reproducible_fraction = (
+        float(np.clip(np.trace(gram) / total_variance, 0.0, 1.0))
+        if total_variance > 1e-12 else 0.0
+    )
+    # Gate: with <1% reproducible variance there is nothing to resolve, and
+    # the share rule alone would renormalize a handful of marginal exceedances.
+    out["centroid_n_reproducible_dims"] = float(
+        np.count_nonzero(exceeds & (share >= min_dim_fraction))
+        if reproducible_fraction >= 0.01 else 0
+    )
+    out["centroid_reproducible_participation_ratio"] = (
+        float(excess.sum() ** 2 / np.square(excess).sum()) if excess.sum() > 0 else 0.0
+    )
+    out["centroid_reproducible_variance_fraction"] = (
+        reproducible_fraction if total_variance > 1e-12 else nan
+    )
+
+    state_gram = state @ state.T
+    if degenerate_state or np.linalg.norm(state_gram) <= 1e-12:
+        out["state_expression_cka"] = 0.0
+        out["state_expression_cka_null_mean"] = 0.0
+        out["state_expression_cka_excess"] = 0.0
+    else:
+        observed_cka = _linear_cka(gram, state_gram)
+        null_cka = np.empty(n_permutations)
+        for index in range(n_permutations):
+            perm = rng.permutation(n_clusters)
+            null_cka[index] = _linear_cka(gram, state_gram[np.ix_(perm, perm)])
+        out["state_expression_cka"] = observed_cka
+        out["state_expression_cka_null_mean"] = float(null_cka.mean())
+        out["state_expression_cka_excess"] = float(observed_cka - null_cka.mean())
+    arrays = {
+        "cross_half_eigenvalues": eigenvalues,
+        "null_median": null_median,
+        "null_q99": null_q99,
+    }
+    return out, arrays
+
+
+def sample_lowrank_mr_states(
+    n_states: int,
+    n_mrs: int,
+    low: float,
+    high: float,
+    rank: int,
+    seed: int,
+) -> np.ndarray:
+    """Draw an exactly rank-``rank`` (after centering) state matrix.
+
+    A Gaussian ``Z @ W`` (``Z`` is ``n_states x rank``, ``W`` is ``rank x
+    n_mrs``) is rescaled *affinely* per MR column so each column spans
+    exactly ``[low, high]`` (min-max scaling).  Affine per-column maps keep
+    the centered matrix exactly rank ``rank`` (no clipping or other
+    nonlinearity), while the per-MR range matches IID Uniform(low, high)
+    draws; for ~15 states the resulting per-MR standard deviation is also
+    close to the uniform value ``(high-low)/sqrt(12)`` (verified empirically
+    in the accompanying check, not enforced).
+    """
+    if rank < 1:
+        raise ValueError("rank must be >= 1")
+    rng = np.random.default_rng(seed)
+    z = rng.standard_normal((n_states, rank))
+    w = rng.standard_normal((rank, n_mrs))
+    raw = z @ w
+    lo = raw.min(axis=0, keepdims=True)
+    span = np.maximum(raw.max(axis=0, keepdims=True) - lo, 1e-12)
+    return (low + (raw - lo) / span * (high - low)).astype(np.float32)
+
+
 def _simulate_arm(
     states: np.ndarray,
     base: dict,
@@ -745,6 +1022,12 @@ def _evaluate_matrix(
     )
     label_metrics = _label_aware_expression_metrics(
         X, labels, seed=base.get("stats_seed", 0))
+    rank_metrics, rank_arrays = _state_expression_rank_metrics(
+        X, labels, states,
+        n_permutations=int(base.get("rank_null_permutations", 200)),
+        seed=int(base.get("rank_null_seed", base.get("stats_seed", 0)) or 0),
+        n_split_permutations=int(base.get("rank_null_split_permutations", 200)),
+    )
     module_metrics = _gene_module_correlations(
         X,
         labels,
@@ -777,7 +1060,14 @@ def _evaluate_matrix(
         "within_minus_across",
     ):
         scalar_metrics[key] = _safe_float(module_metrics[key])
+    for key, value in rank_metrics.items():
+        scalar_metrics[key] = _safe_float(value)
+    null_mean = rank_metrics["mr_state_expression_distance_correlation_null_mean"]
+    scalar_metrics["mr_state_expression_distance_correlation_excess"] = _safe_float(
+        mr_state_expression_distance_correlation - null_mean
+    ) if math.isfinite(null_mean) else float("nan")
     return {
+        "state_alignment_spectrum": rank_arrays,
         "stats": stats,
         "distance": distance,
         "distance_breakdown": breakdown,
@@ -1321,7 +1611,7 @@ def plot_mr_state_comparison(result_or_path, path: str | None = None, scenario: 
     scenario = scenario or scenario_names[-1]
     arm_names = list(result["arms"])
     x = np.arange(len(arm_names))
-    fig, axes = plt.subplots(2, 4, figsize=(18, 8))
+    fig, axes = plt.subplots(3, 4, figsize=(18, 12))
     panels = (
         ("distance", "distance", True),
         ("mr_state_participation_ratio", "MR-state effective rank", False),
@@ -1331,6 +1621,10 @@ def plot_mr_state_comparison(result_or_path, path: str | None = None, scenario: 
         ("pca_size_normalized_standardized_split_half_subspace_stability", "loading subspace stability", False),
         ("pca_size_normalized_standardized_split_half_spectrum_similarity", "PCA spectrum stability", False),
         ("nonzero_frac", "nonzero fraction", False),
+        ("mr_state_expression_distance_correlation", "state/expression distance corr.", False),
+        ("mr_state_expression_distance_correlation_excess", "corr. minus shuffle null", False),
+        ("centroid_n_reproducible_dims", "reproducible between-cluster dims", False),
+        ("state_expression_cka_excess", "state/expression CKA minus null", False),
     )
     for ax, (key, title, lower_is_better) in zip(axes.flat, panels):
         means = []

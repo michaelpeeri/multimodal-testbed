@@ -34,10 +34,10 @@
       "selection_params": {"n_selected_states": 15}
     },
     {
-      "name": "de_locked_best",
+      "name": "de_locked_best_v2",
       "candidate_method": "fixed_pickle",
       "candidate_params": {
-        "path": "mr_state_de_20260910.best_surrogate.pickle",
+        "path": "mr_state_de_20260910_v2.best_surrogate.pickle",
         "key": "best_candidate"
       },
       "selection_method": "identity",

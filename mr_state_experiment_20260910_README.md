@@ -28,10 +28,12 @@ Create the SQLite/output parents before launching:
 
 ```bash
 mkdir -p mr_state_de_20260910 \
-  synthetic_tuning_20260910.mr_de/{checkpoints,grn_diags} \
-  synthetic_tuning_20260910.mr_iid/{checkpoints,grn_diags} \
-  synthetic_tuning_20260910.mr_constant/{checkpoints,grn_diags}
+  synthetic_tuning_20260910.mr_{de,iid,constant}.s{60,61}/{checkpoints,grn_diags}
 ```
+
+(These Step 3 directories are already created in the working tree. The Step 3
+DE arm uses the **v2** DE artifact, `mr_state_de_20260910_v2.best_surrogate.pickle`;
+see Step 2 final conclusions.)
 
 ## Step 1 — optimize two DE states against the exact GRN
 
@@ -102,7 +104,7 @@ PYTHONHASHSEED=0 python3 run_mr_state_harness_grid.py \
 ```
 
 Primary evidence is in each `mr_state_comparison.20260910_signal_*.summary.json`
-under `comparison.paired_deltas_vs_baseline.de_locked_best.scenarios.sergio`.
+under `comparison.paired_deltas_vs_baseline.de_locked_best_v2.scenarios.sergio`.
 The deltas are **DE minus IID**: positive values favor DE for
 `mr_state_expression_distance_correlation`, `within_minus_across`, and
 stability; negative values favor DE for target `distance`. Check the paired
@@ -111,18 +113,22 @@ control should have zero MR-state/expression distance correlation by
 construction. Use the noise-only vs. clean and reduced vs. full conditions to
 locate the loss from noise, dropout, and the combined outlier/UMI stages.
 
-### Set the provisional Optuna correlation minimum from phase 3
+### Optuna biological-penalty settings (resolved; see final conclusions below)
 
-Before launching Optuna, inspect the 12-replicate correlation distributions
-for DE and IID, especially the `reduced_n014_d40`, `d50`, and `d60` conditions.
-Update `biological_signal.minimums` and the matching `scales` entry for
-`biological_mr_state_expression_distance_correlation` **identically in all
-three Optuna configs**. Use a value supported by the DE distribution at a
-condition that also beats IID; the checked-in value `0.15` is provisional.
-Keep the control study's same threshold: its expected fixed deficit adds a
-constant component to its penalty, so raw `objective_distance` is not
-comparable across MR-state methods. Compare `target_distance` and the recorded
-biological metrics instead.
+The Step 3 configs penalize only
+`biological_mr_state_expression_distance_correlation`, with minimum and scale
+both `0.55`, identically in every arm. Note: no condition exists where the
+*original* v1 DE state beat IID; the rationale for 0.55 is instead "achievable
+by IID only marginally (IID d40/d60 median 0.45-0.50, q90 0.50-0.56) but
+reached by the v2 DE state at d40-d60 (q10 0.60-0.69)". The constant control's
+expected fixed deficit adds a constant penalty, so raw `objective_distance` is
+not comparable across MR-state methods; compare `target_distance` and the
+recorded biological metrics instead. The other three biological metrics
+(label-between variance, `within_minus_across`, split-half stability) are
+still recorded per trial but removed from the penalty, because the constant
+control also scores ~0.14/~0/~0.32 on them (state-independent structure).
+With a single penalized term and `penalty_weight` 25, the penalty is:
+constant ~25, IID d40 ~0.3, DE d40-d60 0.
 
 ## Step 2b — rank-resolved follow-up (does DE carry high-dimensional programs?)
 
@@ -176,7 +182,57 @@ synthetic data only (rank recovery for rank 1/3/6/IID, zero for constant,
 the metric is conservative and linear, and CKA must be read as excess over its
 own null.
 
-## Step 3 — three matched-budget Optuna studies
+## Step 2 final conclusions
+
+Evidence: the 11-cell v2 grid (8 paired replicates per cell, `...signal_v2_*`,
+including a bit-identical `reduced_n029_d40` rerun on the deployment
+environment) and the rank-resolved follow-up (`...20260911_rank_resolved_*`:
+noise_only_n014, reduced_n014_d40/d60 with extra rank-1, rank-3 and
+column-shuffled-DE arms). All results are paired and use bootstrap 95% CIs.
+
+1. **v1 DE failed; v2 fixed it.** The v1 DE objective had no state/expression
+   alignment term, and v1 DE was significantly *worse* than IID on
+   `mr_state_expression_distance_correlation` in 6/9 cells. v2 adds that term
+   to the DE surrogate objective. v2 DE beats IID in 10/11 cells (paired
+   delta +0.13 to +0.36, 7-8/8 replicates positive; `full_n014_d70` is not
+   significant), with held-out simulation seeds.
+2. **What DE adds is GRN-specific alignment, not dimensionality.** Column-
+   shuffled DE (same state geometry and per-MR marginals, alignment to the
+   GRN destroyed) is statistically indistinguishable from IID on correlation
+   (-0.001 to +0.03, CI includes 0), while intact DE is +0.21 to +0.24 above
+   shuffled (8/8). CKA excess shows the same ordering (DE > shuffled > IID).
+   DE has no advantage on label-between variance, split-half stability or
+   `within_minus_across`, and slightly *lower* state/centroid effective rank
+   than IID (MR-state participation ratio 11.65 vs 12.02; reproducible
+   centroid participation ratio -0.8 [-1.3, -0.3] in all three cells).
+3. **State-linked structure survives SERGIO at moderate noise/dropout, and is
+   high-dimensional for IID and DE alike.** At noise 0.143 and dropout
+   <=d40, DE keeps correlation ~0.73, label-between variance 0.25 and
+   stability 0.42; at d60 correlation 0.64 and stability 0.19; by d70/full
+   pipeline it is largely gone. Excess over the constant control is
+   significant and spread over many directions (positive across all 14
+   tested; effective rank ~6-8 IID, ~5-7 DE), whereas rank-1/rank-3 states
+   concentrate it in ~1/~3 directions and have lower stability than IID/DE.
+4. **The constant-MR control is not a clean null.** Under SERGIO it still has
+   strong state-independent between-cluster structure (14 "reproducible"
+   dimensions under noise-only; reproducible variance fraction 0.72 at d40;
+   label holdout accuracy 0.86-0.998), so label/PCA-based metrics must be read
+   as excess over the constant arm. Likely cause (not verified): per-cluster
+   stochastic trajectories shared by a cluster's cells. The constant arm also
+   changes the mean MR level, so spectral subtraction is approximate.
+5. **Correlation and CKA reward low rank**: rank-1/3 states score 0.95-0.98
+   correlation. They are state-link metrics, not dimensionality evidence.
+   `within_minus_across` collapses to ~0.002 (d40) and ~0.001 (d60), so what
+   survives is cluster-level geometry, not gene-module coherence.
+
+Caveats: one GRN and one DE matrix (no held-out GRN); DE optimized the
+correlation metric (mitigated by held-out simulation seeds and the shuffle
+control); reproducible-dimension counts are threshold-dependent (prefer the
+participation ratios/spectra); signal is established only at <=d40-d60, not at
+reference-level sparsity. **Verdict: DE v2 is a valid basis for Step 3**, as a
+GRN-aligned (not higher-rank) state source.
+
+## Step 3 — six matched-budget Optuna studies (3 arms x 2 sampler seeds)
 
 The configs hold the GRN settings, parameter search, trial count, and sampler
 seed fixed. They differ only in MR-state source and output paths. The
@@ -189,28 +245,33 @@ Optuna objective records the biological diagnostics; the minimums add a soft
 penalty, not a hard constraint. The constant arm is a negative control, not a
 candidate expected to pass the MR-state alignment criterion.
 
+Each arm has two replicates that differ **only** in `sampler_seed` (60 or 61)
+and output paths (`synthetic_tuning_config.20260910.mr_{de,iid,constant}.s{60,61}.json`);
+seed 60 and 61 align initial suggestions across arms. Launch all six
+concurrently (8 processes are available), each with `PYTHONHASHSEED=0`:
+
 ```bash
-PYTHONHASHSEED=0 python3 tune_synthetic_data.py \
-  --config synthetic_tuning_config.20260910.mr_de.json
-
-PYTHONHASHSEED=0 python3 tune_synthetic_data.py \
-  --config synthetic_tuning_config.20260910.mr_iid.json
-
-PYTHONHASHSEED=0 python3 tune_synthetic_data.py \
-  --config synthetic_tuning_config.20260910.mr_constant.json
+for arm in de iid constant; do for s in 60 61; do
+  PYTHONHASHSEED=0 nohup python3 tune_synthetic_data.py \
+    --config synthetic_tuning_config.20260910.mr_${arm}.s${s}.json \
+    > synthetic_tuning_20260910.mr_${arm}.s${s}.log 2>&1 &
+done; done
 ```
 
-The `mr_de` config requires the selected artifact from step 1 and enforces its
-GRN SHA256. All three configs use the same Optuna sampler seed (`60`) to align
-initial suggestions. Compare `target_distance`, biological metrics, and the
+The unsuffixed `synthetic_tuning_config.20260910.mr_{de,iid,constant}.json`
+files are superseded (kept only because the harness configs use `mr_de.json`
+as their `base_config`); do not launch Optuna from them.
+The DE configs require the **v2** artifact and enforce its GRN SHA256. Compare `target_distance`, biological metrics, and the
 parameter values; do not rank the arms by combined `objective_distance`
 because the constant state has an expected, state-specific correlation
 penalty.
 
 ## Step 4 — crossover validation of Optuna-selected parameters
 
-Use `mr_state_harness_config.20260910_best_replay.json` as a template. For each
-of the three Optuna outputs (`mr_de`, `mr_iid`, `mr_constant`):
+Use `mr_state_harness_config.20260910_best_replay.json` as a template (its
+DE arm, `de_locked_best_v2`, already points at the v2 artifact). Pick the better
+replicate (lower `target_distance` best trial among the same-arm seeds, or run
+both) for each of the three Optuna arms (`mr_de`, `mr_iid`, `mr_constant`):
 
 1. Copy that study's `best_params` values into the template's `base_overrides`
    for `decays`, `cluster_conc`, `noise_params`, `dropout_shape`, and

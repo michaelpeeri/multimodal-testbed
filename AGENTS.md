@@ -2071,3 +2071,66 @@ Several single-file research scripts, with locally shared code. No tests, no pac
     not conclude that the DE optimizer improves state quality from the clean
     grid alone; its clearest evidence so far is the small, paired advantage
     at dropout percentile 40.
+
+- **MR-state experiment (`mr_state_experiment_20260910_README.md`) Step 2
+  final conclusions** (11-cell `mr_state_comparison.20260910_signal_v2_*`
+  grid, 8 paired replicates/cell, plus the rank-resolved follow-up
+  `mr_state_comparison.20260911_rank_resolved_*`; all paired, bootstrap CIs):
+  - The original (v1) DE objective in `mr_state_ga_opt.py` had no
+    state/expression alignment term; v1 DE was significantly *worse* than IID
+    on `mr_state_expression_distance_correlation` in 6/9 cells. Fixed by
+    adding `program_state_expression_alignment` (weight
+    `surrogate_program_alignment_weight`, default 2.0) to the intrinsic
+    surrogate loss; v2 DE re-optimized (population 200, 30 generations, seeds
+    0/1, seed 1 selected -> `mr_state_de_20260910_v2.best_surrogate.pickle`).
+    v2 beats IID in 10/11 cells (paired delta +0.13 to +0.36, 7-8/8
+    replicates positive; `full_n014_d70` n.s.), on held-out simulation seeds.
+    The `reduced_n029_d40` rerun on the deployment environment was bit-
+    identical (same seeds), so it confirms portability, not independence.
+  - **DE's gain is GRN-specific alignment, not dimensionality.** Column-
+    shuffled DE (`candidate_params.column_shuffle`, preserves state geometry
+    and per-MR marginals, destroys GRN alignment) is indistinguishable from
+    IID on correlation (-0.001 to +0.03); intact DE is +0.21-0.24 above it
+    (8/8). DE has no advantage on label-between variance, split-half
+    stability or `within_minus_across`, and slightly lower state/centroid
+    effective rank than IID (MR-state PR 11.65 vs 12.02).
+  - State-linked structure survives SERGIO at noise 0.143 with dropout
+    <=d40-d60 (DE correlation 0.73/0.64, stability 0.42/0.19), and is
+    spread over many directions for IID and DE (effective rank ~6-8/5-7
+    after subtracting the constant control's spectrum) vs. ~1/~3 for the new
+    rank-1/rank-3 control arms; it is largely gone at d70/full pipeline.
+    `within_minus_across` collapses to ~0.002 (d40)/~0.001 (d60): what
+    survives is cluster-level geometry, not gene-module coherence.
+  - **The constant-MR control is not a clean null under SERGIO** (14
+    "reproducible" between-cluster dimensions under noise-only, 0.72
+    reproducible variance fraction at d40, holdout accuracy 0.86-0.998):
+    label/PCA metrics are partly state-independent (cause unverified, likely
+    per-cluster stochastic trajectories). Read them as excess over constant.
+    Correlation/CKA reward low rank (rank-1/3 score 0.95-0.98), so they are
+    state-link, not dimensionality, evidence. Reproducible-dimension *counts*
+    are threshold-dependent; prefer participation ratios/spectra.
+  - New in `mr_state_harness.py`: `_state_expression_rank_metrics` (shuffle-
+    null correlation, split-half reproducible between-cluster rank with a
+    label-permutation parallel-analysis null, CKA vs. shuffle null; NaN for
+    the one-cell-per-cluster surrogate scenario), `lowrank` candidate method,
+    `column_shuffle` option. Verified on synthetic data (rank recovery,
+    constant -> 0, pure noise -> ~0 dims) and by a real-SERGIO smoke run that
+    reproduced the stored v2 values exactly. `mr_state_harness_config.
+    20260911_rank_resolved_grid.json` holds the follow-up grid.
+  - Caveats: one GRN and one DE matrix (no held-out GRN); DE optimized the
+    correlation metric (mitigated by held-out seeds and the shuffle control);
+    reference-level sparsity not reached. Verdict: DE v2 is a valid
+    GRN-aligned (not higher-rank) basis for Step 3.
+  - Step 3 setup: six Optuna studies (arms de/iid/constant x sampler_seed
+    60/61, differing only in seed and output paths) via
+    `synthetic_tuning_config.20260910.mr_{de,iid,constant}.s{60,61}.json`
+    (output dirs pre-created). DE arm uses the **v2** artifact. The
+    biological penalty now covers only `biological_mr_state_expression_
+    distance_correlation` (minimum = scale = 0.55; penalty weight 25 ->
+    constant ~25, IID d40 ~0.3, DE d40-d60 0); the other three biological
+    metrics are still recorded as user_attrs but non-binding. The old
+    unsuffixed `...20260910.mr_*.json` files are superseded but kept
+    (the 20260910/20260911 harness configs use `mr_de.json` as `base_config`);
+    `mr_state_harness_config.20260910_best_replay.json` now points at v2.
+    **User action required**: launch the six processes with a shared
+    `PYTHONHASHSEED=0` (README Step 3), then Step 4 crossover.

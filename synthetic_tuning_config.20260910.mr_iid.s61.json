@@ -1,8 +1,8 @@
 {
-  "_comment": "Compact Optuna run for the DE-derived state on the locked GRN. Run after DE seed selection and after updating the provisional MR-state/expression-correlation minimum from the phase-3 harness.",
+  "_comment": "Step 3 Optuna study, arm=iid (see mr_state_experiment_20260910_README.md). Replicates differ ONLY in sampler_seed (60/61) and output paths. Biological penalty: only the MR-state/expression distance-correlation minimum (0.55, scale 0.55) is penalized, identically across arms; the other biological metrics (label-between variance, within_minus_across, split-half stability) are still recorded as trial user_attrs but are non-binding because they cannot separate state-linked from state-independent structure (constant control scores ~0.14/~0/~0.32). Compare arms on target_distance and recorded biological metrics, not objective_distance. MR state: IID Uniform draws.",
   "target_stats_path": "1cb67ec8-c9e3-4d4a-ba23-a1a8ef3f8450.GRNseed42.stats.v6.mean.pickle",
   "reference_grn_path": "data/trrust_rawdata.human.tsv",
-  "grn_archive_dir": "synthetic_tuning_20260910.mr_de/grn_diags",
+  "grn_archive_dir": "synthetic_tuning_20260910.mr_iid.s61/grn_diags",
   "n_clusters": 15,
   "n_genes": 800,
   "n_cells": 600,
@@ -10,19 +10,19 @@
   "shared_coop_state": 0,
   "stats_n_pca_components": 20,
   "stats_n_structure_genes": 500,
-  "mr_state_method": "fixed_pickle",
-  "mr_state_path": "mr_state_de_20260910.best_surrogate.pickle",
+  "mr_state_method": "random",
+  "mr_state_path": null,
   "mr_state_key": "best_candidate",
-  "mr_state_grn_sha256": "f0f653cd1cd7db0499a63c6b5f4adc8cb2901a5baac69fb499522cfb0e7dc934",
-  "require_mr_state_grn_provenance": true,
-  "storage": "sqlite:///synthetic_tuning_20260910.mr_de/synthetic_tuning_20260910.mr_de.db",
-  "study_name": "tune_synthetic_data6_20260910_mr_de",
-  "output": "synthetic_tuning_20260910.mr_de/tuned_config.json",
-  "artifact_dir": "synthetic_tuning_20260910.mr_de/checkpoints",
+  "mr_state_grn_sha256": null,
+  "require_mr_state_grn_provenance": false,
+  "storage": "sqlite:///synthetic_tuning_20260910.mr_iid.s61/synthetic_tuning_20260910.mr_iid.s61.db",
+  "study_name": "tune_synthetic_data6_20260910_mr_iid_s61",
+  "output": "synthetic_tuning_20260910.mr_iid.s61/tuned_config.json",
+  "artifact_dir": "synthetic_tuning_20260910.mr_iid.s61/checkpoints",
   "n_trials": 80,
   "timeout": null,
   "sampler": "tpe",
-  "sampler_seed": 60,
+  "sampler_seed": 61,
   "sim_seed": 0,
   "pruner": "none",
   "max_lib_size_zero_frac": 0.01,
@@ -91,16 +91,10 @@
     "penalty_weight": 25.0,
     "hard_prune": false,
     "minimums": {
-      "biological_label_between_variance_fraction": 0.15,
-      "biological_within_minus_across": 0.003,
-      "biological_mr_state_expression_distance_correlation": 0.15,
-      "biological_split_half_subspace_stability": 0.35
+      "biological_mr_state_expression_distance_correlation": 0.55
     },
     "scales": {
-      "biological_label_between_variance_fraction": 0.15,
-      "biological_within_minus_across": 0.003,
-      "biological_mr_state_expression_distance_correlation": 0.15,
-      "biological_split_half_subspace_stability": 0.35
+      "biological_mr_state_expression_distance_correlation": 0.55
     }
   },
   "search_space": {
@@ -131,6 +125,5 @@
       "low": 40.0,
       "high": 99.0
     }
-  },
-  "_comment_superseded": "SUPERSEDED for Step 3 by synthetic_tuning_config.20260910.mr_de.s{60,61}.json (v2 DE artifact, recalibrated biological penalty, 2 sampler-seed replicates). Kept unchanged otherwise because the 20260910/20260911 harness configs use mr_de.json as their base_config; do not launch Optuna from this file."
+  }
 }

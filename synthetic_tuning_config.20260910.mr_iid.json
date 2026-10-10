@@ -104,10 +104,33 @@
     }
   },
   "search_space": {
-    "noise_params": {"type": "float", "low": 0.05, "high": 0.28669353163201783, "log": true},
-    "decays": {"type": "float", "low": 0.3, "high": 1.5},
-    "cluster_conc": {"type": "float", "low": 2.0, "high": 50.0, "log": true},
-    "dropout_shape": {"type": "float", "low": 1.0, "high": 20.0},
-    "dropout_percentile": {"type": "float", "low": 40.0, "high": 99.0}
-  }
+    "noise_params": {
+      "type": "float",
+      "low": 0.05,
+      "high": 0.28669353163201783,
+      "log": true
+    },
+    "decays": {
+      "type": "float",
+      "low": 0.3,
+      "high": 1.5
+    },
+    "cluster_conc": {
+      "type": "float",
+      "low": 2.0,
+      "high": 50.0,
+      "log": true
+    },
+    "dropout_shape": {
+      "type": "float",
+      "low": 1.0,
+      "high": 20.0
+    },
+    "dropout_percentile": {
+      "type": "float",
+      "low": 40.0,
+      "high": 99.0
+    }
+  },
+  "_comment_superseded": "SUPERSEDED for Step 3 by synthetic_tuning_config.20260910.mr_iid.s{60,61}.json (v2 DE artifact, recalibrated biological penalty, 2 sampler-seed replicates). Kept unchanged otherwise because the 20260910/20260911 harness configs use mr_de.json as their base_config; do not launch Optuna from this file."
 }

@@ -268,32 +268,46 @@ penalty.
 
 ## Step 4 — crossover validation of Optuna-selected parameters
 
-Use `mr_state_harness_config.20260910_best_replay.json` as a template (its
-DE arm, `de_locked_best_v2`, already points at the v2 artifact). Pick the better
-replicate (lower `target_distance` best trial among the same-arm seeds, or run
-both) for each of the three Optuna arms (`mr_de`, `mr_iid`, `mr_constant`):
+Select parameter sets using the criterion each Optuna study actually optimized:
+`objective_distance = target_distance + biological_signal_penalty`. Within each
+arm, take the objective-best trial from each sampler seed, then use the one with
+lower `target_distance` for that arm's crossover. Do not choose the minimum
+`target_distance` across all trials: that drops the biological penalty and can
+select settings that fit the target statistics while losing the MR-state signal.
+For example, DE s60 trial 77 has target distance 0.3647 but correlation 0.183,
+whereas the objective-best trial 69 has target distance 0.6539 and correlation
+0.573. The constant arm has a constant correlation penalty, so its objective-
+best trial is also its target-distance-best trial. Objective values are used
+only for selecting a trial within an arm; do not compare their magnitudes across
+arms because the constant arm incurs its fixed biological penalty.
 
-1. Copy that study's `best_params` values into the template's `base_overrides`
-   for `decays`, `cluster_conc`, `noise_params`, `dropout_shape`, and
-   `dropout_percentile`. The outlier parameters are fixed and those stages
-   remain disabled in this crossover.
-2. Keep the same selected DE artifact, GRN, technical-stage switches, and all
-   three harness arms unchanged.
-3. Give the run a distinct output name and evaluate the other two arms using
-   that same technical parameter set.
+The selected parameter sets are:
 
-Run each edited template:
+| Arm | Study/trial | Objective | Target distance | MR-state/expression correlation |
+|---|---|---:|---:|---:|
+| DE | `mr_de.s60`, trial 69 | 0.653913 | 0.653913 | 0.573372 |
+| IID | `mr_iid.s60`, trial 77 | 1.247711 | 0.600430 | 0.461501 |
+| Constant | `mr_constant.s61`, trial 29 | 25.253071 | 0.253070 | 0.000000 |
+
+Three ready-to-run configs preserve the same selected DE artifact, locked GRN,
+technical-stage switches, three harness arms, and paired replicate seeds. Each
+uses one parameter set across all three state methods:
 
 ```bash
 PYTHONHASHSEED=0 python3 mr_state_harness.py \
-  --config mr_state_harness_config.20260910_best_replay.json \
-  --output mr_state_comparison.20260910_best_replay_de_params.pickle
+  --config mr_state_harness_config.20260910_best_replay_de_params.json
+
+PYTHONHASHSEED=0 python3 mr_state_harness.py \
+  --config mr_state_harness_config.20260910_best_replay_iid_params.json
+
+PYTHONHASHSEED=0 python3 mr_state_harness.py \
+  --config mr_state_harness_config.20260910_best_replay_constant_params.json
 ```
 
-Repeat with `iid_params` and `constant_params` in the output name. This
-3-parameter-sets × 3-state-methods crossover separates the effect of MR-state
-choice from the different parameter settings selected by independent Optuna
-studies.
+The 3 parameter sets × 3 state methods form the crossover, separating the
+effect of MR-state choice from the different technical settings selected by the
+three Optuna arms. Compare paired DE-minus-IID biological metrics and report the
+constant arm as the negative control; target distance remains descriptive.
 
 ## Decision criteria and resulting protocol
 
